@@ -1,0 +1,108 @@
+export type ErrorCode =
+  | "PROVIDER_CONFIGURATION_ERROR"
+  | "PROVIDER_NOT_AVAILABLE"
+  | "ENVIRONMENT_CREATION_FAILED"
+  | "COMMAND_TIMEOUT"
+  | "BUILD_FAILED"
+  | "PREVIEW_FAILED"
+  | "AGENT_FAILED"
+  | "GENERATION_INCOMPLETE"
+  | "JOB_CANCELLED"
+  | "INSUFFICIENT_CREDITS"
+  | "QUOTA_EXCEEDED"
+  | "VERSION_NOT_FOUND"
+  | "DEPLOYMENT_FAILED"
+  | "VALIDATION_FAILED"
+  | "INVALID_STATE_TRANSITION"
+  | "PLANNING_FAILED"
+  | "STRUCTURED_RESPONSE_EMPTY"
+  | "STRUCTURED_RESPONSE_PARSE_FAILED"
+  | "STRUCTURED_RESPONSE_SCHEMA_INVALID"
+  | "UNSUPPORTED_SITE_REQUIREMENT"
+  | "PROJECT_BOOTSTRAP_FAILED"
+  | "AGENT_GENERATION_FAILED"
+  | "DEPENDENCY_POLICY_VIOLATION"
+  | "REPAIR_LIMIT_REACHED"
+  | "VERSION_SAVE_FAILED"
+  | "PERSISTENCE_INITIALIZATION_FAILED"
+  | "PERSISTENCE_READ_FAILED"
+  | "PERSISTENCE_WRITE_FAILED"
+  | "PERSISTENCE_TRANSACTION_FAILED"
+  | "SITE_NOT_FOUND"
+  | "JOB_NOT_FOUND"
+  | "ARTIFACT_NOT_FOUND"
+  | "ARTIFACT_INTEGRITY_FAILED"
+  | "SITE_NOT_PUBLISHED"
+  | "DEPLOYMENT_NOT_FOUND"
+  | "DEPLOYMENT_ARTIFACT_NOT_FOUND"
+  | "DEPLOYMENT_ARTIFACT_INVALID"
+  | "DEPLOYMENT_BUILD_FAILED"
+  | "PUBLISH_FAILED"
+  | "HOSTING_RESOLUTION_FAILED"
+  | "SITE_RUNTIME_NOT_FOUND"
+  | "RUNTIME_COLLECTION_NOT_FOUND"
+  | "RUNTIME_VALIDATION_FAILED"
+  | "RUNTIME_OPERATION_FORBIDDEN"
+  | "RUNTIME_RECORD_NOT_FOUND"
+  | "RUNTIME_SCHEMA_INVALID"
+  | "RUNTIME_MIGRATION_FAILED"
+  | "RUNTIME_PROVIDER_FAILED"
+  | "RUNTIME_RATE_LIMITED"
+  | "AUTH_EMAIL_TAKEN"
+  | "AUTH_INVALID_CREDENTIALS"
+  | "AUTH_UNAUTHENTICATED"
+  | "AUTH_PASSWORD_INVALID"
+  | "SITE_SECRET_NOT_CONFIGURED"
+  | "SECRET_DECRYPTION_FAILED"
+  | "EXTERNAL_ACTION_NOT_FOUND"
+  | "EXTERNAL_ACTION_FORBIDDEN"
+  | "EXTERNAL_ACTION_FAILED"
+  | "AUTH_REQUIRED"
+  | "INVALID_CREDENTIALS"
+  | "AUTH_RATE_LIMITED"
+  | "SESSION_EXPIRED"
+  | "EXTERNAL_ACTION_RATE_LIMITED"
+  | "CSRF_VALIDATION_FAILED"
+  | "ORIGIN_NOT_ALLOWED"
+  | "SOURCE_SECURITY_VALIDATION_FAILED"
+  | "DEPLOYMENT_SECURITY_VALIDATION_FAILED"
+  | "CUSTOM_DOMAIN_INVALID"
+  | "CUSTOM_DOMAIN_RESERVED"
+  | "CUSTOM_DOMAIN_ALREADY_EXISTS"
+  | "CUSTOM_DOMAIN_NOT_FOUND"
+  | "CUSTOM_DOMAIN_NOT_VERIFIED"
+  | "CUSTOM_DOMAIN_NOT_ACTIVE"
+  | "CUSTOM_DOMAIN_LIMIT_REACHED"
+  | "DOMAIN_VERIFICATION_FAILED"
+  | "DOMAIN_VERIFICATION_EXPIRED"
+  | "HOST_RESOLUTION_FAILED"
+  | "AGENT_RUN_BUDGET_EXCEEDED";
+
+export interface ApplicationErrorOptions {
+  readonly retryable?: boolean;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+  readonly cause?: unknown;
+}
+
+export class ApplicationError extends Error {
+  readonly code: ErrorCode;
+  readonly retryable: boolean;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+
+  constructor(code: ErrorCode, message: string, options: ApplicationErrorOptions = {}) {
+    super(message, { cause: options.cause });
+    this.name = "ApplicationError";
+    this.code = code;
+    this.retryable = options.retryable ?? false;
+    if (options.metadata) this.metadata = options.metadata;
+  }
+}
+
+export class ProviderNotAvailableError extends ApplicationError {
+  constructor(kind: string, id: string) {
+    super("PROVIDER_NOT_AVAILABLE", `${kind} provider '${id}' is not registered`, {
+      metadata: { kind, providerId: id },
+    });
+    this.name = "ProviderNotAvailableError";
+  }
+}

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+.local-data/
+.local-sandboxes/
+.sites-runtime/
+benchmark-results/
+.DS_Store
+tests/
+docs/
