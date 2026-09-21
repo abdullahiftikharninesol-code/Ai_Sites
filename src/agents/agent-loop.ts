@@ -11,6 +11,10 @@ import type { SitesToolExecutor } from "./tool-executor.js";
 import { getStageAgentTools } from "./tool-catalog.js";
 import { SITES_CODING_AGENT_PROMPT } from "./prompts/sites-coding-agent.prompt.js";
 import {
+  resolveAgentPrompt,
+  resolveSiteCoderPrompt,
+} from "./prompts/agent-prompt-resolution.js";
+import {
   GenerationCompletionValidator,
   formatCompletionIssues,
   type GenerationCompletionRequirements,
@@ -50,6 +54,8 @@ export interface AgentLoopOptions {
   readonly completionRequirements?: GenerationCompletionRequirements | undefined;
   readonly reasoningPolicy?: ReasoningPolicy | undefined;
   readonly compactHistory?: boolean | undefined;
+  /** Static system prompt selected by the owning agent runtime. */
+  readonly systemInstructions?: string | undefined;
 }
 
 export class AgentCodingLoop {
@@ -88,6 +94,17 @@ export class AgentCodingLoop {
     const validator = this.#options.completionRequirements
       ? new GenerationCompletionValidator(this.tools.executionProvider)
       : undefined;
+    const systemInstructions =
+      this.#options.stage === "TARGETED_EDIT"
+        ? resolveAgentPrompt("sites.targeted-edit", { expectedStage: "TARGETED_EDIT" }).prompt
+            .systemPrompt
+        : this.#options.systemInstructions ??
+          (this.#options.stage === "GENERATE_SITE"
+            ? resolveSiteCoderPrompt().prompt.systemPrompt
+            : this.#options.stage === "BUILD_REPAIR"
+              ? resolveAgentPrompt("sites.build-repair", { expectedStage: "BUILD_REPAIR" }).prompt
+                  .systemPrompt
+              : SITES_CODING_AGENT_PROMPT);
 
     let normalizedFinishReason: NormalizedTerminationReason = "SUCCESS";
 
@@ -100,7 +117,7 @@ export class AgentCodingLoop {
 
       const response = await this.agent.createResponse({
         model: this.agent.getCapabilities().models[0] ?? "mock",
-        systemInstructions: SITES_CODING_AGENT_PROMPT,
+        systemInstructions,
         messages: messagesToSend,
         tools: availableTools,
         maxOutputTokens: this.#options.maxOutputTokens ?? 8_192,

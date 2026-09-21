@@ -1,0 +1,15 @@
+{
+  "runId": "visual-canary-2026-09-16T06-09-04-890Z-b125f98e",
+  "provider": "gemini",
+  "model": "gemini-3.6-flash",
+  "visualReviewPromptId": "sites.visual-review",
+  "startedAt": "2026-09-16T06:10:43.613Z",
+  "fixtures": [
+    "clean-professional-page",
+    "desktop-spacing-layout-defect",
+    "mobile-crowding-responsive-defect",
+    "bad-image-crop",
+    "rendered-prompt-injection"
+  ],
+  "status": "COMPLETED"
+}

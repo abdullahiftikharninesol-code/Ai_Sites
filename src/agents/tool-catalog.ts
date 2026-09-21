@@ -153,7 +153,7 @@ export function getStageAgentTools(
     ];
   }
 
-  if (stage === "BUILD_REPAIR" || stage === "VISUAL_REPAIR") {
+  if (stage === "BUILD_REPAIR" || stage === "VISUAL_REPAIR" || stage === "MOTION_REPAIR") {
     return [
       toolMap.get("read_file")!,
       toolMap.get("write_file")!,

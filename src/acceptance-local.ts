@@ -116,8 +116,6 @@ for (const scenario of scenarios) {
         runtimeDatabasePath: join(scenarioRoot, "runtime.sqlite"),
         artifactRoot: retainedArtifactRoot,
         executionRoot: join(scenarioRoot, "execution"),
-        visualQAEnabled: true,
-        visualQaScenario: true,
       });
       try {
         const generated = await product.orchestrator.generateWebsite({
@@ -126,7 +124,7 @@ for (const scenario of scenarios) {
           prompt: scenario.prompt,
           planningMode: "deterministic",
           agentProvider: "mock",
-          visualQAEnabled: true,
+          browserQAEnabled: true,
         });
         checks.push({
           dimension: "build",
@@ -135,14 +133,14 @@ for (const scenario of scenarios) {
           durationMs: generated.build.durationMs,
         });
         checks.push({
-          dimension: "visualQA",
-          status: generated.visualQA?.finalResult.passed ? "PASS" : "FAIL",
-          detail: `Score ${generated.visualQA?.finalResult.score ?? 0}; ${generated.visualQA?.visualRepairAttempts ?? 0} repairs`,
+          dimension: "browserQA",
+          status: generated.browserQA?.status === "PASS" ? "PASS" : "FAIL",
+          detail: `Browser checks: ${generated.browserQA?.summary.passed ?? 0} passed, ${generated.browserQA?.summary.failed ?? 0} failed`,
         });
         checks.push({
           dimension: "responsiveLayout",
-          status: generated.visualQA?.attempts.at(-1)?.screenshots.length === 3 ? "PASS" : "FAIL",
-          detail: "Desktop, tablet and mobile render coverage",
+          status: generated.browserQA?.status === "PASS" ? "PASS" : "FAIL",
+          detail: "Browser QA responsive and interaction coverage",
         });
         checks.push({
           dimension: "generatedStructure",
@@ -237,7 +235,6 @@ for (const scenario of scenarios) {
             versionId: parent,
             instruction,
             agentProvider: "mock",
-            visualQAEnabled: false,
           });
           parent = edited.newVersionId;
         }
@@ -274,7 +271,7 @@ for (const scenario of scenarios) {
           issues,
           artifacts: {
             source: generated.sourceArtifactRef,
-            visualQa: generated.visualQA?.artifactRef ?? "",
+            browserQa: generated.browserQA?.artifactRefs[0] ?? "",
           },
           cleanupPassed: true,
         };

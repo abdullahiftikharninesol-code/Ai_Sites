@@ -1,4 +1,5 @@
 import type { SiteSpec } from "../../sites/domain/site-spec.js";
+import type { AssetManifest } from "../../sites/assets/asset-domain.js";
 export interface CliTask {
   readonly jobId: string;
   readonly siteId: string;
@@ -7,7 +8,9 @@ export interface CliTask {
   readonly agentProvider?: string;
   readonly userRequest: string;
   readonly siteSpec?: SiteSpec;
+  readonly assetManifest?: AssetManifest;
   readonly target?: { readonly path: string; readonly find: string; readonly replace: string };
+  readonly generationMode?: "FAST_GENERATION" | "ITERATIVE_FALLBACK";
   readonly runContext?: import("../../agents/budget/inference-run-context.js").InferenceRunContext;
   readonly stage?: import("../../agents/budget/agent-run-budget.js").InferenceStage;
   readonly reasoningPolicy?: import("../../agents/agent-types.js").ReasoningPolicy;

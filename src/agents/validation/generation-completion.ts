@@ -125,7 +125,10 @@ export function buildCompletionRequirements(
   siteSpec?: SiteSpec | undefined,
   scaffoldHashes?: Readonly<Record<string, string>> | undefined,
 ): GenerationCompletionRequirements {
-  const requiredFiles = ["src/App.tsx", "src/styles.css"];
+  // The model owns the application entry component. Styles and all project
+  // infrastructure are already present in the deterministic starter and may
+  // be overlaid by the model, but do not need to be reproduced in its bundle.
+  const requiredFiles = ["src/App.tsx"];
   const identity = normalizeSiteSpecIdentity(siteSpec);
 
   const requireNavigation = identity.pageIds.length > 1;
@@ -515,4 +518,3 @@ export function formatCompletionIssues(issues: readonly CompletionIssue[]): stri
   ];
   return lines.join("\n");
 }
-

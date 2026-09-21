@@ -2,10 +2,12 @@ export type InferenceStage =
   | "SITE_PLANNING"
   | "GENERATE_SITE"
   | "BUILD_REPAIR"
+  | "MOTION_REPAIR"
   | "EDIT_PLANNING"
   | "TARGETED_EDIT"
   | "VISUAL_REVIEW"
-  | "VISUAL_REPAIR";
+  | "VISUAL_REPAIR"
+  | "ASSET_PLANNING";
 
 export type BudgetExhaustedReason =
   | "LOGICAL_REQUEST_LIMIT"

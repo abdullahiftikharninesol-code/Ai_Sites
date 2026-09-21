@@ -13,18 +13,15 @@ try {
     databasePath,
     artifactRoot,
     executionRoot: join(root, "runtime-1"),
-    visualQAEnabled: true,
-    visualQaScenario: true,
   });
   const generated = await first.orchestrator.generateWebsite({
     userId,
     prompt: "Create a responsive restart-safe product website",
     planningMode: "deterministic",
     agentProvider: "mock",
-    visualQAEnabled: true,
   });
   console.log(
-    `Instance A: site ${generated.siteId}; V1 ${generated.versionId}; QA ${generated.visualQA!.finalResult.score}`,
+    `Instance A: site ${generated.siteId}; V1 ${generated.versionId}; Browser QA ${generated.browserQA?.status ?? "NOT_RUN"}`,
   );
   await first.close();
   console.log("Instance A database closed");
@@ -32,8 +29,6 @@ try {
     databasePath,
     artifactRoot,
     executionRoot: join(root, "runtime-2"),
-    visualQAEnabled: true,
-    visualQaScenario: true,
   });
   const loaded = await second.queries.getProject(generated.siteId);
   console.log(
@@ -48,9 +43,8 @@ try {
     versionId: generated.versionId,
     instruction: "Change the heading",
     agentProvider: "mock",
-    visualQAEnabled: true,
   });
-  console.log(`Instance B: V2 ${edited.newVersionId}; QA ${edited.visualQA!.finalResult.score}`);
+  console.log(`Instance B: V2 ${edited.newVersionId}; Browser QA ${edited.browserQA?.status ?? "NOT_RUN"}`);
   await second.close();
   const third = createLocalPersistentSitesProduct({
     databasePath,
@@ -72,7 +66,7 @@ try {
     `Artifacts valid: ${(await Promise.all(versions.items.flatMap((version) => [version.sourceArtifactRef, version.sourceManifestRef!, ...(version.finalScreenshotRefs ?? [])]).map((ref) => third.artifacts.exists(ref)))).every(Boolean)}`,
   );
   console.log(
-    `Cleanup: environments=${third.execution.getActiveEnvironmentCount()}, browsers=${third.browserRenderer.activeBrowserCount}`,
+    `Cleanup: environments=${third.execution.getActiveEnvironmentCount()}`,
   );
   await third.close();
   console.log("Instance C database closed; restart boundary verified");

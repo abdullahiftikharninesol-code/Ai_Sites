@@ -16,8 +16,7 @@ export interface VersionSummary {
   parentVersionId?: string;
   createdAt: string;
   buildStatus: string;
-  visualQAStatus?: string;
-  visualQAScore?: number;
+  browserQAStatus?: string;
   runtimeSchemaVersion?: number;
   published: boolean;
 }
@@ -49,18 +48,20 @@ export interface JobStatus {
   currentStage: string;
   projectId?: string;
   versionId?: string;
+  preview?: { sessionId: string; url: string };
   error?: {
     code: string;
     message: string;
     status?: number;
     providerCode?: string;
+    providerParam?: string;
     requestId?: string;
     retryable?: boolean;
+    diagnostics?: string;
   };
   intelligence?: IntelligenceTaskStatus[];
 }
 export const AGENT_TASK_KINDS = [
-  "INTENT_CLASSIFICATION",
   "REQUIREMENTS_PLANNING",
   "DESIGN_PLANNING",
   "CAPABILITY_PLANNING",
@@ -69,11 +70,8 @@ export const AGENT_TASK_KINDS = [
   "INTEGRATION_PLANNING",
   "CONTENT_GENERATION",
   "CODE_GENERATION",
-  "TOOL_LOOP",
   "BUILD_REPAIR",
   "TARGETED_EDIT",
-  "VISUAL_REVIEW",
-  "VISUAL_REPAIR",
 ] as const;
 export type AgentTaskKind = (typeof AGENT_TASK_KINDS)[number];
 export type AgentTaskStatus =
@@ -121,6 +119,14 @@ export interface LocalInstanceStatus {
   createdAt: string;
   lastAccessedAt: string;
   logs: string[];
+}
+export interface SourceFile {
+  path: string;
+  sizeBytes: number;
+  encoding?: "base64";
+}
+export interface SourceFileContent extends SourceFile {
+  content: string;
 }
 const configuredApiUrl: unknown = import.meta.env.VITE_SITES_DEV_API_URL;
 export const DEFAULT_SITES_DEV_API_URL = "http://127.0.0.1:4310";
@@ -233,6 +239,16 @@ export class PlaygroundApiClient {
   }
   previewInstance(id: string) {
     return this.#request<LocalInstanceStatus>(`/api/dev/previews/${encodeURIComponent(id)}`);
+  }
+  sourceFiles(siteId: string, versionId: string): Promise<{ siteId: string; versionId: string; files: SourceFile[] }> {
+    return this.#request(
+      `/api/dev/sites/${encodeURIComponent(siteId)}/versions/${encodeURIComponent(versionId)}/files`,
+    );
+  }
+  sourceFile(siteId: string, versionId: string, path: string): Promise<SourceFileContent> {
+    return this.#request(
+      `/api/dev/sites/${encodeURIComponent(siteId)}/versions/${encodeURIComponent(versionId)}/files?path=${encodeURIComponent(path)}`,
+    );
   }
   stopPreview(id: string) {
     return this.#request<{ stopped: boolean }>(`/api/dev/previews/${id}`, { method: "DELETE" });

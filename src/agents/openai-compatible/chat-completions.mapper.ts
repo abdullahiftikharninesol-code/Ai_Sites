@@ -35,6 +35,7 @@ export interface ChatCompletionLike {
   readonly usage?: {
     readonly prompt_tokens?: number;
     readonly completion_tokens?: number;
+    readonly total_tokens?: number;
     readonly prompt_tokens_details?: { readonly cached_tokens?: number };
     readonly completion_tokens_details?: { readonly reasoning_tokens?: number };
   };
@@ -172,6 +173,7 @@ export function normalizeChatCompletion(
       outputTokens: usage?.completion_tokens ?? 0,
       ...(cached !== undefined ? { cachedInputTokens: cached } : {}),
       ...(reasoning !== undefined ? { reasoningTokens: reasoning } : {}),
+      ...(usage?.total_tokens !== undefined ? { totalTokens: usage.total_tokens } : {}),
     },
     latencyMs,
     finishReason: mapFinish(choice.finish_reason, toolCalls.length),

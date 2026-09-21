@@ -1,6 +1,21 @@
 import { ApplicationError } from "../../app/errors/application-error.js";
-import type { AgentRequest, AgentResponse, AgentToolCall } from "../agent-types.js";
+import type { AgentMessage, AgentRequest, AgentResponse, AgentToolCall } from "../agent-types.js";
 import { isApprovedAgentTool } from "../tool-catalog.js";
+
+function toAnthropicContent(message: AgentMessage): string | Record<string, unknown>[] {
+  if (!message.imageParts?.length) return message.content;
+  return [
+    ...message.imageParts.map((part) => ({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: part.mimeType,
+        data: Buffer.from(part.data).toString("base64"),
+      },
+    })),
+    ...(message.content ? [{ type: "text", text: message.content }] : []),
+  ];
+}
 
 export interface AnthropicMessageRequest {
   readonly model: string;
@@ -61,7 +76,7 @@ export function mapAnthropicRequest(request: AgentRequest): AnthropicMessageRequ
           })),
         ],
       });
-    } else messages.push({ role: message.role, content: message.content });
+    } else messages.push({ role: message.role, content: toAnthropicContent(message) });
   }
   flush();
   return {

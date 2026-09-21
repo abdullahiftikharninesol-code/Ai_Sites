@@ -9,8 +9,6 @@ const root = await mkdtemp(join(tmpdir(), "sites-domain-demo-")),
     databasePath: join(root, "sites.db"),
     runtimeDatabasePath: join(root, "runtime.sqlite"),
     artifactRoot: join(root, "artifacts"),
-    visualQAEnabled: true,
-    visualQaScenario: true,
   },
   userId = "domain-demo" as UserId,
   hostname = "www.example.test";
@@ -39,7 +37,6 @@ try {
       prompt: "Create a custom-domain product site",
       planningMode: "deterministic",
       agentProvider: "mock",
-      visualQAEnabled: true,
     }),
     d1 = await a.deploymentService.deploy({ siteId: v1.siteId, versionId: v1.versionId });
   await a.deploymentService.publish(d1);
@@ -74,7 +71,6 @@ try {
       versionId: v1.versionId,
       instruction: "Change heading",
       agentProvider: "mock",
-      visualQAEnabled: true,
     }),
     d2 = await b.deploymentService.deploy({ siteId: v1.siteId, versionId: v2.newVersionId });
   await b.deploymentService.publish(d2);
@@ -95,7 +91,7 @@ try {
   await gateway2.close();
   b.localDns.clear();
   console.log(
-    `[CLEANUP] environments=${b.execution.getActiveEnvironmentCount()}, browsers=${b.browserRenderer.activeBrowserCount}, simulatedDns=cleared`,
+    `[CLEANUP] environments=${b.execution.getActiveEnvironmentCount()}, simulatedDns=cleared`,
   );
   await b.close();
 } finally {

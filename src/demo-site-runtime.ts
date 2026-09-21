@@ -11,8 +11,6 @@ const common = {
   databasePath: join(root, "platform", "sites.db"),
   runtimeDatabasePath: join(root, "runtime", "sites-runtime.db"),
   artifactRoot: join(root, "artifacts"),
-  visualQAEnabled: true,
-  visualQaScenario: true,
 };
 const userId = "runtime-demo" as UserId;
 try {
@@ -28,9 +26,8 @@ try {
     prompt: "Create a modern agency website with a contact form",
     planningMode: "deterministic",
     agentProvider: "mock",
-    visualQAEnabled: true,
   });
-  console.log("[V1] generated, built, and visually validated");
+  console.log("[V1] generated, built, and browser validated");
   const runtime = await first.siteRuntime.getRuntime(v1.siteId);
   if (!runtime) throw new Error("Runtime was not provisioned");
   const d1 = await first.deploymentService.deploy({ siteId: v1.siteId, versionId: v1.versionId });
@@ -100,9 +97,8 @@ try {
     versionId: v1.versionId,
     instruction: "Change heading",
     agentProvider: "mock",
-    visualQAEnabled: true,
   });
-  console.log("[V2] edited, built, and visually validated");
+  console.log("[V2] edited, built, and browser validated");
   const d2 = await second.deploymentService.deploy({
     siteId: v1.siteId,
     versionId: v2.newVersionId,
@@ -137,7 +133,7 @@ try {
     )
   ).total;
   console.log(
-    `Restart records: ${restarted}\nV2: ${v2.newVersionId}\nRuntime schema: 2\nV2 records: ${afterV2}\nRollback records: ${afterRollback}\nCleanup: environments=${second.execution.getActiveEnvironmentCount()}, browsers=${second.browserRenderer.activeBrowserCount}`,
+    `Restart records: ${restarted}\nV2: ${v2.newVersionId}\nRuntime schema: 2\nV2 records: ${afterV2}\nRollback records: ${afterRollback}\nCleanup: environments=${second.execution.getActiveEnvironmentCount()}`,
   );
   await second.close();
 } finally {

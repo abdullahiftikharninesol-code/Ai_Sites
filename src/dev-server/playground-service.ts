@@ -6,6 +6,7 @@ import { DevJobManager } from "./dev-job-manager.js";
 import { DevelopmentPreviewManager } from "./development-preview-manager.js";
 import { createAgentProviderRegistry } from "../agents/registry/create-agent-provider-registry.js";
 import { loadConfig } from "../app/config/environment.js";
+import type { SiteSourceSnapshot } from "../sites/generation/source-snapshot.js";
 
 export interface PlaygroundConfig {
   host: string;
@@ -19,12 +20,7 @@ export interface PlaygroundConfig {
   dataRoot: string;
   agentProvider: string;
   agentPlanningEnabled?: boolean;
-  visualRepairAttempts?: number;
 }
-const nonNegativeInteger = (value: string | undefined, fallback: number): number => {
-  const parsed = value === undefined ? fallback : Number(value);
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
-};
 export const loadPlaygroundConfig = (env: NodeJS.ProcessEnv = process.env): PlaygroundConfig => ({
   host: env.SITES_DEV_SERVER_HOST ?? "127.0.0.1",
   port: Number(env.SITES_DEV_SERVER_PORT ?? 4310),
@@ -37,7 +33,6 @@ export const loadPlaygroundConfig = (env: NodeJS.ProcessEnv = process.env): Play
   dataRoot: resolve(env.SITES_DEV_DATA_ROOT ?? join(".sites-runtime", "playground")),
   agentProvider: env.SITES_DEV_AGENT_PROVIDER?.trim() || "mock",
   agentPlanningEnabled: env.SITES_DEV_AGENT_PLANNING === "true",
-  visualRepairAttempts: nonNegativeInteger(env.SITES_DEV_VISUAL_REPAIR_ATTEMPTS, 0),
 });
 
 const playgroundOrigins = (env: NodeJS.ProcessEnv): readonly string[] => {
@@ -74,10 +69,6 @@ export class PlaygroundService {
       runtimeDatabasePath: join(config.dataRoot, "runtime.sqlite"),
       artifactRoot: join(config.dataRoot, "artifacts"),
       executionRoot: join(config.dataRoot, "execution"),
-      visualQAEnabled: true,
-      visualQAMaxRepairAttempts: config.visualRepairAttempts ?? 0,
-      // The failure fixture requires a repair pass; default playground sites must be usable.
-      visualQaScenario: (config.visualRepairAttempts ?? 0) > 0,
       ...(realAgentComposition ?? {}),
     });
     this.jobs = new DevJobManager(this.product.progress);
@@ -116,12 +107,18 @@ export class PlaygroundService {
         // capacity on coding rather than on an extra planning request.
         planningMode: this.config.agentPlanningEnabled ? "agent-with-fallback" : "deterministic",
         agentProvider: this.agentProviderId,
-        visualQAEnabled: true,
+        browserQAEnabled: true,
+        retainPreview: true,
         onIntelligence,
+      });
+      const preview = await this.previews.adopt(result.siteId, result.versionId, result.preview.environmentId, {
+        url: result.preview.url!,
+        port: result.preview.port,
       });
       return {
         projectId: result.siteId,
         versionId: result.versionId,
+        preview: { sessionId: preview.id, url: preview.url },
         ...(result.intelligence ? { intelligence: result.intelligence } : {}),
       };
     });
@@ -138,12 +135,18 @@ export class PlaygroundService {
         instruction: prompt,
         agentProvider: this.agentProviderId,
         agentPlanningEnabled: this.config.agentPlanningEnabled === true,
-        visualQAEnabled: true,
+        browserQAEnabled: true,
+        retainPreview: true,
         onIntelligence,
+      });
+      const preview = await this.previews.adopt(result.siteId, result.newVersionId, result.preview.environmentId, {
+        url: result.preview.url!,
+        port: result.preview.port,
       });
       return {
         projectId: result.siteId,
         versionId: result.newVersionId,
+        preview: { sessionId: preview.id, url: preview.url },
         ...(result.intelligence ? { intelligence: result.intelligence } : {}),
       };
     });
@@ -235,6 +238,45 @@ export class PlaygroundService {
   }
   async versions(siteId: string) {
     return (await this.siteDetail(siteId)).versions;
+  }
+  async sourceFiles(siteId: string, versionId: string, requestedPath?: string) {
+    await this.#project(siteId);
+    const version = await this.product.versions.getById(versionId as VersionId);
+    if (!version || version.siteId !== siteId)
+      throw this.#error("VERSION_NOT_FOUND", "Version not found");
+    const artifact = await this.product.artifacts.get(version.sourceArtifactRef);
+    if (!artifact) throw this.#error("SOURCE_NOT_FOUND", "Source snapshot not found");
+    let snapshot: SiteSourceSnapshot;
+    try {
+      snapshot = JSON.parse(Buffer.from(artifact).toString("utf8")) as SiteSourceSnapshot;
+    } catch {
+      throw this.#error("SOURCE_NOT_FOUND", "Source snapshot is unavailable");
+    }
+    const files = snapshot.manifest?.files?.filter((file) => safeSourcePath(file.path)) ?? [];
+    if (requestedPath === undefined) {
+      return {
+        siteId,
+        versionId,
+        files: files.map((file) => ({
+          path: file.path,
+          sizeBytes: file.sizeBytes,
+          ...(file.encoding ? { encoding: file.encoding } : {}),
+        })),
+      };
+    }
+    if (!safeSourcePath(requestedPath)) throw this.#error("INVALID_REQUEST", "Unsafe source path");
+    const file = files.find((candidate) => candidate.path === requestedPath);
+    if (!file) throw this.#error("SOURCE_FILE_NOT_FOUND", "Source file not found");
+    const content = snapshot.files?.[requestedPath];
+    if (typeof content !== "string") throw this.#error("SOURCE_FILE_NOT_FOUND", "Source file not found");
+    return {
+      siteId,
+      versionId,
+      path: requestedPath,
+      sizeBytes: file.sizeBytes,
+      content,
+      ...(file.encoding ? { encoding: file.encoding } : {}),
+    };
   }
   async deleteSite(siteId: string) {
     const project = await this.#project(siteId);
@@ -363,8 +405,7 @@ export class PlaygroundService {
       parentVersionId: version.parentVersionId,
       createdAt: version.createdAt.toISOString(),
       buildStatus: version.buildStatus,
-      visualQAStatus: version.visualQAStatus,
-      visualQAScore: version.visualQAScore,
+      browserQAStatus: version.browserQAStatus,
       runtimeSchemaVersion: version.runtimeSchemaVersion,
       published,
     };
@@ -372,4 +413,15 @@ export class PlaygroundService {
   #error(code: string, message: string) {
     return Object.assign(new Error(message), { code });
   }
+}
+
+function safeSourcePath(value: string): boolean {
+  return Boolean(
+    value &&
+      !value.includes("\\") &&
+      !value.startsWith("/") &&
+      !value.split("/").includes("..") &&
+      !value.split("/").some((part) => /^\.env(?:\.|$)/i.test(part)) &&
+      !/^(?:node_modules|dist)(?:\/|$)/i.test(value),
+  );
 }

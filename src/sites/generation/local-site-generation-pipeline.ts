@@ -6,11 +6,7 @@ import type {
 } from "../../cli/runtime/local-cli-agent-runtime.js";
 import { ApplicationError } from "../../app/errors/application-error.js";
 import type { LocalExecutionProvider } from "../../execution/local/local-execution.provider.js";
-import type {
-  BuildResult,
-  PreviewResult,
-  PreviewSession,
-} from "../../execution/execution-types.js";
+import type { BuildResult, PreviewSession } from "../../execution/execution-types.js";
 import type { ArtifactStore } from "../../persistence/artifact-store.js";
 import type {
   SiteJobRepository,
@@ -46,27 +42,35 @@ import {
   type SiteChangeSummary,
 } from "./source-snapshot.js";
 import type { StarterTemplate, StarterTemplateRegistry } from "./starter-template-registry.js";
-import type { VisualQAReport } from "../../visual-qa/visual-qa-types.js";
-import type { VisualQARunner } from "../../visual-qa/visual-qa-runner.js";
 import type {
   SiteVersionCommitter,
   UnnumberedSiteVersion,
 } from "../../persistence/version-committer.js";
 import { ArtifactNamespace } from "../../persistence/artifact-namespace.js";
 import type { SiteRuntimeProvider } from "../../site-runtime/site-runtime-provider.js";
-import type {
-  AgentPlanningPipeline,
-  AgentEditPlanner,
-  AgentIntentClassifier,
-  VisualAgentReviewer,
-} from "../../agents/intelligence/agent-intelligence.js";
+import type { AgentPlanningPipeline } from "../../agents/intelligence/agent-intelligence.js";
 import type { AgentTaskTelemetry } from "../../agents/intelligence/intelligence-types.js";
 import {
   createInferenceRunContext,
-  type InferenceRunContext,
   type InferenceRunSummary,
 } from "../../agents/budget/inference-run-context.js";
 import type { GenerationCompletionTelemetry } from "../../agents/validation/generation-completion.js";
+import type { AssetManifest } from "../assets/asset-domain.js";
+import type { AdapterBackedAssetResolver } from "../assets/source-adapters.js";
+import type { MediaStore } from "../assets/media-store.js";
+import { persistAssetManifest } from "../assets/asset-manifest-persistence.js";
+import { resolveCapabilities, type ResolvedCapabilities } from "./capability-resolver.js";
+import { analyzeRequestProfile, type RequestProfile } from "./request-profile.js";
+import { logSiteTokenUsage } from "./site-token-usage-log.js";
+import { createAssetIntent } from "../assets/asset-domain.js";
+import type { BrowserQAReport } from "../../browser-qa/browser-qa-domain.js";
+import { BrowserQARunner } from "../../browser-qa/browser-qa-runner.js";
+import { browserQACoreCheckExecutors } from "../../browser-qa/browser-qa-core-checks.js";
+import { browserQAResponsiveAndInteractionChecks } from "../../browser-qa/browser-qa-interaction-checks.js";
+import { browserQARuntimeChecks } from "../../browser-qa/browser-qa-runtime-checks.js";
+import { persistBrowserQAReport } from "../../browser-qa/browser-qa-persistence.js";
+import type { VisualQAReport } from "../../visual-qa/visual-qa-types.js";
+import type { VisualRepairAttempt, VisualReview } from "../../visual-review/visual-review-domain.js";
 export interface GenerateWebsiteRequest {
   readonly userId: UserId;
   readonly prompt: string;
@@ -76,7 +80,9 @@ export interface GenerateWebsiteRequest {
   readonly agentProvider: string;
   readonly technicalProfile?: string;
   readonly signal?: AbortSignal;
-  readonly visualQAEnabled?: boolean;
+  readonly browserQAEnabled?: boolean;
+  readonly assetManifest?: AssetManifest;
+  readonly retainPreview?: boolean;
 }
 export interface EditWebsiteRequest {
   readonly userId: UserId;
@@ -86,8 +92,9 @@ export interface EditWebsiteRequest {
   readonly onIntelligence?: (telemetry: readonly AgentTaskTelemetry[]) => void;
   readonly agentProvider: string;
   readonly signal?: AbortSignal;
-  readonly visualQAEnabled?: boolean;
+  readonly browserQAEnabled?: boolean;
   readonly agentPlanningEnabled?: boolean;
+  readonly retainPreview?: boolean;
 }
 export interface SiteGenerationResult {
   readonly siteId: SiteId;
@@ -101,20 +108,30 @@ export interface SiteGenerationResult {
   readonly changedFiles: SiteChangeSummary;
   readonly warnings: readonly SiteGenerationWarning[];
   readonly usage: CliAgentSessionReport["usage"];
+  /** Historical compatibility data; never produced by the active pipeline. */
   readonly visualQA?: VisualQAReport;
+  readonly browserQA?: BrowserQAReport;
+  readonly visualReview?: VisualReview;
+  readonly visualRepairAttempt?: VisualRepairAttempt;
   readonly intelligence?: readonly AgentTaskTelemetry[];
   readonly inference?: InferenceRunSummary;
   readonly completion?: GenerationCompletionTelemetry;
+  readonly requestProfile?: RequestProfile;
 }
 export interface SiteEditResult {
   readonly siteId: SiteId;
+  readonly jobId: JobId;
   readonly fromVersionId: VersionId;
   readonly newVersionId: VersionId;
   readonly build: BuildResult;
   readonly preview: PreviewSession;
   readonly changedFiles: SiteChangeSummary;
   readonly usage: CliAgentSessionReport["usage"];
+  /** Historical compatibility data; never produced by the active pipeline. */
   readonly visualQA?: VisualQAReport;
+  readonly browserQA?: BrowserQAReport;
+  readonly visualReview?: VisualReview;
+  readonly visualRepairAttempt?: VisualRepairAttempt;
   readonly intelligence?: readonly AgentTaskTelemetry[];
   readonly inference?: InferenceRunSummary;
 }
@@ -130,15 +147,14 @@ export interface LocalSiteGenerationPipelineDependencies {
   agentRequirements?: RequirementsPlanner;
   agentDesign?: DesignPlanner;
   intelligencePlanning?: AgentPlanningPipeline;
-  editPlanning?: AgentEditPlanner;
-  intentClassifier?: AgentIntentClassifier;
-  visualReview?: VisualAgentReviewer;
   progress: SiteProgressPublisher;
   templates: StarterTemplateRegistry;
   template: StarterTemplate;
-  visualQA?: VisualQARunner;
+  browserQA?: BrowserQARunner;
   versionCommitter?: SiteVersionCommitter;
   runtimeProvider?: SiteRuntimeProvider;
+  assetResolver?: AdapterBackedAssetResolver;
+  assetMediaStore?: MediaStore;
 }
 export class LocalSiteGenerationPipeline {
   readonly #snapshots: SiteSourceSnapshotService;
@@ -150,38 +166,32 @@ export class LocalSiteGenerationPipeline {
     this.#snapshots = new SiteSourceSnapshotService(deps.artifacts);
   }
   async generate(request: GenerateWebsiteRequest): Promise<SiteGenerationResult> {
-    this.#scope.validate(request.prompt);
-    const technicalProfile = this.deps.templates.resolveProfile(this.deps.template);
+    const requestProfile = analyzeRequestProfile(request.prompt);
     const siteId = randomUUID() as SiteId;
     const jobId = randomUUID() as JobId;
     const runContext = createInferenceRunContext({
       runId: jobId,
       limits: {
-        maxModelRequests: 3,
+        maxLogicalRequests: requestProfile.complexity === "COMPLEX" ? 3 : 2,
+        maxPhysicalRequests: requestProfile.complexity === "COMPLEX" ? 5 : 4,
       },
       ...(request.signal ? { signal: request.signal } : {}),
     });
-    const isAgentPlanning =
-      (request.planningMode === "agent" || request.planningMode === "agent-with-fallback") &&
-      Boolean(this.deps.intelligencePlanning);
-    const sitePlanResult = isAgentPlanning
-      ? await this.deps.intelligencePlanning!.planSite(request.prompt, request.signal, runContext)
-      : undefined;
-    const intent = sitePlanResult
-      ? undefined
-      : this.deps.intentClassifier
-        ? await this.deps.intentClassifier.classify(
-            request.prompt,
-            "CREATE_SITE",
-            request.signal,
-            runContext,
-          )
-        : undefined;
+    let terminalError: unknown;
+    try {
+    this.#scope.validate(request.prompt);
+    const technicalProfile = this.deps.templates.resolveProfile(this.deps.template);
     if (request.technicalProfile && request.technicalProfile !== technicalProfile.id)
       throw new ApplicationError(
         "UNSUPPORTED_SITE_REQUIREMENT",
         `Unsupported technical profile: ${request.technicalProfile}`,
       );
+    const isAgentPlanning = requestProfile.needsAgentPlanning &&
+      (request.planningMode === "agent" || request.planningMode === "agent-with-fallback") &&
+      Boolean(this.deps.intelligencePlanning);
+    const sitePlanResult = isAgentPlanning
+      ? await this.deps.intelligencePlanning!.planSite(request.prompt, request.signal, runContext)
+      : undefined;
     const now = new Date();
     const project: SiteProject = {
       id: siteId,
@@ -217,11 +227,8 @@ export class LocalSiteGenerationPipeline {
       this.#emit(job, "DESIGNING", 20, "Design planned");
       siteSpec = sitePlanToSiteSpec(project.name, request.prompt, sitePlanResult.value);
     } else {
-      if (intent) request.onIntelligence?.(intent.telemetry);
-      const requirementsPlanner =
-        request.planningMode === "agent" ? this.deps.agentRequirements : this.deps.requirements;
-      const designPlanner =
-        request.planningMode === "agent" ? this.deps.agentDesign : this.deps.design;
+      const requirementsPlanner = this.deps.requirements;
+      const designPlanner = this.deps.design;
       if (!requirementsPlanner || !designPlanner)
         throw new ApplicationError("PLANNING_FAILED", "Agent planning is not configured");
       requirements = await requirementsPlanner.plan(request.prompt);
@@ -231,33 +238,34 @@ export class LocalSiteGenerationPipeline {
       siteSpec = assembleSiteSpec(project.name, request.prompt, requirements, design);
     }
 
+    let assetManifest = request.assetManifest;
+    if (!assetManifest && this.deps.assetResolver) {
+      const resolvedCapabilities = resolveCapabilities(siteSpec, {
+        profile: technicalProfile,
+        requestText: request.prompt,
+      });
+      const intents = deterministicAssetIntents(siteSpec, resolvedCapabilities, request.prompt);
+      if (intents.length > 0) assetManifest = await this.deps.assetResolver.resolve(intents);
+    }
+
     const siteRuntime =
       siteSpec.runtime?.enabled && this.deps.runtimeProvider
         ? await this.deps.runtimeProvider.provisionRuntime(siteId, siteSpec.runtime)
         : undefined;
     const environment = await this.deps.execution.createEnvironment({});
     let codeGenerationCompleted = false;
+    let retainEnvironment = false;
     this.#emit(job, "CREATING_ENVIRONMENT", 30, "Created disposable local workspace");
     try {
       await this.deps.templates.seed(this.deps.execution, environment.id, this.deps.template);
+      if (assetManifest && this.deps.assetMediaStore)
+        for (const asset of assetManifest.assets)
+          await this.deps.assetMediaStore.materialize(this.deps.execution, environment.id, asset);
       this.#packages.validate(await this.deps.execution.readFile(environment.id, "package.json"));
       await this.#installDependencies(environment.id, jobId, "starter");
       this.#emit(job, "GENERATING", 45, "Agent generating website source");
       request.onIntelligence?.([
         this.#statusTelemetry("CODE_GENERATION", "RUNNING", request.agentProvider, true),
-        this.#statusTelemetry("TOOL_LOOP", "PENDING", request.agentProvider),
-        this.#statusTelemetry("BUILD_REPAIR", "NOT_NEEDED", request.agentProvider),
-        this.#statusTelemetry("TARGETED_EDIT", "NOT_NEEDED", request.agentProvider),
-        this.#statusTelemetry(
-          "VISUAL_REVIEW",
-          request.agentProvider === "mock" ? "PENDING" : "UNSUPPORTED",
-          request.agentProvider,
-        ),
-        this.#statusTelemetry(
-          "VISUAL_REPAIR",
-          request.agentProvider === "mock" ? "PENDING" : "UNSUPPORTED",
-          request.agentProvider,
-        ),
       ]);
       const session = await this.deps.runtime.run(
         environment.id,
@@ -267,13 +275,15 @@ export class LocalSiteGenerationPipeline {
           operation: "GENERATE_SITE",
           runtime: "LOCAL_CLI",
           agentProvider: request.agentProvider,
+          generationMode: "FAST_GENERATION" as const,
           userRequest: request.prompt,
           siteSpec,
+          ...(assetManifest ? { assetManifest } : {}),
           limits: {
             maxAgentTurns: 12,
             maxToolCalls: 40,
             maxBuildRepairs: 1,
-            maxModelRequests: 3,
+            maxLogicalRequests: requestProfile.complexity === "COMPLEX" ? 3 : 2,
             maxContextFiles: 24,
             maxContextBytes: 64_000,
             maxLogBytes: 12_000,
@@ -286,16 +296,9 @@ export class LocalSiteGenerationPipeline {
       );
       codeGenerationCompleted = true;
       let intelligenceTelemetry = [
-        ...(sitePlanResult ? sitePlanResult.telemetry : (intent?.telemetry ?? [])),
+        ...(sitePlanResult ? sitePlanResult.telemetry : []),
         this.#sessionTelemetry("CODE_GENERATION", session, "PASS"),
-        this.#sessionTelemetry("TOOL_LOOP", session, "PASS"),
-        this.#sessionTelemetry(
-          "BUILD_REPAIR",
-          session,
-          session.buildAttempts > 1 ? "PASS" : "NOT_NEEDED",
-        ),
-        this.#statusTelemetry("VISUAL_REVIEW", "NOT_NEEDED", request.agentProvider),
-        this.#statusTelemetry("VISUAL_REPAIR", "NOT_NEEDED", request.agentProvider),
+        ...(session.buildRepairInvoked ? [this.#sessionTelemetry("BUILD_REPAIR", session, "PASS")] : []),
       ];
       request.onIntelligence?.(intelligenceTelemetry);
       await this.#projectValidator.validate(this.deps.execution, environment.id);
@@ -307,64 +310,17 @@ export class LocalSiteGenerationPipeline {
         request.agentProvider === "mock" ? "AI Sites Generated Hero" : undefined,
       );
       const versionId = randomUUID() as VersionId;
-      if (request.visualQAEnabled)
-        this.#emit(job, "QA_RUNNING", 75, "Rendering desktop, tablet, and mobile visual QA");
-      const visualQA = await this.#runVisualQA(
-        request.visualQAEnabled,
+      let browserQARun = await this.#runBrowserQA(
+        request.browserQAEnabled,
         siteId,
         versionId,
         previewResult.url,
         siteSpec,
-        environment.id,
-        request.agentProvider,
-        request.signal,
-        (next) => {
-          previewResult = next;
-        },
-        runContext,
+        assetManifest,
       );
-      if (visualQA && this.deps.visualReview) {
-        const screenshots = visualQA.attempts.at(-1)?.screenshots ?? [];
-        const review = await this.deps.visualReview.review(
-          {
-            screenshots,
-            viewports: screenshots.map(({ viewport: name, width, height }) => ({
-              name,
-              width,
-              height,
-            })),
-            deterministicReport: visualQA.finalResult,
-            design: siteSpec.design,
-            requirements: siteSpec.requirements,
-          },
-          request.signal,
-          runContext,
-        );
-        intelligenceTelemetry = [
-          ...intelligenceTelemetry.filter(
-            ({ taskKind }) => taskKind !== "VISUAL_REVIEW" && taskKind !== "VISUAL_REPAIR",
-          ),
-          ...review.telemetry,
-          this.#statusTelemetry(
-            "VISUAL_REPAIR",
-            review.telemetry[0]?.status === "UNSUPPORTED"
-              ? "UNSUPPORTED"
-              : visualQA.visualRepairAttempts > 0
-                ? "PASS"
-                : "NOT_NEEDED",
-            request.agentProvider,
-            visualQA.visualRepairAttempts > 0,
-          ),
-        ];
-        request.onIntelligence?.(intelligenceTelemetry);
-      }
-      if (visualQA)
-        this.#emit(
-          job,
-          "QA_RUNNING",
-          85,
-          `Visual QA passed with score ${visualQA.finalResult.score}`,
-        );
+      // Browser QA is the sole default runtime QA system. Legacy screenshot
+      // review/repair flags remain readable on old request objects but have no
+      // executable production path.
       const sourceArtifactRef = ArtifactNamespace.version(
         siteId,
         versionId,
@@ -377,6 +333,11 @@ export class LocalSiteGenerationPipeline {
         "SOURCE_MANIFEST",
         "manifest.json",
       );
+      const assetManifestArtifactRef = assetManifest
+        ? ArtifactNamespace.version(siteId, versionId, "GENERATED_ASSET", "manifest.json")
+        : undefined;
+      if (assetManifest && assetManifestArtifactRef)
+        await persistAssetManifest(this.deps.artifacts, assetManifestArtifactRef, assetManifest);
       const snapshot = await this.#snapshots.capture(
         this.deps.execution,
         environment.id,
@@ -400,6 +361,7 @@ export class LocalSiteGenerationPipeline {
         siteId,
         sourceArtifactRef,
         sourceManifestRef,
+        ...(assetManifestArtifactRef ? { assetManifestArtifactRef } : {}),
         buildArtifactRef,
         buildStatus: "SUCCEEDED",
         siteSpec,
@@ -407,12 +369,13 @@ export class LocalSiteGenerationPipeline {
         templateId: this.deps.template.templateId,
         templateVersion: this.deps.template.templateVersion,
         changeSummary: changedFiles.summary,
-        ...(visualQA ? this.#versionVisualMetadata(visualQA) : {}),
-        usageSummary: session.usage,
+        ...(browserQARun ? this.#versionBrowserQAMetadata(browserQARun.report, browserQARun.artifactRef) : {}),
+        usageSummary: { ...session.usage, promptTelemetry: runContext.getSummary().promptExecutions },
         ...(siteRuntime ? { runtimeSchemaVersion: siteRuntime.schemaVersion } : {}),
         createdAt: new Date(),
       };
       await this.#commitVersion(project, versionDraft, 1);
+      retainEnvironment = request.retainPreview === true;
       job = { ...job, status: "SUCCEEDED", progress: 100, startedAt: now, completedAt: new Date() };
       await this.deps.jobs.save(job);
       this.#emit(job, "COMPLETED", 100, "Website Version 1 saved");
@@ -428,9 +391,10 @@ export class LocalSiteGenerationPipeline {
         changedFiles,
         warnings: [],
         usage: session.usage,
-        ...(visualQA ? { visualQA } : {}),
+        ...(browserQARun ? { browserQA: browserQARun.report } : {}),
         intelligence: intelligenceTelemetry,
         inference: runContext.getSummary(),
+        requestProfile,
         ...(session.generationCompletion ? { completion: session.generationCompletion } : {}),
       };
     } catch (cause) {
@@ -438,23 +402,6 @@ export class LocalSiteGenerationPipeline {
         ...(codeGenerationCompleted
           ? []
           : [this.#failureTelemetry("CODE_GENERATION", request.agentProvider, cause)]),
-        ...(codeGenerationCompleted
-          ? []
-          : [this.#statusTelemetry("TOOL_LOOP", "NOT_REACHED", request.agentProvider)]),
-        ...(codeGenerationCompleted
-          ? []
-          : [this.#statusTelemetry("BUILD_REPAIR", "NOT_REACHED", request.agentProvider)]),
-        this.#statusTelemetry("TARGETED_EDIT", "NOT_NEEDED", request.agentProvider),
-        this.#statusTelemetry(
-          "VISUAL_REVIEW",
-          request.agentProvider === "mock" ? "NOT_REACHED" : "UNSUPPORTED",
-          request.agentProvider,
-        ),
-        this.#statusTelemetry(
-          "VISUAL_REPAIR",
-          request.agentProvider === "mock" ? "NOT_REACHED" : "UNSUPPORTED",
-          request.agentProvider,
-        ),
       ]);
       job = {
         ...job,
@@ -467,7 +414,13 @@ export class LocalSiteGenerationPipeline {
       await this.deps.jobs.save(job);
       throw cause;
     } finally {
-      await this.deps.execution.destroyEnvironment(environment.id);
+      if (!retainEnvironment) await this.deps.execution.destroyEnvironment(environment.id);
+    }
+    } catch (cause) {
+      terminalError = cause;
+      throw cause;
+    } finally {
+      logSiteTokenUsage("generate", request.agentProvider, runContext.getSummary(), terminalError);
     }
   }
   async edit(request: EditWebsiteRequest): Promise<SiteEditResult> {
@@ -475,19 +428,14 @@ export class LocalSiteGenerationPipeline {
     const runContext = createInferenceRunContext({
       runId: editJobId,
       limits: {
-        maxModelRequests: 3,
+        maxModelRequests: 2,
       },
       ...(request.signal ? { signal: request.signal } : {}),
     });
-    const intent = this.deps.intentClassifier
-      ? await this.deps.intentClassifier.classify(
-          request.instruction,
-          "EDIT_SITE",
-          request.signal,
-          runContext,
-        )
-      : undefined;
-    request.onIntelligence?.(intent?.telemetry ?? []);
+    let terminalError: unknown;
+    try {
+    // Normal edits have one authoritative Targeted Edit request. Intent and
+    // edit-planning agents are historical compatibility surfaces only.
     const project = await this.deps.projects.getById(request.siteId);
     if (!project || project.ownerId !== request.userId)
       throw new ApplicationError("VERSION_NOT_FOUND", "Site project was not found");
@@ -497,6 +445,7 @@ export class LocalSiteGenerationPipeline {
     const parent = await this.deps.versions.getById(fromVersionId);
     if (!parent) throw new ApplicationError("VERSION_NOT_FOUND", "Site version was not found");
     const environment = await this.deps.execution.createEnvironment({});
+    let retainEnvironment = false;
     try {
       const before = await this.#snapshots.restore(
         this.deps.execution,
@@ -505,15 +454,8 @@ export class LocalSiteGenerationPipeline {
       );
       this.#packages.validate(await this.deps.execution.readFile(environment.id, "package.json"));
       await this.#installDependencies(environment.id, String(request.siteId), "restored");
-      const editPlan =
-        request.agentPlanningEnabled && this.deps.editPlanning
-          ? await this.deps.editPlanning.plan(request.instruction, request.signal, runContext)
-          : undefined;
-      request.onIntelligence?.(editPlan?.telemetry ?? []);
       request.onIntelligence?.([
         this.#statusTelemetry("TARGETED_EDIT", "RUNNING", request.agentProvider, true),
-        this.#statusTelemetry("TOOL_LOOP", "PENDING", request.agentProvider),
-        this.#statusTelemetry("BUILD_REPAIR", "NOT_NEEDED", request.agentProvider),
       ]);
       const session = await this.deps.runtime.run(
         environment.id,
@@ -523,28 +465,17 @@ export class LocalSiteGenerationPipeline {
           operation: "EDIT_SITE",
           runtime: "LOCAL_CLI",
           agentProvider: request.agentProvider,
-          userRequest: editPlan
-            ? `${request.instruction}\nValidated edit plan: ${JSON.stringify(editPlan.value)}`
-            : request.instruction,
+          userRequest: request.instruction,
           ...(parent.siteSpec ? { siteSpec: parent.siteSpec } : {}),
-          limits: { maxAgentTurns: 10, maxToolCalls: 30, maxBuildRepairs: 2 },
+          limits: { maxLogicalRequests: 2, maxBuildRepairs: 1 },
           runContext,
         },
         request.signal,
         runContext,
       );
       let intelligenceTelemetry = [
-        ...(intent?.telemetry ?? []),
-        ...(editPlan?.telemetry ?? []),
         this.#sessionTelemetry("TARGETED_EDIT", session, "PASS"),
-        this.#sessionTelemetry("TOOL_LOOP", session, "PASS"),
-        this.#sessionTelemetry(
-          "BUILD_REPAIR",
-          session,
-          session.buildAttempts > 1 ? "PASS" : "NOT_NEEDED",
-        ),
-        this.#statusTelemetry("VISUAL_REVIEW", "NOT_NEEDED", request.agentProvider),
-        this.#statusTelemetry("VISUAL_REPAIR", "NOT_NEEDED", request.agentProvider),
+        ...(session.buildRepairInvoked ? [this.#sessionTelemetry("BUILD_REPAIR", session, "PASS")] : []),
       ];
       request.onIntelligence?.(intelligenceTelemetry);
       await this.#projectValidator.validate(this.deps.execution, environment.id);
@@ -557,55 +488,15 @@ export class LocalSiteGenerationPipeline {
       );
       const versionNumber = parent.versionNumber + 1;
       const newVersionId = randomUUID() as VersionId;
-      const visualQA = await this.#runVisualQA(
-        request.visualQAEnabled,
+      let browserQARun = await this.#runBrowserQA(
+        request.browserQAEnabled,
         request.siteId,
         newVersionId,
         previewResult.url,
         parent.siteSpec,
-        environment.id,
-        request.agentProvider,
-        request.signal,
-        (next) => {
-          previewResult = next;
-        },
-        runContext,
       );
-      if (visualQA && this.deps.visualReview && parent.siteSpec) {
-        const screenshots = visualQA.attempts.at(-1)?.screenshots ?? [];
-        const review = await this.deps.visualReview.review(
-          {
-            screenshots,
-            viewports: screenshots.map(({ viewport: name, width, height }) => ({
-              name,
-              width,
-              height,
-            })),
-            deterministicReport: visualQA.finalResult,
-            design: parent.siteSpec.design,
-            requirements: parent.siteSpec.requirements,
-          },
-          request.signal,
-          runContext,
-        );
-        intelligenceTelemetry = [
-          ...intelligenceTelemetry.filter(
-            ({ taskKind }) => taskKind !== "VISUAL_REVIEW" && taskKind !== "VISUAL_REPAIR",
-          ),
-          ...review.telemetry,
-          this.#statusTelemetry(
-            "VISUAL_REPAIR",
-            review.telemetry[0]?.status === "UNSUPPORTED"
-              ? "UNSUPPORTED"
-              : visualQA.visualRepairAttempts > 0
-                ? "PASS"
-                : "NOT_NEEDED",
-            request.agentProvider,
-            visualQA.visualRepairAttempts > 0,
-          ),
-        ];
-        request.onIntelligence?.(intelligenceTelemetry);
-      }
+      // Browser QA is the sole default runtime QA system. Legacy visual
+      // review/repair flags remain compatibility-readable but cannot execute.
       const sourceArtifactRef = ArtifactNamespace.version(
         request.siteId,
         newVersionId,
@@ -651,45 +542,41 @@ export class LocalSiteGenerationPipeline {
           ? { templateVersion: parent.templateVersion }
           : {}),
         changeSummary: changedFiles.summary,
-        ...(visualQA ? this.#versionVisualMetadata(visualQA) : {}),
-        usageSummary: session.usage,
+        ...(browserQARun ? this.#versionBrowserQAMetadata(browserQARun.report, browserQARun.artifactRef) : {}),
+        usageSummary: { ...session.usage, promptTelemetry: runContext.getSummary().promptExecutions },
         ...(parent.runtimeSchemaVersion !== undefined
           ? { runtimeSchemaVersion: parent.runtimeSchemaVersion }
           : {}),
         createdAt: new Date(),
       };
       await this.#commitVersion(project, versionDraft, versionNumber);
+      retainEnvironment = request.retainPreview === true;
       return {
         siteId: request.siteId,
+        jobId: editJobId as JobId,
         fromVersionId,
         newVersionId,
         build,
         preview: this.#preview(environment.id, previewResult.url, previewResult.port),
         changedFiles,
         usage: session.usage,
-        ...(visualQA ? { visualQA } : {}),
+        ...(browserQARun ? { browserQA: browserQARun.report } : {}),
         intelligence: intelligenceTelemetry,
         inference: runContext.getSummary(),
       };
     } catch (cause) {
       request.onIntelligence?.([
         this.#failureTelemetry("TARGETED_EDIT", request.agentProvider, cause),
-        this.#statusTelemetry("TOOL_LOOP", "NOT_REACHED", request.agentProvider),
-        this.#statusTelemetry("BUILD_REPAIR", "NOT_REACHED", request.agentProvider),
-        this.#statusTelemetry(
-          "VISUAL_REVIEW",
-          request.agentProvider === "mock" ? "NOT_REACHED" : "UNSUPPORTED",
-          request.agentProvider,
-        ),
-        this.#statusTelemetry(
-          "VISUAL_REPAIR",
-          request.agentProvider === "mock" ? "NOT_REACHED" : "UNSUPPORTED",
-          request.agentProvider,
-        ),
       ]);
       throw cause;
     } finally {
-      await this.deps.execution.destroyEnvironment(environment.id);
+      if (!retainEnvironment) await this.deps.execution.destroyEnvironment(environment.id);
+    }
+    } catch (cause) {
+      terminalError = cause;
+      throw cause;
+    } finally {
+      logSiteTokenUsage("edit", request.agentProvider, runContext.getSummary(), terminalError);
     }
   }
   async restoreVersion(
@@ -783,69 +670,41 @@ export class LocalSiteGenerationPipeline {
           : (candidate.code ?? "AGENT_FAILED"),
     };
   }
-  async #runVisualQA(
+  async #runBrowserQA(
     enabled: boolean | undefined,
     siteId: SiteId,
-    versionKey: string,
+    versionId: VersionId,
     previewUrl: string,
     siteSpec: SiteSpec | undefined,
-    environmentId: string,
-    agentProvider: string,
-    signal: AbortSignal | undefined,
-    updatePreview: (preview: PreviewResult & { url: string }) => void,
-    runContext?: InferenceRunContext,
-  ): Promise<VisualQAReport | undefined> {
+    assetManifest?: AssetManifest,
+  ): Promise<{ readonly report: BrowserQAReport; readonly artifactRef: string } | undefined> {
     if (!enabled) return undefined;
-    if (!this.deps.visualQA)
-      throw new ApplicationError("VALIDATION_FAILED", "Visual QA is not configured");
-    const report = await this.deps.visualQA.run({
-      siteId,
-      versionKey,
-      previewUrl,
-      ...(siteSpec ? { siteSpec } : {}),
-      repair: async (context) => {
-        await this.deps.runtime.run(
-          environmentId,
-          {
-            jobId: randomUUID(),
-            siteId,
-            operation: "EDIT_SITE",
-            stage: "VISUAL_REPAIR",
-            runtime: "LOCAL_CLI",
-            agentProvider,
-            userRequest: context,
-            ...(siteSpec ? { siteSpec } : {}),
-            limits: { maxAgentTurns: 8, maxToolCalls: 20, maxBuildRepairs: 1 },
-            ...(runContext ? { runContext } : {}),
-          },
-          signal,
-          runContext,
-        );
-        await this.#projectValidator.validate(this.deps.execution, environmentId);
-        const next = this.deps.execution.getLatestPreview(environmentId);
-        if (!next?.url)
-          throw new ApplicationError("PREVIEW_FAILED", "Visual repair produced no preview");
-        await this.#functional.validate(next.url);
-        updatePreview(next as PreviewResult & { url: string });
-        return next.url;
+    if (!this.deps.browserQA)
+      throw new ApplicationError("VALIDATION_FAILED", "Browser QA is not configured");
+    const checks = [
+      ...browserQACoreCheckExecutors,
+      ...browserQAResponsiveAndInteractionChecks,
+      ...browserQARuntimeChecks.filter(({ definition }) =>
+        definition.checkId !== "broken-images" || (assetManifest?.assets.length ?? 0) > 0,
+      ),
+    ];
+    const report = await this.deps.browserQA.run({
+      runId: `${siteId}-${versionId}`,
+      target: {
+        baseUrl: previewUrl,
+        projectId: siteId,
+        siteVersionId: versionId,
       },
+      routes: siteSpec?.requirements.pages.map(({ path }) => path) ?? ["/"],
+      checks,
+      artifactPrefix: `sites/${siteId}/versions/${versionId}/qa/screenshots/browser`,
     });
-    if (!report.finalResult.passed && this.deps.visualQA.strict)
-      throw new ApplicationError(
-        "VALIDATION_FAILED",
-        `Visual QA did not pass after ${report.visualRepairAttempts} repair attempt(s)`,
-        {
-          metadata: {
-            score: report.finalResult.score,
-            recommendation: report.finalResult.recommendation,
-          },
-        },
-      );
-    if (!report.finalResult.passed)
-      console.warn(
-        `[sites] site=${siteId} visual QA requires manual review score=${report.finalResult.score} repairs=${report.visualRepairAttempts}`,
-      );
-    return report;
+    const artifactRef = await persistBrowserQAReport(this.deps.artifacts, siteId, versionId, report);
+    if (report.status === "FAIL")
+      throw new ApplicationError("VALIDATION_FAILED", "Browser QA failed for generated site", {
+        metadata: { browserQAArtifactRef: artifactRef, failed: report.summary.failed, failureStage: "BROWSER_QA" },
+      });
+    return { report, artifactRef };
   }
   #metadata() {
     const technicalProfile = this.deps.templates.resolveProfile(this.deps.template);
@@ -856,17 +715,13 @@ export class LocalSiteGenerationPipeline {
       templateVersion: this.deps.template.templateVersion,
     };
   }
-  #versionVisualMetadata(report: VisualQAReport) {
-    const final = report.attempts.at(-1);
+  #versionBrowserQAMetadata(report: BrowserQAReport, artifactRef: string) {
     return {
-      visualQAStatus: report.finalResult.passed
+      browserQAStatus: report.status === "PASS"
         ? ("PASSED" as const)
-        : report.finalResult.recommendation === "MANUAL_REVIEW"
-          ? ("MANUAL_REVIEW" as const)
-          : ("FAILED" as const),
-      visualQAScore: report.finalResult.score,
-      visualQAArtifactRef: report.artifactRef,
-      finalScreenshotRefs: final?.screenshots.map((screenshot) => screenshot.artifactRef) ?? [],
+        : ("PASSED_WITH_WARNINGS" as const),
+      browserQAArtifactRef: artifactRef,
+      browserQAScreenshotRefs: report.artifactRefs,
     };
   }
   async #commitVersion(
@@ -954,4 +809,60 @@ export class LocalSiteGenerationPipeline {
       timestamp: new Date(),
     });
   }
+}
+
+export function deterministicAssetIntents(
+  siteSpec: SiteSpec,
+  capabilities: ResolvedCapabilities,
+  requestText = "",
+) {
+  if (!capabilities.capabilities.some(({ id }) => id === "images")) return [];
+  const sourceText = [...siteSpec.requirements.features, requestText].join(" ").toLowerCase();
+  const automotiveRequest = /\b(?:car|cars|auto|automotive|vehicle|vehicles|motor|motors|dealership|roadster|coupe|suv)\b/.test(sourceText);
+  const describe = (value: string): string => automotiveRequest ? `${value} for an automotive website` : value;
+  const page = siteSpec.requirements.pages[0];
+  type ImageRole = "HERO" | "BACKGROUND" | "CONTENT" | "LOGO" | "GALLERY" | "PRODUCT" | "TEAM" | "TESTIMONIAL";
+  const roles: Array<{ role: ImageRole; key: string; description: string }> = [];
+  const addRole = (role: ImageRole, key: string, description: string): void => {
+    if (!roles.some((candidate) => candidate.key === key)) roles.push({ role, key, description });
+  };
+
+  if (/\bbackground\s+(?:image|photo|visual)\b/.test(sourceText))
+    addRole("BACKGROUND", "background", describe("A background image requested for the site"));
+  if (/\b(?:hero|banner|cover)\s+(?:image|photo|visual)?\b|\b(?:hero|banner|cover)\b/.test(sourceText))
+    addRole("HERO", "hero", describe("A welcoming hero image for the primary page"));
+  if (/\b(?:gallery|galleries|photos|photography|portfolio)\b/.test(sourceText))
+    addRole("GALLERY", "gallery", describe("A curated gallery image"));
+  if (/\b(?:product|catalog|shop)\s*(?:image|photo|imagery|photos?)?\b/.test(sourceText))
+    addRole("PRODUCT", "product", describe("Product imagery"));
+  if (/\b(?:team|staff|dentist|doctor)\s*(?:image|photo|portrait|photos?)?\b/.test(sourceText))
+    addRole("TEAM", "team", describe("A team member portrait"));
+  if (/\b(?:testimonial|review)\s*(?:image|photo|visual|photos?)?\b/.test(sourceText))
+    addRole("TESTIMONIAL", "testimonial", describe("A testimonial supporting image"));
+  if (/\b(?:logo|logos|brand\s+mark)\b/.test(sourceText))
+    addRole("LOGO", "logo", describe("A logo or brand mark for the site"));
+
+  const genericImageEvidence = sourceText.replace(
+    /\b(?:background|hero|banner|cover|gallery|galleries|product|catalog|shop|team|staff|dentist|doctor|testimonial|review|logo|logos|brand\s+mark)(?:\s+(?:image|photo|visual|photos?|imagery|portrait))?\b/g,
+    " ",
+  );
+  if (
+    /\b(?:image|images|photo|photos|photograph|photographs|picture|pictures|illustration|illustrations|imagery)\b/.test(
+      genericImageEvidence,
+    )
+  )
+    addRole("CONTENT", "content", describe("A content image requested for the site"));
+
+  return roles.map(({ role, key, description }) => createAssetIntent({
+    intentId: `${key}-image`,
+    logicalAssetId: `${key}-image`,
+    mediaType: "IMAGE",
+    role,
+    ...(page ? { pageId: page.path.replace(/^\//, "") || "home" } : {}),
+    purpose: description,
+    description,
+    required: false,
+    decorative: role === "GALLERY" || role === "PRODUCT" || role === "TEAM" || role === "TESTIMONIAL",
+    altTextIntent: description,
+  }));
 }

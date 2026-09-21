@@ -7,10 +7,28 @@
 
 import { ApplicationError } from "../../app/errors/application-error.js";
 import type {
+  AgentResponse,
   AgentResponseContract,
   StructuredOutputCapability,
   StructuredResponseTelemetry,
 } from "../agent-types.js";
+
+export function assertStructuredResponseComplete(
+  response: Pick<AgentResponse, "finishReason" | "message">,
+  errorContext = "Agent",
+): void {
+  if (response.finishReason !== "length") return;
+  throw new ApplicationError(
+    "MODEL_OUTPUT_TRUNCATED",
+    `${errorContext} output was truncated before the structured response completed`,
+    {
+      metadata: {
+        reason: "MODEL_OUTPUT_TRUNCATED",
+        modelOutputReceived: response.message.content.trim().length > 0,
+      },
+    },
+  );
+}
 
 export interface ParseStructuredResponseOptions<T> {
   readonly content: string;

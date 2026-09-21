@@ -6,6 +6,7 @@ import type {
   SiteIntegrationSpec,
 } from "../../agents/intelligence/intelligence-types.js";
 import { SiteRuntimeSpecValidator } from "../../site-runtime/runtime-validator.js";
+import type { MotionIntent, MotionPolicyPreset } from "../motion/motion-domain.js";
 
 export interface SitePageSpec {
   readonly name: string;
@@ -18,6 +19,10 @@ export interface SiteSpec {
   readonly auth?: SiteAuthSpec;
   readonly integrations?: SiteIntegrationSpec;
   readonly content?: SiteContentPlan;
+  readonly motion?: {
+    readonly policy?: MotionPolicyPreset;
+    readonly intents: readonly MotionIntent[];
+  };
   readonly project: { readonly name: string; readonly description?: string };
   readonly requirements: {
     readonly siteType: string;
@@ -69,6 +74,8 @@ export function validateSiteSpec(value: unknown): SiteSpec {
   )
     return invalid("Technical choices are required");
   if (spec.runtime) new SiteRuntimeSpecValidator().validate(spec.runtime);
+  // `motion` remains readable on historical SiteSpecs, but motion is no
+  // longer an active generation capability or a blocking validation policy.
   return spec as SiteSpec;
 }
 

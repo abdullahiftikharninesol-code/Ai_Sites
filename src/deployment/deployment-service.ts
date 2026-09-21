@@ -49,10 +49,12 @@ export class DeploymentService {
     const version = await this.versions.getById(request.versionId);
     if (!version || version.siteId !== request.siteId)
       throw new ApplicationError("VERSION_NOT_FOUND", "Version not found");
-    if (version.buildStatus !== "SUCCEEDED" || version.visualQAStatus !== "PASSED")
+    const browserQaAccepted = version.browserQAStatus === "PASSED" || version.browserQAStatus === "PASSED_WITH_WARNINGS";
+    const historicalVisualQaAccepted = version.browserQAStatus === undefined && version.visualQAStatus === "PASSED";
+    if (version.buildStatus !== "SUCCEEDED" || (!browserQaAccepted && !historicalVisualQaAccepted))
       throw new ApplicationError(
         "DEPLOYMENT_BUILD_FAILED",
-        "Version has not passed build and Visual QA policy",
+        "Version has not passed build and Browser QA policy",
       );
     const deploymentId = randomUUID() as DeploymentId;
     const restored = await this.pipeline.restoreVersion(version.id);

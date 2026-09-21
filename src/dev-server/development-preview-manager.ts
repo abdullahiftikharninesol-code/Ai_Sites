@@ -44,6 +44,30 @@ export class DevelopmentPreviewManager {
     if (this.#closed) return Promise.reject(new Error("Preview manager is closed"));
     return this.#serialize(siteId, () => this.#start(siteId, versionId));
   }
+  /** Adopt the successful generation environment without restore/install/build. */
+  adopt(siteId: SiteId, versionId: VersionId, environmentId: string, preview: { readonly url: string; readonly port: number }) {
+    if (this.#closed) return Promise.reject(new Error("Preview manager is closed"));
+    return this.#serialize(siteId, async () => {
+      const old = this.#bySite.get(siteId);
+      if (old) await this.#stop(old);
+      const current = this.execution.getLatestPreview(environmentId);
+      if (!current?.url || current.url !== preview.url)
+        throw new Error("Cannot adopt a generation preview whose environment is not ready");
+      const now = new Date().toISOString();
+      const session: DevelopmentPreviewSession = {
+        id: randomUUID(),
+        siteId,
+        versionId,
+        environmentId,
+        url: preview.url,
+        createdAt: now,
+        lastAccessedAt: now,
+      };
+      this.#sessions.set(session.id, session);
+      this.#bySite.set(siteId, session.id);
+      return session;
+    });
+  }
   async #start(siteId: SiteId, versionId: VersionId) {
     const old = this.#bySite.get(siteId);
     if (old) await this.#stop(old);

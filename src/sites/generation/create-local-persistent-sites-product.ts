@@ -101,10 +101,7 @@ export function createLocalPersistentSitesProduct(options: LocalPersistentSitesP
     artifacts,
     close: () => {
       if (!closed) {
-        if (
-          product.execution.getActiveEnvironmentCount() !== 0 ||
-          product.browserRenderer.activeBrowserCount !== 0
-        )
+        if (product.execution.getActiveEnvironmentCount() !== 0)
           throw new Error("Cannot close persistent Sites product with active resources");
         siteRuntime.close();
         database.close();

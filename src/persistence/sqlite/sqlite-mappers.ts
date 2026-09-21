@@ -44,6 +44,8 @@ export const SqliteMappers = {
     const siteSpec = json<SiteVersion["siteSpec"]>(row.site_spec_json);
     const changeSummary = json<readonly string[]>(row.change_summary_json);
     const screenshots = json<readonly string[]>(row.final_screenshot_refs_json);
+    const browserQaScreenshots = json<readonly string[]>(row.browser_qa_screenshot_refs_json);
+    const visualReviewScreenshots = json<readonly string[]>(row.visual_review_screenshot_refs_json);
     const usage = json<Readonly<Record<string, unknown>>>(row.usage_summary_json);
     return {
       id: text(row, "id") as VersionId,
@@ -55,6 +57,9 @@ export const SqliteMappers = {
       sourceArtifactRef: text(row, "source_artifact_ref"),
       ...(optional(row, "source_manifest_ref")
         ? { sourceManifestRef: optional(row, "source_manifest_ref")! }
+        : {}),
+      ...(optional(row, "asset_manifest_artifact_ref")
+        ? { assetManifestArtifactRef: optional(row, "asset_manifest_artifact_ref")! }
         : {}),
       ...(optional(row, "build_artifact_ref")
         ? { buildArtifactRef: optional(row, "build_artifact_ref")! }
@@ -83,6 +88,28 @@ export const SqliteMappers = {
         ? { visualQAArtifactRef: optional(row, "visual_qa_artifact_ref")! }
         : {}),
       ...(screenshots ? { finalScreenshotRefs: screenshots } : {}),
+      ...(optional(row, "browser_qa_status")
+        ? { browserQAStatus: optional(row, "browser_qa_status") as NonNullable<SiteVersion["browserQAStatus"]> }
+        : {}),
+      ...(optional(row, "browser_qa_artifact_ref")
+        ? { browserQAArtifactRef: optional(row, "browser_qa_artifact_ref")! }
+        : {}),
+      ...(browserQaScreenshots ? { browserQAScreenshotRefs: browserQaScreenshots } : {}),
+      ...(optional(row, "visual_review_status")
+        ? { visualReviewStatus: optional(row, "visual_review_status") as NonNullable<SiteVersion["visualReviewStatus"]> }
+        : {}),
+      ...(optional(row, "visual_review_id") ? { visualReviewId: optional(row, "visual_review_id")! } : {}),
+      ...(optional(row, "visual_review_artifact_ref")
+        ? { visualReviewArtifactRef: optional(row, "visual_review_artifact_ref")! }
+        : {}),
+      ...(visualReviewScreenshots ? { visualReviewScreenshotRefs: visualReviewScreenshots } : {}),
+      ...(optional(row, "visual_repair_attempt_id") ? { visualRepairAttemptId: optional(row, "visual_repair_attempt_id")! } : {}),
+      ...(optional(row, "visual_repair_attempt_status")
+        ? { visualRepairAttemptStatus: optional(row, "visual_repair_attempt_status")! }
+        : {}),
+      ...(optional(row, "visual_repair_attempt_artifact_ref")
+        ? { visualRepairAttemptArtifactRef: optional(row, "visual_repair_attempt_artifact_ref")! }
+        : {}),
       ...(usage ? { usageSummary: usage } : {}),
       ...(row.runtime_schema_version !== null && row.runtime_schema_version !== undefined
         ? { runtimeSchemaVersion: Number(row.runtime_schema_version) }

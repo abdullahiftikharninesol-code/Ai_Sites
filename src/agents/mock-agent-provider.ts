@@ -6,7 +6,6 @@ export interface MockAgentProviderOptions {
   readonly generateBrokenSource?: boolean | undefined;
   readonly endlessRepair?: boolean | undefined;
   readonly localCliScenario?: boolean | undefined;
-  readonly visualQaScenario?: boolean | undefined;
   readonly securityScenario?: boolean | undefined;
   readonly skipFinalize?: boolean | undefined;
   readonly omitStyles?: boolean | undefined;
@@ -54,8 +53,81 @@ export class MockAgentProvider implements AgentProvider {
     }
     const last = request.messages.at(-1);
     const text = last?.content ?? "";
-    const task = request.systemInstructions?.match(/SITES_AGENT_TASK:([A-Z_]+)/)?.[1];
-    if (task) {
+    if (request.responseContract?.type === "JSON_SCHEMA" && request.responseContract.name === "BuildRepairPatchBundle") {
+      const patch = text.includes("missing-module")
+        ? { path: "src/App.tsx", find: 'import "./missing-module";\n', replace: "" }
+        : { path: "src/App.tsx", find: "const brokenValue: string = 123;\n", replace: "const brokenValue: string = \"fixed\";\n" };
+      const response: AgentResponse = {
+        id: `mock-response-${this.#responseId++}`,
+        model: request.model,
+        message: { role: "assistant", content: JSON.stringify({ patches: [patch] }) },
+        toolCalls: [], usage: { inputTokens: 24, cachedInputTokens: 4, outputTokens: 12 }, latencyMs: 2,
+        finishReason: "stop",
+        providerBoundaryTelemetry: measureProviderBoundary({ systemInstruction: request.systemInstructions, contents: request.messages, responseSchema: request.responseContract.schema }),
+        structuredOutputTelemetry: { responseContractType: "JSON_SCHEMA", structuredOutputMode: "NATIVE_SCHEMA", structuredOutputValidated: true, fallbackParserUsed: false },
+      };
+      await request.transportHook?.afterPhysicalAttempt?.(0, undefined, response);
+      return response;
+    }
+    if (request.responseContract?.type === "JSON_SCHEMA" && request.responseContract.name === "SiteCoderFileBundle") {
+      const fullText = request.messages.map((message) => message.content).join("\n");
+      const pages = this.#extractPages(fullText);
+      const sections = this.#extractSections(fullText);
+      const pageElements = pages.map((page) =>
+        `<main data-sites-page="${page}">${sections.map((section) => `<section data-sites-section="${section}"><h1>AI Sites Generated Hero</h1><p>Welcome to our modern website.</p></section>`).join("")}</main>`,
+      ).join("");
+      const response: AgentResponse = {
+        id: `mock-response-${this.#responseId++}`,
+        model: request.model,
+        message: { role: "assistant", content: JSON.stringify({ files: [
+          { path: "src/App.tsx", content: `${this.#options.generateBrokenSource ? 'const brokenValue: string = 123;\n' : ""}export function App() { return <div className="app">${pageElements}</div>; }\n` },
+          {
+            path: "src/styles.css",
+            content:
+              ":root { font-family: system-ui; }\nbody { margin: 0; }\nbutton { transition: transform 300ms ease; }\n.hero { transition: opacity 0.3s ease-out; animation: fadeIn 400ms ease-out; }\n@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }\n@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.01ms; transition-duration: 0.01ms; } }\n",
+          },
+        ] }) },
+        toolCalls: [],
+        usage: { inputTokens: 24, cachedInputTokens: 4, outputTokens: 18 },
+        latencyMs: 2,
+        finishReason: "stop",
+        providerBoundaryTelemetry: measureProviderBoundary({ systemInstruction: request.systemInstructions, contents: request.messages, responseSchema: request.responseContract.schema }),
+        structuredOutputTelemetry: { responseContractType: "JSON_SCHEMA", structuredOutputMode: "NATIVE_SCHEMA", structuredOutputValidated: true, fallbackParserUsed: false },
+      };
+      await request.transportHook?.afterPhysicalAttempt?.(0, undefined, response);
+      return response;
+    }
+    if (request.responseContract?.type === "JSON_SCHEMA" && request.responseContract.name === "SiteEditPatchBundle") {
+      const response: AgentResponse = {
+        id: `mock-response-${this.#responseId++}`,
+        model: request.model,
+        message: { role: "assistant", content: JSON.stringify({ patches: [{ path: "src/App.tsx", find: 'className="app">', replace: 'className="app"><h1>AI Sites Updated Hero</h1>' }] }) },
+        toolCalls: [],
+        usage: { inputTokens: 24, cachedInputTokens: 4, outputTokens: 12 },
+        latencyMs: 2,
+        finishReason: "stop",
+        structuredOutputTelemetry: { responseContractType: "JSON_SCHEMA", structuredOutputMode: "NATIVE_SCHEMA", structuredOutputValidated: true, fallbackParserUsed: false },
+      };
+      await request.transportHook?.afterPhysicalAttempt?.(0, undefined, response);
+      return response;
+    }
+    if (request.systemInstructions?.includes("Asset Planning Agent")) {
+      const response: AgentResponse = {
+        id: `mock-response-${this.#responseId++}`,
+        model: request.model,
+        message: { role: "assistant", content: JSON.stringify({ assets: [] }) },
+        toolCalls: [],
+        usage: { inputTokens: 24, cachedInputTokens: 4, outputTokens: 6 },
+        latencyMs: 2,
+        finishReason: "stop",
+      };
+      await request.transportHook?.afterPhysicalAttempt?.(0, undefined, response);
+      return response;
+    }
+    const task = request.systemInstructions?.match(/SITES_AGENT_TASK:([A-Z_]+)/)?.[1] ??
+      (request.systemInstructions?.includes("Site Planning Agent") ? "SITE_PLANNING" :
+        request.systemInstructions?.includes("Edit Planning Agent") ? "TARGETED_EDIT" : undefined);
+    if (task && !this.#options.localCliScenario) {
       const resp = this.#intelligenceResponse(request, task, text);
       await request.transportHook?.afterPhysicalAttempt?.(0, undefined, resp);
       return resp;
@@ -79,7 +151,7 @@ export class MockAgentProvider implements AgentProvider {
         .join("");
 
       const appContent = this.#options.generateBrokenSource
-        ? `import "./missing-module";\nexport function App() { return <div className="app">${pageElements}</div>; }\n`
+        ? `const brokenValue: string = 123;\nexport function App() { return <div className="app">${pageElements}</div>; }\n`
         : `export function App() { return <div className="app">${pageElements}</div>; }\n`;
 
       const generatedCalls: AgentToolCall[] = [
@@ -199,7 +271,7 @@ export class MockAgentProvider implements AgentProvider {
   #intelligenceResponse(request: AgentRequest, task: string, text: string): AgentResponse {
     const normalized = text.toLowerCase();
     const auth =
-      !/without login|no login|without forms or login/.test(normalized) &&
+      !/without login|no login|without forms or login|do not touch login/.test(normalized) &&
       /login|signup|member|protected/.test(normalized);
     const runtime =
       !/without forms|no forms/.test(normalized) &&
@@ -357,25 +429,11 @@ export class MockAgentProvider implements AgentProvider {
           id: "cli-write-broken",
           name: "write_file",
           arguments: {
-            path: "src/App.tsx",
-            content: this.#options.visualQaScenario
-              ? 'import "./missing-module";\nexport function App() { return <main className="visual-qa-hero"><h1>AI Sites Generated Hero</h1></main>; }\n'
-              : 'import "./missing-module";\nexport function App() { return <main><h1>AI Sites Generated Hero</h1></main>; }\n',
+          path: "src/App.tsx",
+            content:
+              'import "./missing-module";\nexport function App() { return <main><h1>AI Sites Generated Hero</h1></main>; }\n',
           },
         },
-        ...(this.#options.visualQaScenario
-          ? [
-              {
-                id: "cli-visual-broken",
-                name: "write_file",
-                arguments: {
-                  path: "src/styles.css",
-                  content:
-                    ":root { font-family: system-ui; }\nbody { margin: 0; }\n.visual-qa-hero { width: 1200px; padding: 2rem; }\n",
-                },
-              } satisfies AgentToolCall,
-            ]
-          : []),
         { id: "cli-build-broken", name: "run_build", arguments: {} },
       ];
     if (last?.role === "tool" && last.toolCallId === "cli-build-broken")
@@ -397,26 +455,6 @@ export class MockAgentProvider implements AgentProvider {
           arguments: { path: "src/App.tsx", find: 'import "./missing-module";\n', replace: "" },
         },
       ];
-    if (
-      last?.role === "user" &&
-      text.includes("Operation: EDIT") &&
-      text.includes("[VISUAL_REPAIR]")
-    )
-      return [
-        {
-          id: "cli-visual-repair",
-          name: "apply_patch",
-          arguments: {
-            path: "src/styles.css",
-            find: ".visual-qa-hero { width: 1200px; padding: 2rem; }",
-            replace:
-              ".visual-qa-hero { width: auto; max-width: 1200px; padding: clamp(1rem, 5vw, 2rem); }",
-          },
-        },
-        { id: "cli-visual-build", name: "run_build", arguments: {} },
-      ];
-    if (last?.role === "tool" && last.toolCallId === "cli-visual-build")
-      return [{ id: "cli-visual-preview", name: "start_preview", arguments: { port: 0 } }];
     if (last?.role === "user" && text.includes("Operation: EDIT"))
       return [
         {

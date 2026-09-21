@@ -1,9 +1,19 @@
 export type AgentRole = "system" | "user" | "assistant" | "tool";
+/** Narrow, provider-neutral image input contract. Screenshots only; never arbitrary SVG/HTML. */
+export type AgentImageMimeType = "image/png";
+export interface AgentImagePart {
+  readonly mimeType: AgentImageMimeType;
+  readonly data: Uint8Array;
+  /** Artifact identity for traceability. Never a local filesystem path. */
+  readonly sourceRef?: string;
+}
 export interface AgentMessage {
   readonly role: AgentRole;
   readonly content: string;
   readonly toolCallId?: string;
   readonly toolCalls?: readonly AgentToolCall[];
+  /** Provider-neutral image attachments carried alongside `content`. Empty/absent for text-only messages. */
+  readonly imageParts?: readonly AgentImagePart[];
   /** Opaque provider continuation parts; never expose in user telemetry. */
   readonly geminiParts?: readonly Record<string, unknown>[];
 }
@@ -34,6 +44,8 @@ export interface AgentCapabilities {
   readonly text?: boolean;
   readonly tools?: boolean;
   readonly vision?: boolean;
+  /** Image MIME types this provider/model actually accepts. Absent/empty means vision must be treated as unsupported. */
+  readonly visionInputMimeTypes?: readonly AgentImageMimeType[];
   readonly toolCalling: boolean;
   readonly streaming: boolean;
   readonly cachedInput: boolean;
@@ -126,6 +138,7 @@ export interface AgentResponse {
     readonly cachedInputTokens?: number;
     readonly outputTokens: number;
     readonly reasoningTokens?: number;
+    readonly totalTokens?: number;
     readonly retryCount?: number;
   };
   readonly latencyMs: number;

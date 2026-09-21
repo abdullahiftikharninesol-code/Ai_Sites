@@ -1,127 +1,39 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
 import {
   PlaygroundApiClient,
-  formatProviderName,
   type IntelligenceTaskStatus,
   type JobStatus,
   type LocalInstanceStatus,
   type ProgressEvent,
   type SiteDetail,
   type SiteSummary,
+  type SourceFile,
 } from "./api-client";
 import "./styles.css";
+import { friendlyError } from "./error-messages";
 
 const northSmilePrompt = `Create a modern responsive website for a dental clinic called NorthSmile Dental.
 
-Pages:
-- Home
-- Services
-- Dentists
-- Contact
-
-Home should include:
-- hero section
-- clinic benefits
-- featured services
-- dentist introduction
-- patient testimonials
-- appointment CTA
-
-Services should present:
-- General Dentistry
-- Teeth Whitening
-- Dental Implants
-- Orthodontics
-
-Dentists should show three dentist profile cards with specialty and short biography.
-
-Contact should include:
-- clinic contact information
-- opening hours
-- appointment/contact form
-
-Design:
-- modern and professional
-- clean medical aesthetic
-- strong typography
-- responsive desktop/mobile layout
-- polished cards and sections
-- clear navigation and CTAs
-
-Use the existing Sites React + TypeScript + CSS architecture.`;
-
-const defaultPrompt =
-  "Build a modern digital consulting company website with Home, Services, About, Testimonials and Contact. Include a working contact form.";
-const defaultEditPrompt =
-  "Make the hero more compact and add a three-column benefits section below it.";
+Pages: Home, Services, Dentists and Contact. Include a welcoming hero, clinic benefits, featured services, three dentist profiles, patient testimonials, opening hours and an appointment form. Use a clean medical aesthetic, strong typography, polished cards, clear navigation and responsive desktop/mobile layout.`;
+const defaultPrompt = "Build a modern digital consulting company website with Home, Services, About, Testimonials and Contact. Include a working contact form.";
 const presets = [
-  {
-    id: "northsmile",
-    label: "NorthSmile Dental",
-    description: "Multi-page clinic site with forms and profile cards",
-    prompt: northSmilePrompt,
-  },
-  {
-    id: "consulting",
-    label: "Consulting studio",
-    description: "Fast baseline for a polished marketing site",
-    prompt: defaultPrompt,
-  },
-  {
-    id: "restaurant",
-    label: "Local restaurant",
-    description: "Menu, story, location and reservation CTA",
-    prompt:
-      "Create a responsive website for a neighborhood restaurant called Ember & Grain. Include Home, Menu, Our Story and Contact pages, a featured dishes section, chef profile, opening hours, location, reservation form and strong mobile layout. Use the existing React + TypeScript + CSS architecture.",
-  },
+  { id: "saas", label: "SaaS", prompt: "Create a polished SaaS landing page for an AI productivity product with pricing, feature sections, testimonials and a sign-up CTA." },
+  { id: "agency", label: "Agency", prompt: "Create a premium creative agency website with a bold hero, services, selected work, team, testimonials and a contact form." },
+  { id: "portfolio", label: "Portfolio", prompt: "Create a modern personal portfolio with an introduction, selected projects, skills, about section and contact form." },
+  { id: "restaurant", label: "Restaurant", prompt: "Create a responsive website for a neighborhood restaurant called Ember & Grain with menu, chef story, opening hours, location and reservation form." },
+  { id: "dental", label: "Dental clinic", prompt: northSmilePrompt },
 ];
-
-const planningTasks: Record<string, IntelligenceTaskStatus["taskKind"]> = {
-  requirements: "REQUIREMENTS_PLANNING",
-  design: "DESIGN_PLANNING",
-  runtime: "RUNTIME_PLANNING",
-  auth: "AUTH_PLANNING",
-  integrations: "INTEGRATION_PLANNING",
-  content: "CONTENT_GENERATION",
-};
-const taskOrder: IntelligenceTaskStatus["taskKind"][] = [
-  "INTENT_CLASSIFICATION",
-  "REQUIREMENTS_PLANNING",
-  "DESIGN_PLANNING",
-  "RUNTIME_PLANNING",
-  "AUTH_PLANNING",
-  "INTEGRATION_PLANNING",
-  "CONTENT_GENERATION",
-  "CODE_GENERATION",
-  "TOOL_LOOP",
-  "BUILD_REPAIR",
-  "TARGETED_EDIT",
-  "VISUAL_REVIEW",
-  "VISUAL_REPAIR",
-];
-const taskNames: Record<IntelligenceTaskStatus["taskKind"], string> = {
-  INTENT_CLASSIFICATION: "Intent",
-  REQUIREMENTS_PLANNING: "Requirements",
-  DESIGN_PLANNING: "Design",
-  CAPABILITY_PLANNING: "Capabilities",
-  RUNTIME_PLANNING: "Runtime planning",
-  AUTH_PLANNING: "Auth planning",
-  INTEGRATION_PLANNING: "Integration planning",
-  CONTENT_GENERATION: "Content",
-  CODE_GENERATION: "Code generation",
-  TOOL_LOOP: "Tool loop",
-  BUILD_REPAIR: "Build repair",
-  TARGETED_EDIT: "Targeted editing",
-  VISUAL_REVIEW: "Visual review",
-  VISUAL_REPAIR: "Visual repair",
-};
-
 type ConnectionState = "loading" | "online" | "offline";
-const readableError = (reason: unknown, fallback: string) =>
-  reason instanceof Error ? reason.message : fallback;
-const formatTime = (value?: string) =>
-  value ? new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "--";
-
+type WorkspaceMode = "PREVIEW" | "CODE";
+type Viewport = "desktop" | "tablet" | "mobile";
+const taskOrder = ["REQUIREMENTS_PLANNING", "DESIGN_PLANNING", "RUNTIME_PLANNING", "AUTH_PLANNING", "INTEGRATION_PLANNING", "CONTENT_GENERATION", "CODE_GENERATION", "BUILD_REPAIR", "TARGETED_EDIT"] as const;
+const taskNames: Partial<Record<IntelligenceTaskStatus["taskKind"], string>> = {
+  REQUIREMENTS_PLANNING: "Requirements", DESIGN_PLANNING: "Design", RUNTIME_PLANNING: "Runtime planning", AUTH_PLANNING: "Auth planning", INTEGRATION_PLANNING: "Integration planning", CONTENT_GENERATION: "Content", CODE_GENERATION: "Site coder", BUILD_REPAIR: "Build repair", TARGETED_EDIT: "Targeted editing",
+};
+const workflowLabels: Record<string, string> = { QUEUED: "Understanding request", PLANNING: "Understanding request", DESIGNING: "Understanding request", CREATING_ENVIRONMENT: "Preparing site", GENERATING: "Generating website", BUILDING: "Building", PREVIEW_READY: "Checking website", QA_RUNNING: "Checking website", SAVING: "Checking website", COMPLETED: "Ready", FAILED: "Needs attention" };
+const workflowOrder = ["Understanding request", "Preparing site", "Generating website", "Building", "Checking website", "Ready"];
+const formatTime = (value?: string) => value ? new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "--";
+const readableError = (reason: unknown, fallback: string) => reason instanceof Error ? reason.message : fallback;
 export function App() {
   const api = useMemo(() => new PlaygroundApiClient(), []);
   const jobController = useRef<AbortController | undefined>(undefined);
@@ -129,850 +41,94 @@ export function App() {
   const [detail, setDetail] = useState<SiteDetail>();
   const [selectedVersion, setSelectedVersion] = useState<string>();
   const [prompt, setPrompt] = useState(defaultPrompt);
-  const [editPrompt, setEditPrompt] = useState(defaultEditPrompt);
-  const [selectedPreset, setSelectedPreset] = useState("consulting");
+  const [editPrompt, setEditPrompt] = useState("");
   const [events, setEvents] = useState<ProgressEvent[]>([]);
   const [intelligence, setIntelligence] = useState<IntelligenceTaskStatus[]>([]);
   const [busy, setBusy] = useState(false);
   const [runStatus, setRunStatus] = useState<JobStatus["status"]>();
+  const [activeJob, setActiveJob] = useState<JobStatus>();
   const [error, setError] = useState("");
-  const [preview, setPreview] = useState<{ id: string; url: string }>();
+  const [preview, setPreview] = useState<{ id: string; url: string; versionId: string }>();
   const [instance, setInstance] = useState<LocalInstanceStatus>();
-  const [width, setWidth] = useState("100%");
+  const [viewport, setViewport] = useState<Viewport>("desktop");
   const [frameKey, setFrameKey] = useState(0);
   const [connection, setConnection] = useState<ConnectionState>("loading");
-  const [lastUpdated, setLastUpdated] = useState<string>();
-  const [mobileProjectsOpen, setMobileProjectsOpen] = useState(false);
-  const [provider, setProvider] = useState("Loading");
-  const [model, setModel] = useState("Loading");
-  const [executionProvider, setExecutionProvider] = useState("Loading");
+  const [mode, setMode] = useState<WorkspaceMode>("PREVIEW");
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [files, setFiles] = useState<SourceFile[]>([]);
+  const [selectedFile, setSelectedFile] = useState<string>();
+  const [fileContents, setFileContents] = useState<Record<string, string>>({});
+  const [sourceLoading, setSourceLoading] = useState(false);
+  const [sourceError, setSourceError] = useState("");
 
-  useEffect(() => () => jobController.current?.abort(), []);
-  const reloadSites = async () => {
-    setSites(await api.sites());
-    setLastUpdated(new Date().toISOString());
-  };
-  const refreshSites = async () => {
-    setError("");
-    try {
-      await reloadSites();
-      setConnection("online");
-    } catch (reason) {
-      setConnection("offline");
-      setError(readableError(reason, "Unable to refresh projects"));
-    }
-  };
+  const reloadSites = async () => setSites(await api.sites());
+  useEffect(() => { void Promise.all([reloadSites(), api.health()]).then(([, health]) => setConnection(health.status === "ok" ? "online" : "offline")).catch(() => setConnection("offline")); return () => jobController.current?.abort(); }, []);
+  useEffect(() => {
+    if (!preview) { setInstance(undefined); return; }
+    let active = true; let timer: ReturnType<typeof setTimeout>;
+    const refresh = () => void api.previewInstance(preview.id).then((value) => active && setInstance(value)).catch(() => active && setInstance(undefined)).finally(() => { if (active) timer = setTimeout(refresh, 2_000); });
+    refresh(); return () => { active = false; clearTimeout(timer); };
+  }, [api, preview?.id]);
   const openSite = async (id: string) => {
     try {
-      const value = await api.site(id);
-      setDetail(value);
-      setSelectedVersion(value.project.latestVersionId ?? value.versions.at(-1)?.versionId);
-      if (value.activePreview)
-        setPreview({
-          id: value.activePreview.previewSessionId,
-          url: value.activePreview.previewUrl,
-        });
-      setMobileProjectsOpen(false);
-    } catch (reason) {
-      setError(readableError(reason, "Unable to open project"));
-    }
+      const value = await api.site(id); const versionId = value.project.latestVersionId ?? value.versions.at(-1)?.versionId;
+      setDetail(value); setSelectedVersion(versionId); setFiles([]); setSelectedFile(undefined); setFileContents({}); setError("");
+      const active = value.activePreview;
+      if (active && active.versionId === versionId) setPreview({ id: active.previewSessionId, url: active.previewUrl, versionId: active.versionId }); else setPreview(undefined);
+    } catch (reason) { setError(readableError(reason, "Unable to open project")); }
   };
-  const deleteSite = async (site: SiteSummary) => {
-    if (!confirm(`Delete ${site.name} and all of its local versions? This cannot be undone.`))
-      return;
-    setBusy(true);
-    setError("");
-    try {
-      await api.deleteSite(site.projectId);
-      if (detail?.project.projectId === site.projectId) {
-        setDetail(undefined);
-        setSelectedVersion(undefined);
-        setPreview(undefined);
-      }
-      await reloadSites();
-    } catch (reason) {
-      setError(readableError(reason, "Unable to delete project"));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  useEffect(() => {
-    void refreshSites();
-    void api
-      .health()
-      .then((health) => {
-        setProvider(formatProviderName(health.agentProvider));
-        setModel(health.agentModel);
-        setExecutionProvider(formatProviderName(health.executionProvider));
-        setConnection("online");
-      })
-      .catch((reason: unknown) => {
-        setProvider("Unavailable");
-        setModel("Unavailable");
-        setExecutionProvider("Unavailable");
-        setConnection("offline");
-        setError(readableError(reason, "Unable to read backend health"));
-      });
-  }, []);
-  useEffect(() => {
-    if (!preview) {
-      setInstance(undefined);
-      return;
-    }
-    let active = true;
-    let timer: ReturnType<typeof setTimeout>;
-    const refresh = () =>
-      void api
-        .previewInstance(preview.id)
-        .then((value) => active && setInstance(value))
-        .catch(() => active && setInstance(undefined))
-        .finally(() => {
-          if (active) timer = setTimeout(refresh, 2_000);
-        });
-    refresh();
-    return () => {
-      active = false;
-      clearTimeout(timer);
-    };
-  }, [api, preview?.id]);
-
-  const followJob = (jobId: string) =>
-    new Promise<JobStatus>((resolve, reject) => {
-      jobController.current?.abort();
-      const controller = new AbortController();
-      jobController.current = controller;
-      setEvents([]);
-      setIntelligence([]);
-      setRunStatus("QUEUED");
-      const updateIntelligence = (task: IntelligenceTaskStatus) =>
-        setIntelligence((current) => [
-          ...current.filter((item) => item.taskKind !== task.taskKind),
-          task,
-        ]);
-      const stop = api.events(
-        jobId,
-        (event) => setEvents((current) => [...current, event].slice(-500)),
-        updateIntelligence,
-      );
-      let timer: ReturnType<typeof setTimeout>;
-      let done = false;
-      const cleanup = () => {
-        done = true;
-        clearTimeout(timer);
-        stop();
-        controller.signal.removeEventListener("abort", cancel);
-      };
-      const cancel = () => {
-        cleanup();
-        reject(new Error("Stopped following job"));
-      };
-      controller.signal.addEventListener("abort", cancel, { once: true });
-      const poll = () =>
-        void api
-          .job(jobId, controller.signal)
-          .then((job) => {
-            if (done) return;
-            setRunStatus(job.status);
-            setIntelligence(job.intelligence ?? []);
-            if (job.status === "SUCCEEDED" || job.status === "FAILED") {
-              cleanup();
-              if (job.status === "FAILED") {
-                const details = [
-                  job.error?.status ? `HTTP ${job.error.status}` : "",
-                  job.error?.providerCode ? `code ${job.error.providerCode}` : "",
-                  job.error?.retryable ? "retryable" : "",
-                ].filter(Boolean);
-                reject(
-                  new Error(
-                    `${job.error?.message ?? "Job failed"}${details.length ? ` (${details.join(", ")})` : ""}`,
-                  ),
-                );
-              } else resolve(job);
-            }
-          })
-          .catch((reason: unknown) => {
-            cleanup();
-            reject(reason instanceof Error ? reason : new Error("Unable to read job status"));
-          })
-          .finally(() => {
-            if (!done) timer = setTimeout(poll, 500);
-          });
-      poll();
-    });
-
-  const startVersionInstance = async (siteId: string, versionId: string) => {
-    if (preview) await api.stopPreview(preview.id);
-    const value = await api.preview(siteId, versionId);
-    setPreview({ id: value.previewSessionId, url: value.previewUrl });
-  };
-  const generate = async () => {
-    setBusy(true);
-    setError("");
-    try {
-      const { jobId } = await api.generate(prompt);
-      const job = await followJob(jobId);
-      await reloadSites();
-      if (job.projectId) await openSite(job.projectId);
-      if (job.projectId && job.versionId) await startVersionInstance(job.projectId, job.versionId);
-    } catch (reason) {
-      setError(readableError(reason, "Generation failed"));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const edit = async () => {
-    if (!detail) return;
-    setBusy(true);
-    setError("");
-    try {
-      const { jobId } = await api.edit(detail.project.projectId, editPrompt, selectedVersion);
-      const job = await followJob(jobId);
-      await openSite(detail.project.projectId);
-      if (job.versionId) setSelectedVersion(job.versionId);
-      if (job.versionId) await startVersionInstance(detail.project.projectId, job.versionId);
-    } catch (reason) {
-      setError(readableError(reason, "Edit failed"));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const startPreview = async () => {
-    if (!detail || !selectedVersion) return;
-    setBusy(true);
-    setError("");
-    try {
-      if (preview) await api.stopPreview(preview.id);
-      const value = await api.preview(detail.project.projectId, selectedVersion);
-      setPreview({ id: value.previewSessionId, url: value.previewUrl });
-    } catch (reason) {
-      setError(readableError(reason, "Unable to start preview"));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const stopPreview = async () => {
-    if (!preview) return;
-    setBusy(true);
-    try {
-      await api.stopPreview(preview.id);
-      setPreview(undefined);
-      setInstance(undefined);
-    } catch (reason) {
-      setError(readableError(reason, "Unable to stop preview"));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const action = async (kind: "publish" | "rollback" | "unpublish") => {
-    if (!detail || !selectedVersion) return;
-    setBusy(true);
-    setError("");
-    try {
-      if (kind === "publish") await api.publish(detail.project.projectId, selectedVersion);
-      else if (kind === "rollback") {
-        const deployment = detail.deployments.find((item) => item.versionId === selectedVersion);
-        if (!deployment || !confirm("Rollback to selected deployment?")) return;
-        await api.rollback(detail.project.projectId, deployment.deploymentId);
-      } else if (confirm("Unpublish this site?")) await api.unpublish(detail.project.projectId);
-      await openSite(detail.project.projectId);
-    } catch (reason) {
-      setError(readableError(reason, "Project action failed"));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const isRateLimited = /429|rate.?limit/i.test(error);
-  const isMockProvider = provider.toLowerCase() === "mock";
-  const sortedIntelligence = [...intelligence].sort(
-    (left, right) => taskOrder.indexOf(left.taskKind) - taskOrder.indexOf(right.taskKind),
-  );
-  const passedTasks = intelligence.filter((task) => task.success || task.status === "PASS").length;
-  const currentVersion = detail?.versions.find((version) => version.versionId === selectedVersion);
-  const selectPreset = (preset: (typeof presets)[number]) => {
-    setSelectedPreset(preset.id);
-    setPrompt(preset.prompt);
-  };
-  const handlePromptKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (
-      (event.ctrlKey || event.metaKey) &&
-      event.key === "Enter" &&
-      !busy &&
-      prompt.trim().length >= 3
-    ) {
-      event.preventDefault();
-      void generate();
-    }
-  };
-
-  return (
-    <div className="shell">
-      <header className="topbar">
-        <div className="brand-lockup">
-          <button
-            className="mobile-menu"
-            aria-label="Toggle projects"
-            aria-expanded={mobileProjectsOpen}
-            onClick={() => setMobileProjectsOpen((open) => !open)}
-          >
-            <span />
-            <span />
-            <span />
-          </button>
-          <span className="brand-mark">S</span>
-          <div>
-            <div className="brand-name">
-              Sites <span>/</span> Lab
-            </div>
-            <p>Local AI website testing console</p>
-          </div>
-        </div>
-        <div className="topbar-center">
-          <span className="live-dot" /> Local workspace <span className="slash">/</span> v0.1
-        </div>
-        <div className="topbar-actions">
-          <div className={`connection-pill ${connection}`}>
-            <span className="connection-dot" />
-            {connection === "loading"
-              ? "Connecting"
-              : connection === "online"
-                ? "API online"
-                : "API offline"}
-          </div>
-          <button
-            className="icon-button"
-            title="Refresh projects"
-            aria-label="Refresh projects"
-            onClick={() => void refreshSites()}
-          >
-            ↻
-          </button>
-        </div>
-      </header>
-
-      <aside className={`sidebar ${mobileProjectsOpen ? "mobile-open" : ""}`}>
-        <div className="sidebar-heading">
-          <div>
-            <span className="eyebrow">WORKSPACE</span>
-            <h2>Projects</h2>
-          </div>
-          <span className="count-badge">{sites.length}</span>
-        </div>
-        <button
-          className="new-project"
-          onClick={() => {
-            setDetail(undefined);
-            setMobileProjectsOpen(false);
-          }}
-        >
-          <span>+</span> New test run
-        </button>
-        <div className="project-list">
-          {sites.length ? (
-            sites.map((site) => (
-              <div
-                className={`project ${detail?.project.projectId === site.projectId ? "active" : ""}`}
-                key={site.projectId}
-              >
-                <button className="project-select" onClick={() => void openSite(site.projectId)}>
-                  <span className="project-icon">{site.name.slice(0, 1).toUpperCase()}</span>
-                  <span className="project-copy">
-                    <strong>{site.name}</strong>
-                    <small>
-                      {site.latestVersion ? `Version ${site.latestVersion}` : "Generating"}
-                    </small>
-                  </span>
-                  <span className="project-arrow">›</span>
-                </button>
-                <button
-                  className="project-delete"
-                  title={`Delete ${site.name}`}
-                  aria-label={`Delete ${site.name}`}
-                  disabled={busy}
-                  onClick={() => void deleteSite(site)}
-                >
-                  ×
-                </button>
-              </div>
-            ))
-          ) : (
-            <div className="sidebar-empty">
-              <span className="empty-folder">○</span>
-              <strong>No projects yet</strong>
-              <span>Your generated sites will appear here.</span>
-            </div>
-          )}
-        </div>
-        <div className="sidebar-footer">
-          <div className="footer-status">
-            <span className={`status-light ${connection}`} />{" "}
-            <span>
-              {connection === "online"
-                ? "Ready for testing"
-                : connection === "loading"
-                  ? "Checking API"
-                  : "Backend unavailable"}
-            </span>
-          </div>
-          {lastUpdated && <small>Synced {formatTime(lastUpdated)}</small>}
-        </div>
-      </aside>
-
-      <main className="workspace">
-        <div className="workspace-header">
-          <div>
-            <span className="eyebrow">{detail ? "PROJECT OVERVIEW" : "TEST WORKBENCH"}</span>
-            <h1>{detail ? detail.project.name : "Build and test a site"}</h1>
-            <p>
-              {detail
-                ? `${detail.project.slug} · choose a version, preview it, then iterate.`
-                : "Turn a plain-language brief into a local, inspectable website."}
-            </p>
-          </div>
-          {detail && (
-            <button className="secondary" onClick={() => setDetail(undefined)}>
-              ← New run
-            </button>
-          )}
-        </div>
-        <section className="system-banner">
-          <div className="banner-icon">✦</div>
-          <div>
-            <strong>{isMockProvider ? "Safe test mode" : `Live ${provider} test mode`}</strong>
-            <span>
-              {isMockProvider
-                ? "Mock intelligence + local execution. No provider quota is used."
-                : `${provider} is active. Requests use your configured provider credential; builds stay local.`}
-            </span>
-          </div>
-          <span className="banner-meta">{model}</span>
-        </section>
-
-        {!detail ? (
-          <section className="builder-card">
-            <div className="builder-intro">
-              <div>
-                <span className="step-label">
-                  <span>01</span> DEFINE YOUR TEST
-                </span>
-                <h2>What should we build?</h2>
-                <p>
-                  Choose a scenario or describe your own site. The prompt is sent to the configured
-                  agent and the result is built inside the local workspace.
-                </p>
-              </div>
-              <div className="builder-decoration">
-                <span />
-                <span />
-                <span />
-              </div>
-            </div>
-            <div className="preset-label">
-              <span>QUICK SCENARIOS</span>
-              <small>Good starting points for repeatable testing</small>
-            </div>
-            <div className="preset-grid">
-              {presets.map((preset) => (
-                <button
-                  key={preset.id}
-                  className={`preset ${selectedPreset === preset.id ? "selected" : ""}`}
-                  onClick={() => selectPreset(preset)}
-                >
-                  <span className="preset-check">{selectedPreset === preset.id ? "✓" : ""}</span>
-                  <strong>{preset.label}</strong>
-                  <small>{preset.description}</small>
-                </button>
-              ))}
-            </div>
-            <label className="field-label" htmlFor="site-prompt">
-              SITE BRIEF <span>{prompt.length.toLocaleString()} / 20,000</span>
-            </label>
-            <textarea
-              id="site-prompt"
-              aria-label="Site prompt"
-              value={prompt}
-              onChange={(event) => {
-                setPrompt(event.target.value);
-                setSelectedPreset("");
-              }}
-              onKeyDown={handlePromptKeyDown}
-              rows={8}
-              placeholder="Describe the pages, sections, style and interactions you want to test..."
-            />
-            <div className="builder-footer">
-              <span className="keyboard-hint">
-                <kbd>Ctrl</kbd>
-                <span>+</span>
-                <kbd>Enter</kbd> to run
-              </span>
-              <button
-                className="primary-action"
-                disabled={busy || prompt.trim().length < 3 || connection === "offline"}
-                onClick={() => void generate()}
-              >
-                <span>{busy ? "Running pipeline" : "Generate website"}</span>
-                <span className="button-arrow">→</span>
-              </button>
-            </div>
-          </section>
-        ) : (
-          <section className="project-card">
-            <div className="project-summary">
-              <div className="site-avatar">{detail.project.name.slice(0, 1).toUpperCase()}</div>
-              <div>
-                <span className="eyebrow">ACTIVE PROJECT</span>
-                <h2>{detail.project.name}</h2>
-                <p>{detail.project.slug}</p>
-              </div>
-              <div className="summary-actions">
-                <span className="version-state">
-                  <span className="status-light online" />{" "}
-                  {detail.project.publishedVersionId ? "Published" : "Draft"}
-                </span>
-              </div>
-            </div>
-            <div className="metric-row">
-              <div>
-                <span>VERSIONS</span>
-                <strong>{detail.versions.length}</strong>
-              </div>
-              <div>
-                <span>SELECTED BUILD</span>
-                <strong>{currentVersion ? `V${currentVersion.versionNumber}` : "—"}</strong>
-              </div>
-              <div>
-                <span>BUILD STATUS</span>
-                <strong className="value-good">{currentVersion?.buildStatus ?? "Ready"}</strong>
-              </div>
-              <div>
-                <span>EXECUTION</span>
-                <strong>{executionProvider}</strong>
-              </div>
-            </div>
-            <div className="section-line">
-              <h3>Version history</h3>
-              <span>Select a build to preview or publish it</span>
-            </div>
-            <div className="versions">
-              {detail.versions.map((version) => (
-                <button
-                  key={version.versionId}
-                  className={selectedVersion === version.versionId ? "selected" : ""}
-                  onClick={() => setSelectedVersion(version.versionId)}
-                >
-                  <span className="version-number">V{version.versionNumber}</span>
-                  <span className="version-info">
-                    <strong>{version.published ? "Published build" : "Draft build"}</strong>
-                    <small>
-                      {formatTime(version.createdAt)} · QA {version.visualQAScore ?? "—"}
-                    </small>
-                  </span>
-                  <span className="version-chevron">›</span>
-                </button>
-              ))}
-            </div>
-            <div className="action-row">
-              <button
-                className="primary-action small"
-                disabled={busy || !selectedVersion}
-                onClick={() => void startPreview()}
-              >
-                Preview selected <span>→</span>
-              </button>
-              <button
-                className="secondary"
-                disabled={busy || !selectedVersion}
-                onClick={() => void action("publish")}
-              >
-                Publish
-              </button>
-              <button
-                className="secondary"
-                disabled={busy || !selectedVersion}
-                onClick={() => void action("rollback")}
-              >
-                Rollback
-              </button>
-              <button
-                className="danger subtle"
-                disabled={busy || !detail.project.publishedDeploymentId}
-                onClick={() => void action("unpublish")}
-              >
-                Unpublish
-              </button>
-              {detail.hostedUrl && (
-                <a className="button-link" href={detail.hostedUrl} target="_blank" rel="noreferrer">
-                  Open published ↗
-                </a>
-              )}
-            </div>
-            <div className="edit-divider">
-              <span className="eyebrow">ITERATE ON THIS SITE</span>
-              <h3>What would you like to change?</h3>
-              <textarea
-                aria-label="Edit prompt"
-                value={editPrompt}
-                onChange={(event) => setEditPrompt(event.target.value)}
-                rows={3}
-              />
-              <button
-                className="secondary"
-                disabled={busy || !editPrompt.trim()}
-                onClick={() => void edit()}
-              >
-                {busy ? "Applying change..." : "Apply edit"} <span>→</span>
-              </button>
-            </div>
-          </section>
-        )}
-
-        {error && (
-          <div className={`error ${isRateLimited ? "rate-limit" : ""}`} role="alert">
-            <div className="error-title">
-              <span>!</span>
-              <strong>
-                {isRateLimited ? "Provider rate limit reached" : "Run needs attention"}
-              </strong>
-            </div>
-            <p>{error}</p>
-            {isRateLimited && (
-              <p>
-                Switch <code>SITES_DEV_AGENT_PROVIDER</code> to <code>mock</code>, restart the
-                backend, and continue local validation.
-              </p>
-            )}
-          </div>
-        )}
-        <div className="telemetry-header">
-          <div>
-            <span className="eyebrow">OBSERVABILITY</span>
-            <h2>Pipeline telemetry</h2>
-          </div>
-          <div className="telemetry-summary">
-            <span>
-              <b>{passedTasks}</b> passed
-            </span>
-            <span>
-              <b>{events.length}</b> events
-            </span>
-            <span className={`status-chip ${runStatus?.toLowerCase() ?? "idle"}`}>
-              {runStatus ?? "READY"}
-            </span>
-          </div>
-        </div>
-        <section className="telemetry-grid">
-          <div className="telemetry-card">
-            <div className="card-heading">
-              <div>
-                <span className="card-kicker">LIVE TRACE</span>
-                <h3>Run progress</h3>
-              </div>
-              <span className={`pulse ${runStatus === "RUNNING" ? "active" : ""}`} />
-            </div>
-            {events.length === 0 ? (
-              <div className="panel-empty">
-                <span className="empty-line" />
-                <strong>No run started</strong>
-                <span>Events will appear here in execution order.</span>
-              </div>
-            ) : (
-              <ol className="events">
-                {events.slice(-12).map((event, index) => (
-                  <li key={`${event.timestamp}-${index}`}>
-                    <span className="event-marker" />
-                    <div>
-                      <strong>{event.stage}</strong>
-                      <span>{event.message}</span>
-                    </div>
-                    <time>{formatTime(event.timestamp)}</time>
-                  </li>
-                ))}
-              </ol>
-            )}
-          </div>
-          <div className="telemetry-card">
-            <div className="card-heading">
-              <div>
-                <span className="card-kicker">TASK BREAKDOWN</span>
-                <h3>Agent intelligence</h3>
-              </div>
-              <span className="task-count">{intelligence.length} tasks</span>
-            </div>
-            <div className="intelligence-grid">
-              {intelligence.length === 0 && (
-                <div className="panel-empty">
-                  <strong>No task telemetry yet</strong>
-                  <span>Start a generation to inspect each agent task.</span>
-                </div>
-              )}
-              {sortedIntelligence.map((task, index) => (
-                <div className="task-item" key={`${task.taskKind}-${index}`}>
-                  <div className="task-title">
-                    <strong>{taskNames[task.taskKind]}</strong>
-                    <span data-status={task.status}>{task.status}</span>
-                  </div>
-                  <small>
-                    {formatProviderName(task.provider)} · {task.model}
-                  </small>
-                  {task.latencyMs > 0 && (
-                    <small>
-                      {task.latencyMs} ms · {task.turns} turn{task.turns === 1 ? "" : "s"} ·{" "}
-                      {task.toolCalls} tool call{task.toolCalls === 1 ? "" : "s"}
-                    </small>
-                  )}
-                  {task.fallbackUsed && (
-                    <small className="warning-text">Agent failed → deterministic fallback</small>
-                  )}
-                  {task.errorCategory && (
-                    <small className="warning-text">{task.errorCategory}</small>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        </section>
-        {detail?.plans && (
-          <details className="plans-disclosure">
-            <summary>
-              <span>Validated planning inspector</span>
-              <small>View structured plan payloads</small>
-            </summary>
-            <div className="plans">
-              {Object.entries(detail.plans).map(([name, plan]) => {
-                const task = intelligence.find((item) => item.taskKind === planningTasks[name]);
-                const source = task?.fallbackUsed
-                  ? "Deterministic Fallback"
-                  : task?.attempted
-                    ? "Agent"
-                    : "Deterministic";
-                return (
-                  <section key={name}>
-                    <strong>{name.charAt(0).toUpperCase() + name.slice(1)}</strong>
-                    <small>Source: {source}</small>
-                    <pre>{JSON.stringify(plan, null, 2)}</pre>
-                  </section>
-                );
-              })}
-            </div>
-          </details>
-        )}
-      </main>
-
-      <section className="preview-panel">
-        <div className="preview-header">
-          <div>
-            <span className="eyebrow">LOCAL OUTPUT</span>
-            <h2>Website preview</h2>
-          </div>
-          {preview ? (
-            <span className="preview-live">
-              <span className="status-light online" /> Live
-            </span>
-          ) : (
-            <span className="preview-live muted-label">Waiting</span>
-          )}
-        </div>
-        <div className="preview-toolbar">
-          <div className="device-switcher">
-            {[
-              ["Desktop", "100%"],
-              ["Tablet", "768px"],
-              ["Mobile", "390px"],
-            ].map(([label, value]) => (
-              <button
-                key={label}
-                className={width === value ? "selected" : ""}
-                onClick={() => setWidth(value)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          {preview && (
-            <div className="preview-actions">
-              <button
-                className="toolbar-button"
-                title="Refresh preview"
-                onClick={() => setFrameKey((key) => key + 1)}
-              >
-                ↻
-              </button>
-              <button className="toolbar-button" onClick={() => void stopPreview()} disabled={busy}>
-                Stop
-              </button>
-              <a className="toolbar-button" href={preview.url} target="_blank" rel="noreferrer">
-                Open ↗
-              </a>
-            </div>
-          )}
-        </div>
-        <div className="frame-wrap">
-          {preview ? (
-            <iframe
-              key={frameKey}
-              title="Generated site preview"
-              src={preview.url}
-              style={{ width }}
-            />
-          ) : (
-            <div className="preview-empty">
-              <div className="preview-orbit">
-                <span>↗</span>
-              </div>
-              <span className="eyebrow">NO ACTIVE PREVIEW</span>
-              <h2>Your site will appear here</h2>
-              <p>Generate a project or select a version, then launch its local preview.</p>
-              <div className="preview-checklist">
-                <span>
-                  <b>01</b> Generate a site
-                </span>
-                <span>
-                  <b>02</b> Select a version
-                </span>
-                <span>
-                  <b>03</b> Start preview
-                </span>
-              </div>
-            </div>
-          )}
-        </div>
-        {instance && (
-          <details className="instance-inspector" open>
-            <summary>
-              <span>Local instance</span>
-              <span className="instance-running">
-                <span className="status-light online" /> Running
-              </span>
-            </summary>
-            <div className="instance-facts">
-              <span>
-                <strong>Processes</strong>
-                {instance.processCount}
-              </span>
-              <span>
-                <strong>Environment</strong>
-                {instance.environmentId}
-              </span>
-              <span className="full-fact">
-                <strong>Workspace</strong>
-                <code>{instance.workspacePath}</code>
-              </span>
-            </div>
-            <pre>
-              {instance.logs.length
-                ? instance.logs.join("\n")
-                : "Preview is running; no process output yet."}
-            </pre>
-          </details>
-        )}
-        <div className="preview-footer">
-          <span>
-            Execution: <strong>{executionProvider}</strong>
-          </span>
-          <span>Port secured locally</span>
-        </div>
-      </section>
-    </div>
-  );
+  const newRun = () => { setDetail(undefined); setSelectedVersion(undefined); setPreview(undefined); setMode("PREVIEW"); setError(""); };
+  const stopPreview = async () => { if (!preview) return; try { await api.stopPreview(preview.id); setPreview(undefined); setInstance(undefined); } catch (reason) { setError(readableError(reason, "Unable to stop preview")); } };
+  const startVersionPreview = async (siteId: string, versionId: string) => { if (preview) await api.stopPreview(preview.id); const value = await api.preview(siteId, versionId); setPreview({ id: value.previewSessionId, url: value.previewUrl, versionId }); };
+  const selectVersion = async (versionId: string) => { setSelectedVersion(versionId); setFiles([]); setSelectedFile(undefined); if (detail && preview?.versionId !== versionId) try { await startVersionPreview(detail.project.projectId, versionId); } catch (reason) { setError(readableError(reason, "Unable to load this version's preview")); } };
+  const followJob = (jobId: string) => new Promise<JobStatus>((resolve, reject) => {
+    jobController.current?.abort(); const controller = new AbortController(); jobController.current = controller; setEvents([]); setIntelligence([]); setActiveJob(undefined); setRunStatus("QUEUED");
+    let timer: ReturnType<typeof setTimeout>; let done = false; const stopEvents = api.events(jobId, (event) => setEvents((current) => [...current, event].slice(-300)), (task) => setIntelligence((current) => [...current.filter((item) => item.taskKind !== task.taskKind), task]));
+    const cleanup = () => { done = true; clearTimeout(timer); stopEvents(); controller.signal.removeEventListener("abort", cancel); }; const cancel = () => { cleanup(); reject(new Error("Stopped following job")); }; controller.signal.addEventListener("abort", cancel, { once: true });
+    const poll = () => void api.job(jobId, controller.signal).then((job) => { if (done) return; setActiveJob(job); setRunStatus(job.status); setIntelligence(job.intelligence ?? []); if (job.status === "SUCCEEDED" || job.status === "FAILED") { cleanup(); if (job.status === "FAILED") reject(Object.assign(new Error(job.error?.message ?? "Job failed"), { job })); else resolve(job); } }).catch((reason) => { cleanup(); reject(reason instanceof Error ? reason : new Error("Unable to read job status")); }).finally(() => { if (!done) timer = setTimeout(poll, 500); });
+    poll();
+  });
+  const finishSuccess = async (job: JobStatus, siteId?: string) => { await reloadSites(); if (siteId ?? job.projectId) await openSite(siteId ?? job.projectId!); if (job.preview && job.versionId) setPreview({ id: job.preview.sessionId, url: job.preview.url, versionId: job.versionId }); };
+  const generate = async () => { if (prompt.trim().length < 3) return; setBusy(true); setError(""); setMode("PREVIEW"); try { const { jobId } = await api.generate(prompt.trim()); await finishSuccess(await followJob(jobId)); } catch (reason) { const job = (reason as { job?: JobStatus }).job; if (job) setActiveJob(job); setError(friendlyError(job, readableError(reason, "We couldn't finish this website."))); } finally { setBusy(false); } };
+  const edit = async () => { if (!detail || editPrompt.trim().length < 3) return; const siteId = detail.project.projectId; setBusy(true); setError(""); try { const { jobId } = await api.edit(siteId, editPrompt.trim(), selectedVersion); await finishSuccess(await followJob(jobId), siteId); setEditPrompt(""); } catch (reason) { const job = (reason as { job?: JobStatus }).job; if (job) setActiveJob(job); setError(friendlyError(job, "We couldn't apply that change.")); } finally { setBusy(false); } };
+  const deleteSite = async (site: SiteSummary) => { if (!confirm(`Delete ${site.name} and all of its local versions? This cannot be undone.`)) return; try { await api.deleteSite(site.projectId); if (detail?.project.projectId === site.projectId) newRun(); await reloadSites(); } catch (reason) { setError(readableError(reason, "Unable to delete project")); } };
+  const loadSourceFiles = async () => { if (!detail || !selectedVersion) return; setSourceLoading(true); setSourceError(""); try { const value = await api.sourceFiles(detail.project.projectId, selectedVersion); setFiles(value.files); const firstText = value.files.find((file) => !file.encoding); setSelectedFile((current) => current && value.files.some((file) => file.path === current) ? current : firstText?.path); } catch (reason) { setSourceError(readableError(reason, "Unable to load generated source")); } finally { setSourceLoading(false); } };
+  useEffect(() => { if (detail && selectedVersion) void loadSourceFiles(); }, [detail?.project.projectId, selectedVersion]);
+  useEffect(() => { if (!detail || !selectedVersion || !selectedFile || files.find((file) => file.path === selectedFile)?.encoding) return; const key = `${selectedVersion}:${selectedFile}`; if (fileContents[key] !== undefined) return; setSourceLoading(true); setSourceError(""); void api.sourceFile(detail.project.projectId, selectedVersion, selectedFile).then((value) => setFileContents((current) => ({ ...current, [key]: value.content }))).catch((reason) => setSourceError(readableError(reason, "Unable to load source file"))).finally(() => setSourceLoading(false)); }, [detail?.project.projectId, selectedVersion, selectedFile, files]);
+  const currentVersion = detail?.versions.find((version) => version.versionId === selectedVersion); const currentSource = selectedVersion && selectedFile ? fileContents[`${selectedVersion}:${selectedFile}`] : undefined; const currentStage = activeJob?.currentStage ?? events.at(-1)?.stage ?? "QUEUED";
+  return <div className="sites-module"><header className="sites-module-header"><button className="sites-module-title" onClick={newRun} aria-label="Open Sites"><span className="sites-module-mark">S</span><span><strong>Sites</strong><small>Website builder</small></span></button><div className="sites-module-actions"><span className={`connection-state ${connection}`}><i />{connection === "online" ? "Ready" : connection === "loading" ? "Connecting" : "Offline"}</span><button className="icon-button" aria-label="Refresh projects" onClick={() => void reloadSites()}>↻</button></div></header><main className="sites-content">{!detail && !busy && <StartScreen sites={sites} busy={busy} onNew={newRun} onOpen={openSite} onDelete={deleteSite} prompt={prompt} setPrompt={setPrompt} onGenerate={generate} />}{!detail && busy && <GenerationView events={events} currentStage={currentStage} runStatus={runStatus} viewport={viewport} setViewport={setViewport} />}{detail && <ProjectWorkspace detail={detail} selectedVersion={selectedVersion} currentVersion={currentVersion} onBack={newRun} onSelectVersion={selectVersion} mode={mode} setMode={setMode} viewport={viewport} setViewport={setViewport} preview={preview} frameKey={frameKey} refreshPreview={() => setFrameKey((key) => key + 1)} onStartPreview={() => detail && selectedVersion ? void startVersionPreview(detail.project.projectId, selectedVersion) : undefined} onStopPreview={() => void stopPreview()} instance={instance} files={files} selectedFile={selectedFile} setSelectedFile={setSelectedFile} currentSource={currentSource} sourceLoading={sourceLoading} sourceError={sourceError} editPrompt={editPrompt} setEditPrompt={setEditPrompt} onEdit={edit} busy={busy} setDetailsOpen={setDetailsOpen} />}{error && <ErrorNotice message={error} job={activeJob} onRetry={detail ? edit : generate} onDetails={() => setDetailsOpen(true)} canRetry={!busy && (detail ? editPrompt.trim().length >= 3 : prompt.trim().length >= 3)} />}</main>{detailsOpen && <TechnicalDetails job={activeJob} intelligence={intelligence} events={events} version={currentVersion} previewReused={Boolean(preview)} onClose={() => setDetailsOpen(false)} />}</div>;
 }
+
+function SitesProjects({ sites, busy, onNew, onOpen, onDelete }: { sites: SiteSummary[]; busy: boolean; onNew: () => void; onOpen: (id: string) => void; onDelete: (site: SiteSummary) => void }) { return <section className="sites-projects" aria-label="Recent Sites"><div className="sites-projects-heading"><div><span className="overline">SITES</span><h2>Recent sites</h2></div><button className="new-project" onClick={onNew}>＋ New website</button></div>{sites.length ? <div className="sites-project-grid">{sites.map((site) => <article className="site-project-card" key={site.projectId}><button className="site-project-open" onClick={() => onOpen(site.projectId)}><span className="project-avatar">{site.name.slice(0, 1).toUpperCase()}</span><span><strong>{site.name}</strong><small>{site.latestVersion ? `Version ${site.latestVersion}` : "In progress"}</small></span></button><button className="delete-project" aria-label={`Delete ${site.name}`} disabled={busy} onClick={() => onDelete(site)}>×</button></article>)}</div> : <div className="sites-projects-empty">Your generated sites will appear here.</div>}</section>; }
+function StartScreen({ sites, busy, onNew, onOpen, onDelete, prompt, setPrompt, onGenerate }: { sites: SiteSummary[]; busy: boolean; onNew: () => void; onOpen: (id: string) => void; onDelete: (site: SiteSummary) => void; prompt: string; setPrompt: (value: string) => void; onGenerate: () => void }) { const submit = (event: FormEvent) => { event.preventDefault(); onGenerate(); }; return <section className="start-screen"><div className="start-copy"><span className="eyebrow">SITES</span><h1>What do you want to build?</h1><p>Describe your website and Sites will build it for you.</p></div><PromptComposer value={prompt} setValue={setPrompt} onSubmit={submit} buttonLabel="Generate" placeholder="Build a modern SaaS website for an AI meeting assistant..." /><div className="example-section"><div className="section-label"><span>Try an example</span><small>Or write your own prompt</small></div><div className="preset-grid">{presets.map((preset) => <button className="preset-chip" key={preset.id} onClick={() => setPrompt(preset.prompt)}><span>{preset.label}</span><i>↗</i></button>)}</div></div><div className="start-note"><span>✦</span><span>Every site includes a responsive layout, live preview and readable source code.</span></div><SitesProjects sites={sites} busy={busy} onNew={onNew} onOpen={onOpen} onDelete={onDelete} /></section>; }
+function PromptComposer({ value, setValue, onSubmit, buttonLabel, placeholder }: { value: string; setValue: (value: string) => void; onSubmit: (event: FormEvent) => void; buttonLabel: string; placeholder: string }) { const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); onSubmit(event); } }; return <form className="prompt-composer" onSubmit={onSubmit}><textarea aria-label={placeholder} value={value} onChange={(event) => setValue(event.target.value)} onKeyDown={onKeyDown} placeholder={placeholder} rows={5} /><div className="composer-footer"><span className="composer-hint"><kbd>⌘</kbd><kbd>↵</kbd> to generate</span><button className="primary-button" type="submit">{buttonLabel}<span>→</span></button></div></form>; }
+function GenerationView({ events, currentStage, runStatus, viewport, setViewport }: { events: ProgressEvent[]; currentStage: string; runStatus?: JobStatus["status"]; viewport: Viewport; setViewport: (value: Viewport) => void }) { const currentLabel = workflowLabels[currentStage] ?? "Generating website"; const reached = new Set(events.map((event) => workflowLabels[event.stage]).filter(Boolean)); if (runStatus === "SUCCEEDED") reached.add("Ready"); const activeIndex = Math.max(0, workflowOrder.indexOf(currentLabel)); return <section className="generating-screen"><div className="generation-card"><div className="generation-title"><span className="loader" /><div><span className="eyebrow">WORKING ON IT</span><h1>Building your website</h1><p>We’re turning your idea into a real, responsive site.</p></div></div><div className="friendly-steps">{workflowOrder.slice(0, Math.max(activeIndex + 1, reached.size || 1)).map((label, index) => <div className={`friendly-step ${reached.has(label) || index < activeIndex ? "done" : index === activeIndex ? "current" : ""}`} key={label}><span>{reached.has(label) || index < activeIndex ? "✓" : index === activeIndex ? "•" : "○"}</span><strong>{label}</strong></div>)}</div><div className="generation-events">{events.slice(-3).map((event, index) => <p key={`${event.timestamp}-${index}`}>{event.message}</p>)}</div></div><div className="waiting-preview"><div className="preview-topline"><span>Live preview</span><span className="preview-badge">Preparing</span></div><div className="preview-placeholder"><div className="placeholder-window"><span /><span /><span /></div><strong>Your website will appear here</strong><small>Preview becomes available when the build is ready.</small></div><ViewportSwitcher viewport={viewport} setViewport={setViewport} /></div></section>; }
+function ProjectWorkspace({ detail, selectedVersion, currentVersion, onBack, onSelectVersion, mode, setMode, viewport, setViewport, preview, frameKey, refreshPreview, onStartPreview, onStopPreview, instance, files, selectedFile, setSelectedFile, currentSource, sourceLoading, sourceError, editPrompt, setEditPrompt, onEdit, busy, setDetailsOpen }: { detail: SiteDetail; selectedVersion?: string; currentVersion?: SiteDetail["versions"][number]; onBack: () => void; onSelectVersion: (id: string) => void; mode: WorkspaceMode; setMode: (mode: WorkspaceMode) => void; viewport: Viewport; setViewport: (viewport: Viewport) => void; preview?: { id: string; url: string; versionId: string }; frameKey: number; refreshPreview: () => void; onStartPreview: () => void; onStopPreview: () => void; instance?: LocalInstanceStatus; files: SourceFile[]; selectedFile?: string; setSelectedFile: (path?: string) => void; currentSource?: string; sourceLoading: boolean; sourceError: string; editPrompt: string; setEditPrompt: (value: string) => void; onEdit: () => void; busy: boolean; setDetailsOpen: (open: boolean) => void }) { const status = busy ? "Building" : currentVersion?.browserQAStatus === "FAILED" || currentVersion?.buildStatus === "FAILED" ? "Needs attention" : currentVersion ? "Saved" : "Ready"; return <section className="workspace-screen"><header className="workspace-header"><div className="workspace-title"><button className="back-button" onClick={onBack}>← <span>Projects</span></button><div><h1>{detail.project.name}</h1><span>{detail.project.slug}</span></div></div><div className="workspace-actions"><StatusPill status={status} /><VersionSelector versions={detail.versions} selectedVersion={selectedVersion} onSelect={onSelectVersion} /><button className="details-button" onClick={() => setDetailsOpen(true)}>View details</button></div></header><div className="workspace-body"><ConversationPanel detail={detail} editPrompt={editPrompt} setEditPrompt={setEditPrompt} onEdit={onEdit} busy={busy} /><section className="canvas"><div className="canvas-header"><div className="mode-switcher" role="tablist" aria-label="Workspace view"><button className={mode === "PREVIEW" ? "active" : ""} onClick={() => setMode("PREVIEW")} role="tab" aria-selected={mode === "PREVIEW"}>Preview</button><button className={mode === "CODE" ? "active" : ""} onClick={() => setMode("CODE")} role="tab" aria-selected={mode === "CODE"}>Code</button></div>{mode === "PREVIEW" ? <ViewportSwitcher viewport={viewport} setViewport={setViewport} /> : <span className="readonly-label">Read-only source</span>}</div>{mode === "PREVIEW" ? <PreviewPanel preview={preview} frameKey={frameKey} viewport={viewport} onRefresh={refreshPreview} onStart={onStartPreview} onStop={onStopPreview} instance={instance} /> : <CodePanel files={files} selectedFile={selectedFile} setSelectedFile={setSelectedFile} content={currentSource} loading={sourceLoading} error={sourceError} />}</section></div></section>; }
+function ConversationPanel({ detail, editPrompt, setEditPrompt, onEdit, busy }: { detail: SiteDetail; editPrompt: string; setEditPrompt: (value: string) => void; onEdit: () => void; busy: boolean }) { const submit = (event: FormEvent) => { event.preventDefault(); onEdit(); }; return <aside className="conversation"><div className="conversation-heading"><span className="eyebrow">CONVERSATION</span><h2>Keep shaping it</h2></div><div className="messages"><div className="message user-message"><span className="message-avatar">You</span><div><small>You asked</small><p>{detail.project.name} website</p></div></div><div className="message sites-message"><span className="message-avatar sites-avatar">S</span><div><small>Sites</small><p>Your website is ready to explore. Ask for a change whenever you like.</p></div></div></div><form className="edit-composer" onSubmit={submit}><textarea aria-label="Ask Sites for a change" value={editPrompt} onChange={(event) => setEditPrompt(event.target.value)} placeholder="Ask Sites for a change..." rows={4} /><div><span>Describe a visual or content change</span><button className="send-button" disabled={busy || editPrompt.trim().length < 3} type="submit">{busy ? "Updating…" : "Send change"}<b>↑</b></button></div></form></aside>; }
+function PreviewPanel({ preview, frameKey, viewport, onRefresh, onStart, onStop, instance }: { preview?: { id: string; url: string; versionId: string }; frameKey: number; viewport: Viewport; onRefresh: () => void; onStart: () => void; onStop: () => void; instance?: LocalInstanceStatus }) { return <div className="preview-area"><div className="preview-toolbar"><div><span className={`live-indicator ${preview ? "on" : ""}`} />{preview ? "Live preview" : "Preview not started"}</div><div className="preview-toolbar-actions">{preview ? <><button onClick={onRefresh} aria-label="Refresh preview">↻</button><button onClick={onStop}>Stop</button><a href={preview.url} target="_blank" rel="noreferrer">Open ↗</a></> : <button className="toolbar-primary" onClick={onStart}>Open preview</button>}</div></div><div className="iframe-stage">{preview ? <iframe key={frameKey} title="Generated website preview" src={preview.url} className={`viewport-${viewport}`} /> : <div className="empty-preview"><div className="empty-preview-icon">✦</div><h2>Preview your website</h2><p>Start the preview to see this version come to life.</p><button className="primary-button" onClick={onStart}>Open preview <span>→</span></button></div>}</div>{instance && <details className="preview-instance"><summary>Preview is running <span>View local details</span></summary><div><span>Environment <b>{instance.environmentId}</b></span><span>Processes <b>{instance.processCount}</b></span></div></details>}</div>; }
+function ViewportSwitcher({ viewport, setViewport }: { viewport: Viewport; setViewport: (viewport: Viewport) => void }) { return <div className="viewport-switcher" aria-label="Preview size"><button className={viewport === "desktop" ? "active" : ""} onClick={() => setViewport("desktop")}>Desktop</button><button className={viewport === "tablet" ? "active" : ""} onClick={() => setViewport("tablet")}>Tablet</button><button className={viewport === "mobile" ? "active" : ""} onClick={() => setViewport("mobile")}>Mobile</button></div>; }
+type TreeEntry = { path: string; label: string; folder: boolean; children?: TreeEntry[] };
+function CodePanel({ files, selectedFile, setSelectedFile, content, loading, error }: { files: SourceFile[]; selectedFile?: string; setSelectedFile: (path?: string) => void; content?: string; loading: boolean; error: string }) { return <div className="code-area"><aside className="file-tree"><div className="file-tree-heading">FILES <span>{files.filter((file) => !file.encoding).length}</span></div>{loading && !files.length ? <div className="tree-message">Loading files…</div> : error && !files.length ? <div className="tree-message error-text">{error}</div> : buildFileTree(files.filter((file) => !file.encoding)).map((entry) => <FileTreeEntry entry={entry} key={entry.path} selectedFile={selectedFile} setSelectedFile={setSelectedFile} />)}</aside><section className="code-viewer"><div className="code-header"><span>{selectedFile ?? "Select a file"}</span>{selectedFile && <button onClick={() => content && void navigator.clipboard?.writeText(content)}>Copy</button>}</div>{error && files.length ? <div className="code-empty error-text">{error}</div> : !selectedFile ? <div className="code-empty">Select a source file to inspect it.</div> : loading && content === undefined ? <div className="code-empty">Loading source…</div> : <pre className="source-code" aria-label={`${selectedFile} source code`}><code>{(content ?? "").split("\n").map((line, index) => <span className="code-line" key={index}><i>{index + 1}</i><b>{highlightLine(line, selectedFile)}</b></span>)}</code></pre>}</section></div>; }
+function buildFileTree(files: SourceFile[]): TreeEntry[] { const root: TreeEntry[] = []; for (const file of files.slice().sort((a, b) => a.path.localeCompare(b.path))) { let current = root; const parts = file.path.split("/"); parts.forEach((part, index) => { const path = parts.slice(0, index + 1).join("/"); let entry = current.find((item) => item.path === path); if (!entry) { entry = { path, label: part, folder: index < parts.length - 1, ...(index < parts.length - 1 ? { children: [] } : {}) }; current.push(entry); } current = entry.children ?? []; }); } return root; }
+function FileTreeEntry({ entry, selectedFile, setSelectedFile }: { entry: TreeEntry; selectedFile?: string; setSelectedFile: (path?: string) => void }) { const [open, setOpen] = useState(true); if (entry.folder) return <div className="tree-folder"><button onClick={() => setOpen((value) => !value)}><span>{open ? "⌄" : "›"}</span> {entry.label}</button>{open && <div>{entry.children?.map((child) => <FileTreeEntry entry={child} key={child.path} selectedFile={selectedFile} setSelectedFile={setSelectedFile} />)}</div>}</div>; return <button className={`tree-file ${selectedFile === entry.path ? "selected" : ""}`} onClick={() => setSelectedFile(entry.path)}><span>•</span>{entry.label}</button>; }
+function highlightLine(line: string, path = "") { const parts = line.split(/(\/\/.*|\/\*.*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:const|let|var|function|return|export|default|import|from|interface|type|class|extends|if|else|true|false|null|undefined|async|await)\b|\b\d+(?:\.\d+)?\b)/g); return parts.map((part, index) => { const kind = /^\/\//.test(part) || /^\/\*/.test(part) ? "comment" : /^(?:const|let|var|function|return|export|default|import|from|interface|type|class|extends|if|else|true|false|null|undefined|async|await)$/.test(part) ? "keyword" : /^\d/.test(part) ? "number" : /^(?:["'`])/.test(part) ? "string" : path.endsWith(".css") && /--?[a-z-]+/.test(part) ? "property" : ""; return <span className={kind} key={`${index}-${part}`}>{part}</span>; }); }
+function VersionSelector({ versions, selectedVersion, onSelect }: { versions: SiteDetail["versions"]; selectedVersion?: string; onSelect: (id: string) => void }) { return <label className="version-selector"><span>Version</span><select value={selectedVersion ?? ""} onChange={(event) => onSelect(event.target.value)} aria-label="Select version">{versions.slice().reverse().map((version) => <option value={version.versionId} key={version.versionId}>V{version.versionNumber}{version.versionId === selectedVersion ? " · Current" : ""}</option>)}</select></label>; }
+function StatusPill({ status }: { status: string }) { return <span className={`status-pill ${status.toLowerCase().replace(" ", "-")}`}><i />{status}</span>; }
+function ErrorNotice({ message, job, onRetry, onDetails, canRetry }: { message: string; job?: JobStatus; onRetry: () => void; onDetails: () => void; canRetry: boolean }) {
+  const failure = job?.error;
+  return <section className="error-notice" role="alert"><div className="error-icon">!</div><div>
+    <h2>{message.includes("couldn't") ? message : "We couldn't finish this website"}</h2>
+    <p>{message}</p>
+    {failure && <small>
+      {failure.status !== undefined && <>HTTP {failure.status} · </>}
+      {failure.providerCode ?? failure.code}
+      {failure.providerParam && <> · {failure.providerParam}</>}
+      {failure.requestId && <> · Request {failure.requestId}</>}
+    </small>}
+    <div className="error-actions"><button onClick={onDetails}>View details</button><button className="primary-button small" disabled={!canRetry} onClick={onRetry}>Try again</button></div>
+    {failure?.retryable && <small>This issue may resolve if you try again shortly.</small>}
+  </div></section>;
+}
+function TechnicalDetails({ job, intelligence, events, version, previewReused, onClose }: { job?: JobStatus; intelligence: IntelligenceTaskStatus[]; events: ProgressEvent[]; version?: SiteDetail["versions"][number]; previewReused: boolean; onClose: () => void }) { const ordered = intelligence.slice().sort((a, b) => taskOrder.indexOf(a.taskKind as never) - taskOrder.indexOf(b.taskKind as never)); const input = intelligence.reduce((sum, item) => sum + (item.inputTokens ?? 0), 0); const output = intelligence.reduce((sum, item) => sum + (item.outputTokens ?? 0), 0); return <div className="details-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><aside className="details-drawer" role="dialog" aria-modal="true" aria-label="Technical details"><header><div><span className="eyebrow">DEVELOPER VIEW</span><h2>Run details</h2></div><button onClick={onClose} aria-label="Close details">×</button></header><div className="details-content"><DetailGroup title="Run"><DetailRow label="Job ID" value={job?.id ?? "—"} mono /><DetailRow label="Status" value={job?.status ?? "Ready"} /><DetailRow label="Last stage" value={job?.currentStage ?? events.at(-1)?.stage ?? "—"} /></DetailGroup><DetailGroup title="Provider"><DetailRow label="Provider" value={intelligence[0]?.provider ?? "—"} /><DetailRow label="Model" value={intelligence[0]?.model ?? "—"} /></DetailGroup><DetailGroup title="Usage"><DetailRow label="Request profile" value={intelligence.some((item) => item.attempted) ? "Active" : "Deterministic"} /><DetailRow label="Planner calls" value={String(intelligence.filter((item) => /PLANNING|CONTENT/.test(item.taskKind) && item.attempted).length)} /><DetailRow label="Input tokens" value={String(input)} /><DetailRow label="Output tokens" value={String(output)} /><DetailRow label="Total tokens" value={String(input + output)} /></DetailGroup><DetailGroup title="Checks"><DetailRow label="Build" value={version?.buildStatus === "SUCCEEDED" ? "PASS" : version?.buildStatus ?? "—"} /><DetailRow label="Browser QA" value={version?.browserQAStatus ?? "—"} /><DetailRow label="Build repair used" value={intelligence.some((item) => item.taskKind === "BUILD_REPAIR" && item.attempted) ? "YES" : "NO"} /><DetailRow label="Preview reused" value={previewReused ? "YES" : "NO"} /></DetailGroup>{job?.error?.diagnostics && <DetailGroup title="Build diagnostics"><pre className="source-code"><code>{job.error.diagnostics}</code></pre></DetailGroup>}<DetailGroup title="Task trace">{ordered.length ? ordered.map((item) => <div className="task-row" key={item.taskKind}><span>{taskNames[item.taskKind] ?? item.taskKind}</span><b data-status={item.status}>{item.status}</b></div>) : <p className="muted-copy">No run telemetry available.</p>}</DetailGroup></div></aside></div>; }
+function DetailGroup({ title, children }: { title: string; children: ReactNode }) { return <section className="detail-group"><h3>{title}</h3>{children}</section>; }
+function DetailRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) { return <div className="detail-row"><span>{label}</span><b className={mono ? "mono" : ""}>{value}</b></div>; }

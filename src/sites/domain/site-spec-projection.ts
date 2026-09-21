@@ -16,13 +16,11 @@ import type { GenerationCompletionRequirements } from "../../agents/validation/g
  * Retained fields (lossless for frontend generation):
  * - Project name & description
  * - Site type
- * - Canonical pages (with deterministic marker IDs)
- * - Canonical sections (with deterministic marker IDs)
+ * - Canonical pages and sections
  * - Full content plan, copy, headlines, testimonials, brand voice
  * - Full design tokens (colors, typography, theme, style, spacing)
  * - Features and functional requirements
  * - Integrations & authentication specifications
- * - Structural marker identities for Phase 2 validation
  */
 export interface GenerationSiteSpec {
   readonly project: {
@@ -35,12 +33,10 @@ export interface GenerationSiteSpec {
     readonly name: string;
     readonly path: string;
     readonly purpose?: string | undefined;
-    readonly markerAttr: string;
   }[];
   readonly sections: readonly {
     readonly id: string;
     readonly name: string;
-    readonly markerAttr: string;
   }[];
   readonly features: readonly string[];
   readonly design: SiteSpec["design"];
@@ -52,12 +48,6 @@ export interface GenerationSiteSpec {
   };
   readonly integrations?: SiteSpec["integrations"] | undefined;
   readonly auth?: SiteSpec["auth"] | undefined;
-  readonly structuralContract: {
-    readonly pageMarkerAttribute: "data-sites-page";
-    readonly sectionMarkerAttribute: "data-sites-section";
-    readonly requiredPageMarkers: readonly string[];
-    readonly requiredSectionMarkers: readonly string[];
-  };
 }
 
 /**
@@ -74,7 +64,6 @@ export function toGenerationSiteSpec(
       name: p.name,
       path: p.path,
       ...(p.purpose ? { purpose: p.purpose } : {}),
-      markerAttr: `data-sites-page="${id}"`,
     };
   });
 
@@ -95,17 +84,8 @@ export function toGenerationSiteSpec(
     return {
       id,
       name,
-      markerAttr: `data-sites-section="${id}"`,
     };
   });
-
-  const requiredPageMarkers = requirements?.requiredPages
-    ? requirements.requiredPages.map((p) => canonicalizeIdentifier(p))
-    : pages.map((p) => p.id);
-
-  const requiredSectionMarkers = requirements?.requiredSections
-    ? requirements.requiredSections.map((s) => canonicalizeIdentifier(s))
-    : sections.map((s) => s.id);
 
   return {
     project: {
@@ -125,11 +105,5 @@ export function toGenerationSiteSpec(
     },
     ...(spec.integrations ? { integrations: spec.integrations } : {}),
     ...(spec.auth ? { auth: spec.auth } : {}),
-    structuralContract: {
-      pageMarkerAttribute: "data-sites-page",
-      sectionMarkerAttribute: "data-sites-section",
-      requiredPageMarkers,
-      requiredSectionMarkers,
-    },
   };
 }

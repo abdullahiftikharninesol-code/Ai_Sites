@@ -9,11 +9,6 @@ import {
   DeterministicDesignPlanner,
   DeterministicRequirementsPlanner,
 } from "../../planning/planning.js";
-import type {
-  VisualQAResult,
-  SiteScreenshotArtifact,
-  ViewportPreset,
-} from "../../visual-qa/visual-qa-types.js";
 import { IntelligenceValidators } from "./intelligence-validators.js";
 import type {
   AgentTaskKind,
@@ -21,7 +16,6 @@ import type {
   IntelligenceRunResult,
   PlanningExecutionStrategy,
   PlanningMode,
-  SiteEditPlan,
   SiteIntent,
   SiteIntentResult,
   SitePlanningBundle,
@@ -32,10 +26,16 @@ import {
   planningBundleToSitePlan,
   sitePlanToPlanningBundle,
 } from "../../sites/domain/site-plan.js";
+import { SITE_PLAN_JSON_SCHEMA } from "../../sites/domain/site-plan-schema.js";
 import {
-  SITE_PLAN_JSON_SCHEMA,
-  SITE_EDIT_PLAN_JSON_SCHEMA,
-} from "../../sites/domain/site-plan-schema.js";
+  AGENT_CONTRACT_REGISTRY,
+  type AgentContractRegistry,
+} from "../contracts/agent-contract.js";
+import {
+  PROMPT_REGISTRY,
+  type PromptDefinition,
+  type PromptRegistry,
+} from "../prompts/prompt-registry.js";
 import {
   parseStructuredResponse,
   stripOuterMarkdownFence,
@@ -70,62 +70,6 @@ export interface IntelligenceOptions {
   readonly strategy?: PlanningExecutionStrategy;
   readonly model?: string;
   readonly timeoutMs?: number;
-}
-
-export class AgentIntentClassifier {
-  readonly #validators = new IntelligenceValidators();
-  constructor(
-    private readonly agent: AgentProvider,
-    private readonly model?: string,
-  ) {}
-  async classify(
-    prompt: string,
-    explicitIntent?: SiteIntent,
-    signal?: AbortSignal,
-    runContext?: InferenceRunContext,
-  ): Promise<IntelligenceRunResult<SiteIntentResult>> {
-    // Generate/edit/publish routes already know their intent. Avoid spending a
-    // provider request to rediscover information supplied by the application.
-    if (explicitIntent)
-      return {
-        value: deterministicIntent(prompt, explicitIntent),
-        telemetry: [
-          {
-            taskKind: "INTENT_CLASSIFICATION",
-            provider: this.agent.id,
-            model: this.model ?? this.agent.getCapabilities().models[0] ?? "unknown",
-            attempted: false,
-            supported: true,
-            success: true,
-            fallbackUsed: false,
-            latencyMs: 0,
-            turns: 0,
-            toolCalls: 0,
-            status: "PASS",
-          },
-        ],
-      };
-    try {
-      const scopedAgent = runContext ? runContext.createScopedProvider(this.agent, "SITE_PLANNING") : this.agent;
-      const response = await request(
-        scopedAgent,
-        this.model,
-        "INTENT_CLASSIFICATION",
-        prompt,
-        signal,
-      );
-      return {
-        value: this.#validators.validateIntent(parse(response)),
-        telemetry: [telemetry(this.agent, "INTENT_CLASSIFICATION", response, "PASS")],
-      };
-    } catch (cause) {
-      const value = deterministicIntent(prompt, explicitIntent);
-      return {
-        value,
-        telemetry: [failureTelemetry(this.agent, "INTENT_CLASSIFICATION", cause, true)],
-      };
-    }
-  }
 }
 
 export class AgentPlanningPipeline {
@@ -184,6 +128,7 @@ export class AgentPlanningPipeline {
         signal,
         this.options.timeoutMs,
         contract,
+        resolveSitePlanningPrompt().systemPrompt,
       );
       const capability =
         scopedAgent.getCapabilities().structuredOutputCapability ?? "FALLBACK_TEXT";
@@ -372,156 +317,6 @@ export class AgentPlanningPipeline {
   }
 }
 
-export class AgentEditPlanner {
-  readonly #validators = new IntelligenceValidators();
-  constructor(
-    private readonly agent: AgentProvider,
-    private readonly model?: string,
-  ) {}
-  async plan(
-    instruction: string,
-    signal?: AbortSignal,
-    runContext?: InferenceRunContext,
-  ): Promise<IntelligenceRunResult<SiteEditPlan>> {
-    try {
-      const scopedAgent = runContext
-        ? runContext.createScopedProvider(this.agent, "EDIT_PLANNING")
-        : this.agent;
-      const contract: AgentResponseContract = {
-        type: "JSON_SCHEMA",
-        name: "SiteEditPlan",
-        schema: SITE_EDIT_PLAN_JSON_SCHEMA,
-      };
-      const response = await request(
-        scopedAgent,
-        this.model,
-        "TARGETED_EDIT",
-        instruction,
-        signal,
-        30_000,
-        contract,
-      );
-      const capability =
-        scopedAgent.getCapabilities().structuredOutputCapability ?? "FALLBACK_TEXT";
-      const parseResult = parseStructuredResponse<SiteEditPlan>({
-        content: response.message.content,
-        contract,
-        capability,
-        validate: (parsed) => this.#validators.validateEdit(parsed),
-        errorContext: "Edit planning",
-      });
-      return {
-        value: parseResult.value,
-        telemetry: [
-          telemetry(
-            this.agent,
-            "TARGETED_EDIT",
-            response,
-            "PASS",
-            true,
-            undefined,
-            parseResult.telemetry,
-          ),
-        ],
-      };
-    } catch (cause) {
-      const lower = instruction.toLowerCase();
-      const value: SiteEditPlan = {
-        requestedChanges: [instruction.slice(0, 500)],
-        mustPreserve: ["runtime", "auth", "integrations", "unrequested routes and sections"],
-        likelyAffectedAreas:
-          lower.includes("hero") || lower.includes("heading") ? ["hero"] : ["requested component"],
-        mutations: {
-          runtime: /database|collection|runtime/.test(lower),
-          auth: /auth|login|signup/.test(lower),
-          integration: /integration|action|api/.test(lower),
-        },
-      };
-      return { value, telemetry: [failureTelemetry(this.agent, "TARGETED_EDIT", cause, true)] };
-    }
-  }
-}
-
-export interface VisualAgentCritique {
-  readonly overallAssessment: string;
-  readonly issues: readonly {
-    readonly severity: "INFO" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
-    readonly category: string;
-    readonly description: string;
-    readonly suggestedChange: string;
-  }[];
-  readonly repairRecommended: boolean;
-}
-export class VisualAgentReviewer {
-  constructor(
-    private readonly agent: AgentProvider,
-    private readonly model?: string,
-  ) {}
-  async review(
-    input: {
-      screenshots: readonly SiteScreenshotArtifact[];
-      viewports: readonly ViewportPreset[];
-      deterministicReport: VisualQAResult;
-      design: unknown;
-      requirements: unknown;
-    },
-    signal?: AbortSignal,
-    runContext?: InferenceRunContext,
-  ): Promise<IntelligenceRunResult<VisualAgentCritique | undefined>> {
-    const capabilities = this.agent.getCapabilities();
-    if (capabilities.vision !== true)
-      return {
-        value: undefined,
-        telemetry: [
-          {
-            taskKind: "VISUAL_REVIEW",
-            provider: this.agent.id,
-            model: this.model ?? capabilities.models[0] ?? "unknown",
-            attempted: false,
-            supported: false,
-            success: false,
-            fallbackUsed: false,
-            latencyMs: 0,
-            turns: 0,
-            toolCalls: 0,
-            errorCategory: "UNSUPPORTED_CAPABILITY",
-            status: "UNSUPPORTED",
-          },
-        ],
-      };
-    try {
-      // Artifact references and viewport facts are passed; adapters may map them to normalized multimodal parts.
-      const scopedAgent = runContext
-        ? runContext.createScopedProvider(this.agent, "VISUAL_REVIEW")
-        : this.agent;
-      const response = await request(
-        scopedAgent,
-        this.model,
-        "VISUAL_REVIEW",
-        JSON.stringify(input),
-        signal,
-      );
-      const candidate = parse(response) as VisualAgentCritique;
-      if (
-        !candidate ||
-        typeof candidate.overallAssessment !== "string" ||
-        !Array.isArray(candidate.issues) ||
-        typeof candidate.repairRecommended !== "boolean"
-      )
-        throw new ApplicationError("VALIDATION_FAILED", "Invalid visual critique");
-      return {
-        value: candidate,
-        telemetry: [telemetry(this.agent, "VISUAL_REVIEW", response, "PASS")],
-      };
-    } catch (cause) {
-      return {
-        value: undefined,
-        telemetry: [failureTelemetry(this.agent, "VISUAL_REVIEW", cause, false)],
-      };
-    }
-  }
-}
-
 async function request(
   agent: AgentProvider,
   model: string | undefined,
@@ -530,6 +325,7 @@ async function request(
   signal?: AbortSignal,
   timeoutMs = 30_000,
   responseContract?: AgentResponseContract,
+  systemInstructions?: string,
 ): Promise<AgentResponse> {
   if (signal?.aborted) throw new ApplicationError("JOB_CANCELLED", "Agent task was cancelled");
   const controller = new AbortController();
@@ -539,7 +335,9 @@ async function request(
   try {
     return await agent.createResponse({
       model: model ?? agent.getCapabilities().models[0] ?? "unknown",
-      systemInstructions: `SITES_AGENT_TASK:${task}\nReturn only the requested compact JSON. Never include secrets, credentials, hidden reasoning, source code, or unsupported capabilities.`,
+      systemInstructions:
+        systemInstructions ??
+        `SITES_AGENT_TASK:${task}\nReturn only the requested compact JSON. Never include secrets, credentials, hidden reasoning, source code, or unsupported capabilities.`,
       messages: [{ role: "user", content }],
       maxOutputTokens: 1_500,
       reasoningPolicy: "LOW",
@@ -550,6 +348,43 @@ async function request(
     clearTimeout(timer);
     signal?.removeEventListener("abort", relay);
   }
+}
+
+/** Resolve and verify the planner's static prompt before provider dispatch. */
+export function resolveSitePlanningPrompt(
+  agentContracts: Pick<AgentContractRegistry, "getCurrentAgentContract"> = AGENT_CONTRACT_REGISTRY,
+  prompts: Pick<PromptRegistry, "getCurrentPrompt" | "getPrompt"> = PROMPT_REGISTRY,
+): PromptDefinition {
+  const agentContract = agentContracts.getCurrentAgentContract("sites.site-planner");
+  const prompt =
+    agentContract.prompt.promptVersion === undefined
+      ? prompts.getCurrentPrompt(agentContract.prompt.promptId)
+      : prompts.getPrompt(agentContract.prompt.promptId, agentContract.prompt.promptVersion);
+  if (prompt.stage !== agentContract.stage) {
+    throw new ApplicationError(
+      "PROMPT_STAGE_MISMATCH",
+      `Site planning prompt stage '${prompt.stage}' does not match agent stage '${agentContract.stage}'`,
+    );
+  }
+  if (
+    !prompt.compatibleAgentContracts.some(
+      (compatible) =>
+        compatible.agentId === agentContract.agentId &&
+        compatible.contractVersion === agentContract.contractVersion,
+    )
+  ) {
+    throw new ApplicationError(
+      "PROMPT_AGENT_CONTRACT_MISMATCH",
+      "Site planning prompt is not compatible with the active agent contract",
+    );
+  }
+  if (prompt.lifecycle.status !== "ACTIVE") {
+    throw new ApplicationError(
+      "INVALID_PROMPT_DEFINITION",
+      "Site planning requires an ACTIVE prompt for a new run",
+    );
+  }
+  return prompt;
 }
 function parse(response: AgentResponse): unknown {
   const { content } = stripOuterMarkdownFence(response.message.content);

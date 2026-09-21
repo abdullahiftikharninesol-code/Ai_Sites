@@ -158,4 +158,14 @@ const mime = (path: string) =>
         ? "text/css; charset=utf-8"
         : path.endsWith(".svg")
           ? "image/svg+xml"
+          : path.endsWith(".png")
+            ? "image/png"
+            : path.endsWith(".jpg") || path.endsWith(".jpeg")
+              ? "image/jpeg"
+              : path.endsWith(".gif")
+                ? "image/gif"
+                : path.endsWith(".webp")
+                  ? "image/webp"
+                  : path.endsWith(".avif")
+                    ? "image/avif"
           : "application/octet-stream";

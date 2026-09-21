@@ -1,5 +1,7 @@
 import { ApplicationError } from "../../app/errors/application-error.js";
 import type { AgentProvider } from "../agent-provider.js";
+import type { AgentId } from "../contracts/agent-contract.js";
+import { resolveAgentPrompt } from "../prompts/agent-prompt-resolution.js";
 import type {
   AgentCapabilities,
   AgentRequest,
@@ -49,6 +51,14 @@ export interface InferenceRunSummary {
   readonly outputTokens: number;
   readonly reasoningTokens: number;
   readonly totalTokens: number;
+  /** Successful provider responses only; absent optional fields mean the provider did not report them for every response. */
+  readonly providerUsage?: {
+    readonly inputTokens: number;
+    readonly cachedInputTokens?: number;
+    readonly outputTokens: number;
+    readonly reasoningTokens?: number;
+    readonly totalTokens: number;
+  };
   readonly stages: Readonly<Record<InferenceStage, StageTelemetrySummary>>;
   readonly providersUsed: readonly string[];
   readonly modelsUsed: readonly string[];
@@ -56,6 +66,29 @@ export interface InferenceRunSummary {
   readonly budgetExceeded: boolean;
   readonly failureReason?: string;
   readonly attempts: readonly PhysicalAttemptRecord[];
+  readonly promptExecutions: readonly PromptExecutionTelemetry[];
+}
+
+export interface PromptExecutionTelemetry {
+  readonly agentId: AgentId;
+  readonly agentContractVersion: number;
+  readonly promptId: string;
+  readonly promptVersion: number;
+  readonly promptHash: string;
+  readonly stage: InferenceStage;
+  readonly provider: string;
+  readonly model?: string;
+  readonly reasoningPolicyId: string;
+  readonly contextPolicyId: string;
+  readonly logicalRequestCount: number;
+  readonly physicalRequestCount: number;
+  readonly inputTokens: number;
+  readonly cachedInputTokens: number;
+  readonly outputTokens: number;
+  readonly startedAt: string;
+  readonly completedAt: string;
+  readonly success: boolean;
+  readonly errorCategory?: string;
 }
 
 export class InferenceBudget {
@@ -306,16 +339,29 @@ export class InferenceTelemetryCollector {
       latencyMs: number;
     }
   >();
+  private readonly promptExecutions: PromptExecutionTelemetry[] = [];
+  private readonly providerTokens = {
+    responses: 0,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    cachedComplete: true,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    reasoningComplete: true,
+    totalTokens: 0,
+  };
 
   constructor(_clock: () => number = Date.now) {
     const stages: InferenceStage[] = [
       "SITE_PLANNING",
       "GENERATE_SITE",
       "BUILD_REPAIR",
+      "MOTION_REPAIR",
       "EDIT_PLANNING",
       "TARGETED_EDIT",
       "VISUAL_REVIEW",
       "VISUAL_REPAIR",
+      "ASSET_PLANNING",
     ];
     for (const stage of stages) {
       this.stageStats.set(stage, {
@@ -350,11 +396,21 @@ export class InferenceTelemetryCollector {
     readonly stage: InferenceStage;
     readonly provider: string;
     readonly model?: string;
-    readonly usage: { readonly inputTokens: number; readonly outputTokens: number; readonly reasoningTokens?: number };
+    readonly usage: { readonly inputTokens: number; readonly cachedInputTokens?: number; readonly outputTokens: number; readonly reasoningTokens?: number; readonly totalTokens?: number };
     readonly latencyMs: number;
   }): void {
     this.providersUsed.add(info.provider);
     if (info.model) this.modelsUsed.add(info.model);
+
+    const tokens = this.providerTokens;
+    tokens.responses++;
+    tokens.inputTokens += info.usage.inputTokens;
+    tokens.outputTokens += info.usage.outputTokens;
+    tokens.totalTokens += info.usage.totalTokens ?? (info.usage.inputTokens + info.usage.outputTokens);
+    if (info.usage.cachedInputTokens === undefined) tokens.cachedComplete = false;
+    else tokens.cachedInputTokens += info.usage.cachedInputTokens;
+    if (info.usage.reasoningTokens === undefined) tokens.reasoningComplete = false;
+    else tokens.reasoningTokens += info.usage.reasoningTokens;
 
     const stage = this.stageStats.get(info.stage);
     if (stage) {
@@ -384,6 +440,10 @@ export class InferenceTelemetryCollector {
     }
   }
 
+  recordPromptExecution(record: PromptExecutionTelemetry): void {
+    this.promptExecutions.push(record);
+  }
+
   getSummary(runId: string, budget: InferenceBudget): InferenceRunSummary {
     const stages: Record<string, StageTelemetrySummary> = {};
     for (const [key, value] of this.stageStats.entries()) {
@@ -399,6 +459,13 @@ export class InferenceTelemetryCollector {
       outputTokens: budget.outputTokens,
       reasoningTokens: budget.reasoningTokens,
       totalTokens: budget.totalTokens,
+      ...(this.providerTokens.responses ? { providerUsage: {
+        inputTokens: this.providerTokens.inputTokens,
+        ...(this.providerTokens.cachedComplete ? { cachedInputTokens: this.providerTokens.cachedInputTokens } : {}),
+        outputTokens: this.providerTokens.outputTokens,
+        ...(this.providerTokens.reasoningComplete ? { reasoningTokens: this.providerTokens.reasoningTokens } : {}),
+        totalTokens: this.providerTokens.totalTokens,
+      } } : {}),
       stages: stages as Readonly<Record<InferenceStage, StageTelemetrySummary>>,
       providersUsed: Array.from(this.providersUsed),
       modelsUsed: Array.from(this.modelsUsed),
@@ -406,6 +473,7 @@ export class InferenceTelemetryCollector {
       budgetExceeded: budget.budgetExceeded,
       ...(budget.exhaustedReason ? { failureReason: budget.exhaustedReason } : {}),
       attempts: [...this.attempts],
+      promptExecutions: [...this.promptExecutions],
     };
   }
 }
@@ -440,6 +508,8 @@ export class RunScopedAgentProvider implements AgentProvider {
     );
 
     let attemptStartedAt = 0;
+    const promptIdentity = promptIdentityForStage(this.stage);
+    const promptStartedAt = new Date().toISOString();
 
     // 2. Transport hook attached for physical accounting
     const transportHook: TransportHook = {
@@ -486,6 +556,20 @@ export class RunScopedAgentProvider implements AgentProvider {
         usage: response.usage,
         latencyMs: response.latencyMs,
       });
+      if (promptIdentity) this.context.telemetry.recordPromptExecution({
+        ...promptIdentity,
+        stage: this.stage,
+        provider: this.delegate.id,
+        ...(response.model ? { model: response.model } : {}),
+        logicalRequestCount: 1,
+        physicalRequestCount: 1 + (response.usage.retryCount ?? 0),
+        inputTokens: response.usage.inputTokens,
+        cachedInputTokens: response.usage.cachedInputTokens ?? 0,
+        outputTokens: response.usage.outputTokens,
+        startedAt: promptStartedAt,
+        completedAt: new Date().toISOString(),
+        success: true,
+      });
 
       return response;
     } catch (cause) {
@@ -495,8 +579,54 @@ export class RunScopedAgentProvider implements AgentProvider {
         model: request.model,
         cause,
       });
+      if (promptIdentity) this.context.telemetry.recordPromptExecution({
+        ...promptIdentity,
+        stage: this.stage,
+        provider: this.delegate.id,
+        ...(request.model ? { model: request.model } : {}),
+        logicalRequestCount: 1,
+        physicalRequestCount: 1,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        startedAt: promptStartedAt,
+        completedAt: new Date().toISOString(),
+        success: false,
+        ...(cause instanceof ApplicationError ? { errorCategory: cause.code } : {}),
+      });
       throw cause;
     }
+  }
+}
+
+const AGENT_FOR_STAGE: Partial<Record<InferenceStage, AgentId>> = {
+  SITE_PLANNING: "sites.site-planner",
+  GENERATE_SITE: "sites.site-coder",
+  BUILD_REPAIR: "sites.build-repair",
+  MOTION_REPAIR: "sites.motion-repair",
+  EDIT_PLANNING: "sites.edit-planner",
+  TARGETED_EDIT: "sites.targeted-edit",
+  ASSET_PLANNING: "sites.asset-planner",
+  VISUAL_REVIEW: "sites.visual-review",
+  VISUAL_REPAIR: "sites.visual-repair",
+};
+
+function promptIdentityForStage(stage: InferenceStage): Omit<PromptExecutionTelemetry, "stage" | "provider" | "model" | "logicalRequestCount" | "physicalRequestCount" | "inputTokens" | "cachedInputTokens" | "outputTokens" | "startedAt" | "completedAt" | "success" | "errorCategory"> | undefined {
+  const agentId = AGENT_FOR_STAGE[stage];
+  if (!agentId) return undefined;
+  try {
+    const resolved = resolveAgentPrompt(agentId, { expectedStage: stage });
+    return {
+      agentId,
+      agentContractVersion: resolved.agentContract.contractVersion,
+      promptId: resolved.prompt.promptId,
+      promptVersion: resolved.prompt.promptVersion,
+      promptHash: resolved.prompt.promptHash,
+      reasoningPolicyId: resolved.agentContract.reasoningPolicy.id,
+      contextPolicyId: resolved.agentContract.contextPolicy.id,
+    };
+  } catch {
+    return undefined;
   }
 }
 

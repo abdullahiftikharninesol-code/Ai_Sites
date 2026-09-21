@@ -1,0 +1,9 @@
+{
+  "initialReviewStatus": "INCONCLUSIVE",
+  "repairAttemptStatus": "NOT_ATTEMPTED",
+  "filesChanged": [],
+  "buildSuccess": true,
+  "browserQAStatus": "PASS",
+  "visualReviewLogical": 0,
+  "visualRepairLogical": 0
+}

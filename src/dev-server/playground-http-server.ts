@@ -37,6 +37,8 @@ const safeError = (error: unknown) => {
     "REQUEST_TOO_LARGE",
     "VALIDATION_FAILED",
     "DEPLOYMENT_BUILD_FAILED",
+    "SOURCE_NOT_FOUND",
+    "SOURCE_FILE_NOT_FOUND",
   ]);
   const code =
     typeof value.code === "string" && allowed.has(value.code) ? value.code : "DEV_REQUEST_FAILED";
@@ -142,6 +144,13 @@ export class PlaygroundHttpServer {
       match = /^\/api\/dev\/sites\/([^/]+)\/versions\/([^/]+)\/preview$/.exec(path);
       if (method === "POST" && match)
         return this.#json(res, 201, await this.service.startPreview(match[1]!, match[2]!));
+      match = /^\/api\/dev\/sites\/([^/]+)\/versions\/([^/]+)\/files$/.exec(path);
+      if (method === "GET" && match)
+        return this.#json(
+          res,
+          200,
+          await this.service.sourceFiles(match[1]!, match[2]!, url.searchParams.get("path") ?? undefined),
+        );
       match = /^\/api\/dev\/previews\/([^/]+)$/.exec(path);
       if (method === "GET" && match)
         return this.#json(res, 200, await this.service.previewInspector(match[1]!));
@@ -182,7 +191,9 @@ export class PlaygroundHttpServer {
         res,
         normalized.code === "SITE_NOT_FOUND" ||
           normalized.code === "VERSION_NOT_FOUND" ||
-          normalized.code === "DEPLOYMENT_NOT_FOUND"
+          normalized.code === "DEPLOYMENT_NOT_FOUND" ||
+          normalized.code === "SOURCE_NOT_FOUND" ||
+          normalized.code === "SOURCE_FILE_NOT_FOUND"
           ? 404
           : normalized.code === "DEV_JOB_BUSY"
             ? 409

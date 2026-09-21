@@ -37,6 +37,22 @@ const migrations = [
     version: 6,
     sql: `CREATE TABLE site_deletion_context (site_id TEXT PRIMARY KEY); DROP TRIGGER site_versions_immutable_delete; CREATE TRIGGER site_versions_immutable_delete BEFORE DELETE ON site_versions WHEN NOT EXISTS (SELECT 1 FROM site_deletion_context WHERE site_id=OLD.site_id) BEGIN SELECT RAISE(ABORT, 'site versions are immutable'); END;`,
   },
+  {
+    version: 7,
+    sql: `ALTER TABLE site_versions ADD COLUMN asset_manifest_artifact_ref TEXT;`,
+  },
+  {
+    version: 8,
+    sql: `ALTER TABLE site_versions ADD COLUMN browser_qa_status TEXT; ALTER TABLE site_versions ADD COLUMN browser_qa_artifact_ref TEXT; ALTER TABLE site_versions ADD COLUMN browser_qa_screenshot_refs_json TEXT;`,
+  },
+  {
+    version: 9,
+    sql: `ALTER TABLE site_versions ADD COLUMN visual_review_status TEXT; ALTER TABLE site_versions ADD COLUMN visual_review_id TEXT; ALTER TABLE site_versions ADD COLUMN visual_review_artifact_ref TEXT; ALTER TABLE site_versions ADD COLUMN visual_review_screenshot_refs_json TEXT;`,
+  },
+  {
+    version: 10,
+    sql: `ALTER TABLE site_versions ADD COLUMN visual_repair_attempt_id TEXT; ALTER TABLE site_versions ADD COLUMN visual_repair_attempt_status TEXT; ALTER TABLE site_versions ADD COLUMN visual_repair_attempt_artifact_ref TEXT;`,
+  },
 ];
 export class SqliteDatabase {
   readonly connection: Database.Database;

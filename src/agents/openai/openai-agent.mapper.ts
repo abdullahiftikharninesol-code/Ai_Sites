@@ -44,7 +44,9 @@ export interface OpenAIResponseLike {
   readonly usage?: {
     readonly input_tokens?: number;
     readonly output_tokens?: number;
+    readonly total_tokens?: number;
     readonly input_tokens_details?: { readonly cached_tokens?: number };
+    readonly output_tokens_details?: { readonly reasoning_tokens?: number };
   };
 }
 
@@ -151,8 +153,14 @@ export function normalizeOpenAIResponse(
     toolCalls,
     usage: {
       inputTokens: usage?.input_tokens ?? 0,
-      cachedInputTokens: usage?.input_tokens_details?.cached_tokens ?? 0,
+      ...(usage?.input_tokens_details?.cached_tokens !== undefined
+        ? { cachedInputTokens: usage.input_tokens_details.cached_tokens }
+        : {}),
       outputTokens: usage?.output_tokens ?? 0,
+      ...(usage?.output_tokens_details?.reasoning_tokens !== undefined
+        ? { reasoningTokens: usage.output_tokens_details.reasoning_tokens }
+        : {}),
+      ...(usage?.total_tokens !== undefined ? { totalTokens: usage.total_tokens } : {}),
     },
     latencyMs,
     finishReason: incomplete

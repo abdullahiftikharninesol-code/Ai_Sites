@@ -1,31 +1,21 @@
 import type { ExecutionProvider } from "../../execution/execution-provider.js";
+import {
+  buildResolvedDependencyManifest,
+  materializePackageJson,
+} from "../generation/resolved-dependency-manifest.js";
+import { SITE_V1_TECHNICAL_PROFILE } from "../../cli/runtime/site-technical-profile.js";
+import { SITE_CAPABILITY_REGISTRY_VERSION } from "../generation/capability-registry.js";
 
-export const DEFAULT_PACKAGE_JSON = JSON.stringify(
-  {
-    name: "react-vite-site",
-    private: true,
-    version: "0.0.0",
-    type: "module",
-    scripts: {
-      dev: "vite",
-      build: "tsc -b && vite build",
-      preview: "vite preview",
-    },
-    dependencies: {
-      react: "^19.0.0",
-      "react-dom": "^19.0.0",
-    },
-    devDependencies: {
-      "@types/react": "^19.0.0",
-      "@types/react-dom": "^19.0.0",
-      "@vitejs/plugin-react": "^4.3.4",
-      typescript: "^5.7.3",
-      vite: "^6.2.0",
-    },
-  },
-  null,
-  2,
-);
+const DEFAULT_DEPENDENCY_MANIFEST = buildResolvedDependencyManifest(SITE_V1_TECHNICAL_PROFILE, {
+  profileId: SITE_V1_TECHNICAL_PROFILE.id,
+  profileVersion: SITE_V1_TECHNICAL_PROFILE.version,
+  capabilityRegistryVersion: SITE_CAPABILITY_REGISTRY_VERSION,
+  capabilities: [{ id: "core-web", version: 1 }],
+});
+
+export const DEFAULT_PACKAGE_JSON = materializePackageJson(DEFAULT_DEPENDENCY_MANIFEST, {
+  name: "react-vite-site",
+});
 
 export const DEFAULT_VITE_CONFIG = `import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
@@ -50,8 +40,6 @@ export const DEFAULT_TSCONFIG = JSON.stringify(
       noEmit: true,
       jsx: "react-jsx",
       strict: true,
-      noUnusedLocals: true,
-      noUnusedParameters: true,
       noFallthroughCasesInSwitch: true,
     },
     include: ["src"],
@@ -102,6 +90,16 @@ body {
   margin: 0;
   min-height: 100vh;
 }
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
 `;
 
 export const DEFAULT_APP_TSX = `export function App() {
@@ -124,9 +122,7 @@ export async function scaffoldDeterministicReactVite(
   options: ScaffoldOptions = {},
 ): Promise<{ filesScaffolded: string[] }> {
   const existingFiles = new Set(
-    (await execution.listFiles(environmentId))
-      .filter((f) => f.type === "FILE")
-      .map((f) => f.path),
+    (await execution.listFiles(environmentId)).filter((f) => f.type === "FILE").map((f) => f.path),
   );
 
   const filesScaffolded: string[] = [];
@@ -139,7 +135,10 @@ export async function scaffoldDeterministicReactVite(
   };
 
   const indexHtml = options.projectName
-    ? DEFAULT_INDEX_HTML.replace("<title>AI Generated Site</title>", `<title>${options.projectName}</title>`)
+    ? DEFAULT_INDEX_HTML.replace(
+        "<title>AI Generated Site</title>",
+        `<title>${options.projectName}</title>`,
+      )
     : DEFAULT_INDEX_HTML;
 
   await ensureFile("package.json", DEFAULT_PACKAGE_JSON);

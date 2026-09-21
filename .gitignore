@@ -9,6 +9,7 @@ coverage/
 .local-sandboxes/
 .sites-runtime/
 benchmark-results/
+artifacts/prompt-evals/
 .DS_Store
 tests/
 docs/

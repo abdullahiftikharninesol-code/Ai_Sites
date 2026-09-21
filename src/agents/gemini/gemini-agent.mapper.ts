@@ -1,8 +1,15 @@
 import { ApplicationError } from "../../app/errors/application-error.js";
 import { randomUUID } from "node:crypto";
-import type { AgentRequest, AgentResponse, AgentToolCall } from "../agent-types.js";
+import type { AgentMessage, AgentRequest, AgentResponse, AgentToolCall } from "../agent-types.js";
 import { isApprovedAgentTool } from "../tool-catalog.js";
 import { projectGeminiSchema } from "../../sites/domain/site-plan-schema.js";
+
+function geminiParts(message: AgentMessage): Record<string, unknown>[] {
+  const imageParts = (message.imageParts ?? []).map((part) => ({
+    inlineData: { mimeType: part.mimeType, data: Buffer.from(part.data).toString("base64") },
+  }));
+  return [...imageParts, ...(message.content ? [{ text: message.content }] : [])];
+}
 export interface GeminiRequest {
   readonly model: string;
   readonly contents: readonly Record<string, unknown>[];
@@ -21,6 +28,7 @@ export interface GeminiResponseLike {
     readonly cachedContentTokenCount?: number;
     readonly candidatesTokenCount?: number;
     readonly thoughtsTokenCount?: number;
+    readonly totalTokenCount?: number;
   };
   readonly promptFeedback?: { readonly blockReason?: string };
 }
@@ -66,7 +74,7 @@ export function mapGeminiRequest(
     } else
       contents.push({
         role: message.role === "assistant" ? "model" : "user",
-        parts: [{ text: message.content }],
+        parts: geminiParts(message),
       });
   }
   return {
@@ -181,5 +189,6 @@ function usage(response: GeminiResponseLike): AgentResponse["usage"] {
     ...(value?.thoughtsTokenCount !== undefined
       ? { reasoningTokens: value.thoughtsTokenCount }
       : {}),
+    ...(value?.totalTokenCount !== undefined ? { totalTokens: value.totalTokenCount } : {}),
   };
 }

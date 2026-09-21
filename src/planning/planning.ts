@@ -52,6 +52,11 @@ export class DeterministicRequirementsPlanner implements RequirementsPlanner {
   async plan(prompt: string): Promise<SiteRequirementSpec> {
     const normalized = prompt.toLowerCase();
     const has = (...terms: readonly string[]) => terms.some((term) => normalized.includes(term));
+    const explicitPage = (name: string) => {
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`\\b(?:${escaped}\\s+(?:page|screen|view|route)|(?:page|screen|view|route)\\s+(?:called\\s+)?${escaped})\\b`, "i").test(prompt) ||
+        new RegExp(`\\bpages?\\s*:\\s*[^\\n.]{0,240}\\b${escaped}\\b`, "i").test(prompt);
+    };
     const forbidsForms = has("no forms", "without forms");
     const forbidsLogin = has("no login", "no member login", "no forms or login", "without login");
     const siteType = has("portfolio")
@@ -71,7 +76,11 @@ export class DeterministicRequirementsPlanner implements RequirementsPlanner {
       { name: "Home", path: "/", purpose: "Primary landing page", include: true },
       { name: "About", path: "/about", include: has("about") },
       { name: "Services", path: "/services", include: has("services") },
-      { name: "Menu", path: "/menu", include: has("menu") },
+      {
+        name: "Menu",
+        path: "/menu",
+        include: explicitPage("menu") || (siteType === "restaurant" && has("menu")),
+      },
       { name: "Dentists", path: "/dentists", include: has("dentist") },
       { name: "Pricing", path: "/pricing", include: has("pricing") },
       { name: "Integrations", path: "/integrations", include: has("integrations") },
@@ -84,7 +93,9 @@ export class DeterministicRequirementsPlanner implements RequirementsPlanner {
       {
         name: "Dashboard",
         path: "/dashboard",
-        include: has("dashboard", "member login", "sign up"),
+        include:
+          explicitPage("dashboard") ||
+          has("member portal", "member dashboard", "member login", "protected dashboard", "sign up"),
       },
     ];
     const pages = pageCandidates

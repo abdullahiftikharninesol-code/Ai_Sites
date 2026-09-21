@@ -5,7 +5,7 @@ export type GeminiAgentConfig = CommonAgentConfig & {
   readonly maxOutputTokens?: number;
 };
 export const loadGeminiAgentConfig = (env: NodeJS.ProcessEnv = process.env): GeminiAgentConfig => {
-  const base = loadCommonAgentConfig(env, "GEMINI", "Gemini", "gemini-2.5-flash");
+  const base = loadCommonAgentConfig(env, "GEMINI", "Gemini", "gemini-3.6-flash");
   return {
     ...base,
     timeoutMs: env.GEMINI_AGENT_TIMEOUT_MS ? base.timeoutMs : 120_000,

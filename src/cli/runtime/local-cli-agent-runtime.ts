@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { ApplicationError } from "../../app/errors/application-error.js";
-import { AgentCodingLoop, type AgentLoopResult } from "../../agents/agent-loop.js";
 import { GatewayAgentProvider } from "../../agents/gateway/gateway-agent.provider.js";
 import type { AgentGateway } from "../../agents/gateway/agent-gateway.js";
 import type { AgentProviderRegistry } from "../../agents/registry/agent-provider-registry.js";
@@ -27,7 +26,36 @@ import {
   measureRequestSize,
 } from "../../agents/budget/token-estimator.js";
 import { toGenerationSiteSpec } from "../../sites/domain/site-spec-projection.js";
-import { SITES_CODING_AGENT_PROMPT } from "../../agents/prompts/sites-coding-agent.prompt.js";
+import {
+  resolveAgentPrompt,
+  resolveSiteCoderPrompt,
+} from "../../agents/prompts/agent-prompt-resolution.js";
+import { resolveCapabilities } from "../../sites/generation/capability-resolver.js";
+import type { ResolvedCapabilities } from "../../sites/generation/capability-resolver.js";
+import { buildResolvedDependencyManifest } from "../../sites/generation/resolved-dependency-manifest.js";
+import type { ResolvedDependencyManifest } from "../../sites/generation/resolved-dependency-manifest.js";
+import { GeneratedImportValidator } from "../../sites/generation/import-validator.js";
+import { validateAssetReferences } from "../../sites/assets/asset-reference-validator.js";
+import { applyDeterministicAutofix, applyDeterministicBuildRepair } from "../../sites/generation/deterministic-autofix.js";
+import {
+  SITE_CODER_FILE_BUNDLE_JSON_SCHEMA,
+  BUILD_REPAIR_PATCH_BUNDLE_JSON_SCHEMA,
+  applyBuildRepairPatchBundle,
+  materializeSiteCoderFileBundle,
+  validateSiteCoderFileBundle,
+  validateSiteCoderBundleCompletion,
+  validateBuildRepairPatchBundle,
+  SITE_EDIT_PATCH_BUNDLE_JSON_SCHEMA,
+  applySiteEditPatchBundle,
+  validateSiteEditPatchBundle,
+  type SiteCoderFileBundle,
+} from "./site-coder-file-bundle.js";
+import {
+  assertStructuredResponseComplete,
+  parseStructuredResponse,
+} from "../../agents/shared/structured-response-parser.js";
+import { SITES_UI_REGISTRY } from "../../sites/generation/sites-ui-registry.js";
+import { buildCapabilityAwareGenerationContext } from "./capability-aware-generation-context.js";
 import {
   getDefaultProfile,
   getProfile,
@@ -47,6 +75,9 @@ export interface CliAgentSessionReport {
   readonly durationMs: number;
   readonly usage: Readonly<Record<string, unknown>>;
   readonly generationCompletion?: GenerationCompletionTelemetry | undefined;
+  readonly generationMode?: "FAST_GENERATION" | "ITERATIVE_FALLBACK" | "TARGETED_EDIT";
+  readonly deterministicAutofixes?: readonly string[];
+  readonly buildRepairInvoked?: boolean;
 }
 export type CliAgentProgressListener = (
   state: "GENERATING" | "BUILDING" | "PREVIEW_READY" | "COMPLETED",
@@ -79,8 +110,24 @@ export class LocalCliAgentRuntime {
     const registryId = providerId === "mock" ? "mock-agent" : providerId;
     const capabilities = this.providers.get(registryId).getCapabilities();
     const operation = task.operation === "EDIT_SITE" ? "EDIT_SITE" : "GENERATE_SITE";
+    const generationStage: InferenceStage =
+      task.stage ?? (operation === "EDIT_SITE" ? "TARGETED_EDIT" : "GENERATE_SITE");
+    // Resolve the active execution contract and exact prompt before dispatch.
+    // Retired specialized stages have no current prompt.
+    const runtimePrompt =
+      operation === "GENERATE_SITE"
+        ? resolveSiteCoderPrompt()
+        : resolveAgentPrompt("sites.targeted-edit", { expectedStage: "TARGETED_EDIT" });
     const technicalProfile = resolveRuntimeProfile(task.siteSpec?.technical.profileId);
-
+    const resolvedCapabilities =
+      task.siteSpec &&
+      (!task.siteSpec.technical.profileId ||
+        task.siteSpec.technical.profileId === technicalProfile.id)
+        ? resolveCapabilities(task.siteSpec, { profile: technicalProfile })
+        : undefined;
+    const dependencyManifest = resolvedCapabilities
+      ? buildResolvedDependencyManifest(technicalProfile, resolvedCapabilities)
+      : undefined;
     const effectiveContext =
       runContext ??
       task.runContext ??
@@ -109,8 +156,6 @@ export class LocalCliAgentRuntime {
       capabilities,
     );
 
-    const generationStage: InferenceStage =
-      task.stage ?? (operation === "EDIT_SITE" ? "TARGETED_EDIT" : "GENERATE_SITE");
     const gatewayProvider = effectiveContext.createScopedProvider(
       rawGatewayProvider,
       generationStage,
@@ -121,6 +166,8 @@ export class LocalCliAgentRuntime {
       maxTotalWrittenBytes: task.limits?.maxTotalWrittenBytes ?? 1_000_000,
       maxBuildAttempts: 1 + (task.limits?.maxBuildRepairs ?? 1),
       compactObservations: true,
+      managedFiles: technicalProfile.files.managed,
+      stage: generationStage,
       onToolStart: (name) => {
         if (name === "run_build") this.progress?.("BUILDING", "Running real local build");
       },
@@ -131,6 +178,8 @@ export class LocalCliAgentRuntime {
         environmentId,
         task.siteSpec?.project.name ? { projectName: task.siteSpec.project.name } : {},
       );
+      if (dependencyManifest?.capabilities.some(({ id }) => id === "ui"))
+        await SITES_UI_REGISTRY.materialize(this.execution, environmentId, technicalProfile);
     }
     const before = new Map<string, string>();
     const scaffoldHashes: Record<string, string> = {};
@@ -147,7 +196,7 @@ export class LocalCliAgentRuntime {
       }
     }
     const completionRequirements =
-      operation === "GENERATE_SITE"
+      operation === "GENERATE_SITE" && task.siteSpec && task.generationMode !== "ITERATIVE_FALLBACK"
         ? buildCompletionRequirements(task.siteSpec, scaffoldHashes)
         : undefined;
 
@@ -162,10 +211,18 @@ export class LocalCliAgentRuntime {
       ? toGenerationSiteSpec(task.siteSpec, completionRequirements)
       : undefined;
 
-    const context = await this.#discoverContext(environmentId, task, operation, technicalProfile);
+    const context = await this.#discoverContext(
+      environmentId,
+      task,
+      operation,
+      technicalProfile,
+      resolvedCapabilities,
+      dependencyManifest,
+      task.assetManifest,
+    );
 
     const promptForEstimation = [
-      SITES_CODING_AGENT_PROMPT,
+      runtimePrompt.prompt.systemPrompt,
       JSON.stringify(stagePolicy.tools),
       `Operation: ${operation === "EDIT_SITE" ? "EDIT" : "GENERATE"}`,
       `User request: ${task.userRequest}`,
@@ -216,7 +273,7 @@ export class LocalCliAgentRuntime {
 
     const requestSizeTelemetry = measureRequestSize({
       stage: generationStage,
-      systemInstructions: SITES_CODING_AGENT_PROMPT,
+      systemInstructions: runtimePrompt.prompt.systemPrompt,
       toolSchemas: JSON.stringify(stagePolicy.tools),
       siteSpecContent: projectedSiteSpec ? JSON.stringify(projectedSiteSpec) : undefined,
       workspaceContext: context,
@@ -228,66 +285,114 @@ export class LocalCliAgentRuntime {
 
     const startingMetrics = this.execution.getUsageMetrics(environmentId);
     const started = Date.now();
-    this.progress?.("GENERATING", "Running LOCAL_CLI coding-agent loop");
-    const loop = await new AgentCodingLoop(gatewayProvider, tools, {
-      maxTurns: task.limits?.maxAgentTurns ?? 12,
-      maxToolCalls: task.limits?.maxToolCalls ?? 40,
-      maxOutputTokens: requestedOutputAllowance,
-      reasoningPolicy: stagePolicy.reasoningPolicy,
-      tools: stagePolicy.tools,
-      requireFilesWritten: operation === "GENERATE_SITE",
-      finalizeOnMaxTurns: true,
-      finalizeOnWrite: operation === "EDIT_SITE",
-      stage: generationStage,
-      ...(completionRequirements !== undefined ? { completionRequirements } : {}),
-      ...(signal ? { signal } : {}),
-    }).run(
-      environmentId,
-      [
-        `Operation: ${operation === "EDIT_SITE" ? "EDIT" : "GENERATE"}`,
-        `User request: ${task.userRequest}`,
-        operation === "GENERATE_SITE"
-          ? [
-              "CRITICAL: The current workspace contains only a starter fixture header ('AI Sites Local Execution Test'). You must write the full website implementation by overwriting src/App.tsx and updating src/styles.css using write_file.",
-              `Required structural markers: Every page must have data-sites-page="<page-id>" and every section must have data-sites-section="<section-id>".`,
-              completionRequirements
-                ? `Required pages: ${completionRequirements.requiredPages.join(", ")}\nRequired sections: ${completionRequirements.requiredSections.join(", ")}`
-                : "",
-              "MANDATORY SAME-RESPONSE PROTOCOL: issue write_file for src/App.tsx and src/styles.css, then issue finalize_generation as the final tool call in this response. Do not stop after writes, wait for observations, or answer with prose. Include the exact required page and section IDs in the manifest.",
-            ]
-              .filter(Boolean)
-              .join("\n")
-          : "",
-        projectedSiteSpec ? `SiteSpec: ${JSON.stringify(projectedSiteSpec)}` : "",
-        `Workspace context:\n${context}`,
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    );
-    if (loop.limitReached)
-      console.warn(
-        `[sites] job=${task.jobId} agent reached maxTurns=${loop.turns}; finalizing workspace`,
+    // All live generation/edit operations use one bounded structured response.
+    // The parser handles native schema, JSON mode, and strict JSON text fallback;
+    // provider capability never reactivates the old tool loop.
+    const boundedStructuredOperation = operation === "GENERATE_SITE" || operation === "EDIT_SITE";
+    let bundle: SiteCoderFileBundle | undefined;
+    let generationCompletion: GenerationCompletionTelemetry | undefined;
+    let directUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+    let directModel = capabilities.models[0] ?? "unknown";
+    this.progress?.("GENERATING", operation === "EDIT_SITE" ? "Applying bounded edit patch" : "Generating bounded source file bundle");
+    if (boundedStructuredOperation) {
+      const responseContract = operation === "EDIT_SITE" ? {
+        type: "JSON_SCHEMA" as const,
+        name: "SiteEditPatchBundle",
+        schema: SITE_EDIT_PATCH_BUNDLE_JSON_SCHEMA,
+        strict: true,
+      } : {
+        type: "JSON_SCHEMA" as const,
+        name: "SiteCoderFileBundle",
+        schema: SITE_CODER_FILE_BUNDLE_JSON_SCHEMA,
+        strict: true,
+      };
+      const response = await gatewayProvider.createResponse({
+        model: capabilities.models[0] ?? "unknown",
+        systemInstructions: runtimePrompt.prompt.systemPrompt,
+        messages: [{
+          role: "user",
+          content: [
+            operation === "EDIT_SITE"
+              ? "Return exactly one JSON object matching the SiteEditPatchBundle schema. Make the smallest requested source edit and do not call tools."
+              : "Return exactly one JSON object matching the SiteCoderFileBundle schema. Do not call tools.",
+            operation === "EDIT_SITE"
+              ? "Only patch the requested editable source file; never modify package manifests, configuration, lockfiles, or Sites-managed files."
+              : "Write only editable application source files. Never modify package manifests, configuration, lockfiles, or Sites-managed files.",
+            operation === "GENERATE_SITE"
+              ? [
+                  "The existing React + TypeScript + Vite scaffold supplies src/main.tsx, baseline src/styles.css, and project configuration.",
+                  "The bundle must contain a complete, non-empty src/App.tsx application entry component.",
+                  "You may add components, views, pages, and custom CSS files. Every local import you add must resolve to a file in this bundle or the documented scaffold.",
+                  "Return compilable TypeScript/TSX, use React state for requested demo interactions, and do not regenerate unchanged scaffold boilerplate.",
+                ].join(" ")
+              : "",
+            operation === "GENERATE_SITE" && completionRequirements ? `Required pages/views: ${completionRequirements.requiredPages.join(", ")}\nRequired sections/features: ${completionRequirements.requiredSections.join(", ")}. Implement these semantically using appropriate React routes, state, tabs, views, or components. Legacy data-sites-page and data-sites-section attributes are optional and are not required.` : "",
+            projectedSiteSpec ? `SiteSpec: ${JSON.stringify(projectedSiteSpec)}` : "",
+            `Workspace context:\n${context}`,
+            `User request: ${task.userRequest}`,
+          ].filter(Boolean).join("\n\n"),
+        }],
+        maxOutputTokens: requestedOutputAllowance,
+        reasoningPolicy: stagePolicy.reasoningPolicy,
+        responseContract,
+        ...(signal ? { signal } : {}),
+      });
+      assertStructuredResponseComplete(
+        response,
+        operation === "EDIT_SITE" ? "Targeted edit" : "Site coder",
       );
-    if (operation === "GENERATE_SITE") {
-      if (loop.completionAccepted !== true) {
-        const issuesSummary = loop.completionIssues
-          ?.map((i) => `[${i.code}] ${i.message}`)
-          .join("; ");
+      const parsed = parseStructuredResponse<SiteCoderFileBundle | import("./site-coder-file-bundle.js").SiteEditPatchBundle>({
+        content: response.message.content,
+        contract: responseContract,
+        capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
+        validate: (value) => operation === "EDIT_SITE"
+          ? validateSiteEditPatchBundle(value)
+          : validateSiteCoderFileBundle(value, completionRequirements),
+        errorContext: operation === "EDIT_SITE" ? "Targeted edit" : "Site coder",
+      }).value;
+      if (operation === "EDIT_SITE") {
+        await applySiteEditPatchBundle(this.execution, environmentId, parsed as import("./site-coder-file-bundle.js").SiteEditPatchBundle);
+      } else {
+        const generatedBundle = parsed as SiteCoderFileBundle;
+        bundle = generatedBundle;
+        await materializeSiteCoderFileBundle(this.execution, environmentId, generatedBundle);
+      }
+      directUsage = {
+        inputTokens: response.usage.inputTokens,
+        cachedInputTokens: response.usage.cachedInputTokens ?? 0,
+        outputTokens: response.usage.outputTokens,
+      };
+      directModel = response.model;
+    }
+    let autofixResult = await applyDeterministicAutofix(this.execution, environmentId);
+    if (completionRequirements && operation === "GENERATE_SITE") {
+      const completion = await validateSiteCoderBundleCompletion(
+        this.execution,
+        environmentId,
+        bundle!,
+        completionRequirements,
+      );
+      if (!completion.valid)
         throw new ApplicationError(
           "GENERATION_INCOMPLETE",
-          `GENERATION_INCOMPLETE: Generation failed to satisfy completion contract: ${issuesSummary || "finalize_generation was not called or accepted"}`,
-          {
-            metadata: {
-              attempts: loop.generationCompletion?.attempts ?? 0,
-              issues: loop.completionIssues ?? [],
-              terminationReason: loop.normalizedFinishReason,
-            },
-          },
+          `Site coder bundle failed completion validation: ${completion.issues.map((issue) => issue.message).join("; ")}`,
         );
-      }
+      generationCompletion = { attempts: 1, accepted: true, rejectedAttempts: 0 };
     }
+    if (operation === "GENERATE_SITE" && completionRequirements && !generationCompletion)
+      throw new ApplicationError("GENERATION_INCOMPLETE", "Structured site coder response did not satisfy completion contract");
+    if (dependencyManifest)
+      await new GeneratedImportValidator(dependencyManifest).validate(
+        this.execution,
+        environmentId,
+      );
+    await validateAssetReferences(this.execution, environmentId, task.assetManifest);
     let automaticBuildAttempts = 0;
-    const repairLoops: AgentLoopResult[] = [];
+    let repairModelCalls = 0;
+    let repairInputTokens = 0;
+    let repairCachedInputTokens = 0;
+    let repairOutputTokens = 0;
+    let initialBuildDiagnostics: string | undefined;
     let build = this.execution.getLastBuildResult(environmentId);
     if (this.execution.getLastBuildSuccess(environmentId) !== true) {
       this.progress?.("BUILDING", "Running required final production build");
@@ -297,6 +402,23 @@ export class LocalCliAgentRuntime {
         args: ["run", "build"],
         timeoutMs: task.limits?.timeoutMs ?? 60_000,
       });
+    }
+    if (build && (build.exitCode !== 0 || build.timedOut)) {
+      initialBuildDiagnostics = normalizeBuildLog(build.stderr, build.stdout);
+      logBuildFailure(task.jobId, initialBuildDiagnostics);
+      const deterministicBuildRepair = await applyDeterministicBuildRepair(this.execution, environmentId);
+      if (deterministicBuildRepair.changed) {
+        autofixResult = {
+          changed: true,
+          fixes: Object.freeze([...autofixResult.fixes, ...deterministicBuildRepair.fixes]),
+        };
+        automaticBuildAttempts += 1;
+        build = await this.execution.executeCommand(environmentId, {
+          executable: "npm",
+          args: ["run", "build"],
+          timeoutMs: task.limits?.timeoutMs ?? 60_000,
+        });
+      }
     }
     const maxBuildRepairs = task.limits?.maxBuildRepairs ?? 1;
     for (
@@ -313,6 +435,9 @@ export class LocalCliAgentRuntime {
         `Repairing production build (${repairAttempt}/${maxBuildRepairs})`,
       );
       const repairContext = await this.#extractRepairContext(environmentId, output);
+      const repairPrompt = resolveAgentPrompt("sites.build-repair", {
+        expectedStage: "BUILD_REPAIR",
+      });
       const repairProvider = effectiveContext.createScopedProvider(
         rawGatewayProvider,
         "BUILD_REPAIR",
@@ -320,29 +445,47 @@ export class LocalCliAgentRuntime {
       const repairPolicy = getInferenceContextPolicy("BUILD_REPAIR", {
         overrideMaxOutput: task.limits?.maxOutputTokens,
       });
-      const repair = await new AgentCodingLoop(repairProvider, tools, {
-        maxTurns: 1,
-        maxToolCalls: 12,
-        maxOutputTokens: repairPolicy.outputPolicy.defaultMaxOutputTokens,
-        reasoningPolicy: repairPolicy.reasoningPolicy,
-        tools: repairPolicy.tools,
-        stage: "BUILD_REPAIR",
-        finalizeOnMaxTurns: true,
-        finalizeOnWrite: true,
-        ...(signal ? { signal } : {}),
-      }).run(
-        environmentId,
-        [
-          "Operation: REPAIR",
-          "Fix the current project so npm run build succeeds.",
-          "Inspect the referenced files, make only necessary corrections, and do not redesign the site.",
-          `Build output:\n${output}`,
-          repairContext ? `Relevant source files:\n${repairContext}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
-      );
-      repairLoops.push(repair);
+      {
+        const responseContract = {
+          type: "JSON_SCHEMA" as const,
+          name: "BuildRepairPatchBundle",
+          schema: BUILD_REPAIR_PATCH_BUNDLE_JSON_SCHEMA,
+          strict: true,
+        };
+        const response = await repairProvider.createResponse({
+          model: capabilities.models[0] ?? "unknown",
+          systemInstructions: repairPrompt.prompt.systemPrompt,
+          messages: [{ role: "user", content: [
+            "Return exactly one JSON BuildRepairPatchBundle. Do not call tools.",
+            "Only repair the reported build failure. Do not modify managed files, package manifests, or dependencies.",
+            `Build output:\n${output}`,
+            dependencyManifest
+              ? `Current dependency manifest:\n${JSON.stringify({
+                  dependencies: dependencyManifest.dependencies,
+                  devDependencies: dependencyManifest.devDependencies,
+                })}`
+              : "",
+            repairContext ? `Relevant source files:\n${repairContext}` : "",
+          ].filter(Boolean).join("\n\n") }],
+          maxOutputTokens: repairPolicy.outputPolicy.defaultMaxOutputTokens,
+          reasoningPolicy: repairPolicy.reasoningPolicy,
+          responseContract,
+          ...(signal ? { signal } : {}),
+        });
+        assertStructuredResponseComplete(response, "Build repair");
+        const patchBundle = parseStructuredResponse({
+          content: response.message.content,
+          contract: responseContract,
+          capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
+          validate: validateBuildRepairPatchBundle,
+          errorContext: "Build repair",
+        }).value;
+        await applyBuildRepairPatchBundle(this.execution, environmentId, patchBundle);
+        repairModelCalls = 1;
+        repairInputTokens = response.usage.inputTokens;
+        repairCachedInputTokens = response.usage.cachedInputTokens ?? 0;
+        repairOutputTokens = response.usage.outputTokens;
+      }
       automaticBuildAttempts += 1;
       build = await this.execution.executeCommand(environmentId, {
         executable: "npm",
@@ -352,17 +495,18 @@ export class LocalCliAgentRuntime {
     }
     if (!build || build.exitCode !== 0 || build.timedOut) {
       const output = build ? safeBuildOutput(build.stderr, build.stdout) : "No build result";
-      console.error(
-        `[sites] final build failed job=${task.jobId} exit=${build?.exitCode ?? "null"} timedOut=${build?.timedOut ?? false}\n${output.slice(-8_000)}`,
-      );
+      logBuildFailure(task.jobId, output, "FINAL");
       throw new ApplicationError(
         "REPAIR_LIMIT_REACHED",
         "Generated project production build failed after repair attempts",
         {
           metadata: {
+            failureStage: "BUILD",
             exitCode: build?.exitCode ?? null,
             timedOut: build?.timedOut ?? false,
-            repairAttempts: repairLoops.length,
+            repairAttempts: repairModelCalls,
+            ...(initialBuildDiagnostics ? { initialDiagnostics: initialBuildDiagnostics } : {}),
+            diagnostics: output,
           },
         },
       );
@@ -390,26 +534,22 @@ export class LocalCliAgentRuntime {
     return {
       success: this.execution.getLastBuildSuccess(environmentId) === true && Boolean(preview?.url),
       provider: providerId,
-      model: loop.model,
+      model: directModel,
       runtime: "LOCAL_CLI",
-      turns: loop.turns + repairLoops.reduce((total, item) => total + item.turns, 0),
-      toolCalls: loop.toolCalls + repairLoops.reduce((total, item) => total + item.toolCalls, 0),
+      turns: (boundedStructuredOperation ? 1 : 0) + repairModelCalls,
+      toolCalls: 0,
       buildAttempts: tools.buildAttempts + automaticBuildAttempts,
       finalBuildSuccess: this.execution.getLastBuildSuccess(environmentId) === true,
       ...(preview?.url ? { previewUrl: preview.url } : {}),
       filesChanged: files,
       durationMs: Date.now() - started,
       usage: {
-        inputTokens:
-          loop.inputTokens + repairLoops.reduce((total, item) => total + item.inputTokens, 0),
-        cachedInputTokens:
-          loop.cachedInputTokens +
-          repairLoops.reduce((total, item) => total + item.cachedInputTokens, 0),
-        outputTokens:
-          loop.outputTokens + repairLoops.reduce((total, item) => total + item.outputTokens, 0),
-        modelCalls: loop.turns + repairLoops.reduce((total, item) => total + item.turns, 0),
-        limitReached: loop.limitReached ?? false,
-        toolCalls: loop.toolCalls + repairLoops.reduce((total, item) => total + item.toolCalls, 0),
+        inputTokens: directUsage.inputTokens + repairInputTokens,
+        cachedInputTokens: directUsage.cachedInputTokens + repairCachedInputTokens,
+        outputTokens: directUsage.outputTokens + repairOutputTokens,
+        modelCalls: (boundedStructuredOperation ? 1 : 0) + repairModelCalls,
+        limitReached: false,
+        toolCalls: 0,
         executionProvider: this.execution.id,
         environmentCreationMs: metrics.environmentCreationMs,
         filesWritten: metrics.filesWritten - startingMetrics.filesWritten,
@@ -430,9 +570,10 @@ export class LocalCliAgentRuntime {
         tokenBudget: effectiveContext.budget.limits.maxTotalTokens,
         requestSize: requestSizeTelemetry,
       },
-      ...(loop.generationCompletion !== undefined
-        ? { generationCompletion: loop.generationCompletion }
-        : {}),
+      ...(generationCompletion ? { generationCompletion } : {}),
+      generationMode: operation === "EDIT_SITE" ? "TARGETED_EDIT" : "FAST_GENERATION",
+      deterministicAutofixes: autofixResult.fixes.map((fix) => fix.id),
+      buildRepairInvoked: repairModelCalls > 0,
     };
   }
   async #discoverContext(
@@ -440,14 +581,26 @@ export class LocalCliAgentRuntime {
     task: CliTask,
     operation?: "GENERATE_SITE" | "EDIT_SITE",
     profile: GeneratedAppProfile = getDefaultProfile(),
+    resolvedCapabilities?: ResolvedCapabilities,
+    dependencyManifest?: ResolvedDependencyManifest,
+    assetManifest?: import("../../sites/assets/asset-domain.js").AssetManifest,
   ): Promise<string> {
     if (operation === "GENERATE_SITE") {
       const contractLines = [
+        buildCapabilityAwareGenerationContext({
+          profile,
+          capabilities: resolvedCapabilities,
+          dependencyManifest,
+          uiRegistryItems: SITES_UI_REGISTRY.listItems(),
+          assetManifest,
+          requestText: task.userRequest,
+        }),
+        "",
         "Runtime Contract:",
         `Runtime: ${formatTechnology(profile.framework)} + ${formatTechnology(profile.language)} + ${formatTechnology(profile.bundler)}`,
         `Bundler: ${formatTechnology(profile.bundler)} (${formatLogicalCommand(profile.commands.build)})`,
         "",
-        "Editable:",
+        "Existing editable scaffold files (additional safe src application files are allowed):",
         ...profile.files.editable.map((path) => `- ${path}`),
         "",
         "Managed by Sites (deterministic scaffold, do not edit or recreate):",
@@ -455,7 +608,7 @@ export class LocalCliAgentRuntime {
         "",
         "Rules:",
         "- Do not add external packages unless explicitly permitted.",
-        "- Overwrite src/App.tsx and src/styles.css with complete implementation.",
+        "- Return a complete src/App.tsx. Override src/styles.css only when custom baseline styling is needed; otherwise keep the scaffold stylesheet.",
       ];
 
       const chunks: string[] = [contractLines.join("\n")];
@@ -488,7 +641,8 @@ export class LocalCliAgentRuntime {
     return chunks.join("\n");
   }
   async #extractRepairContext(environmentId: string, buildOutput: string): Promise<string> {
-    const fileMatches = buildOutput.match(/(?:src\/[a-zA-Z0-9_./-]+\.(?:tsx?|jsx?|css|json))/g);
+    const normalizedOutput = buildOutput.replaceAll("\\", "/");
+    const fileMatches = normalizedOutput.match(/(?:src\/[a-zA-Z0-9_./-]+\.(?:tsx?|jsx?|css|json))/g);
     const targetFiles = Array.from(new Set(fileMatches ?? []));
     if (targetFiles.length === 0) {
       try {
@@ -506,10 +660,12 @@ export class LocalCliAgentRuntime {
     for (const filePath of targetFiles.slice(0, 5)) {
       try {
         const content = await this.execution.readFile(environmentId, filePath);
-        const size = Buffer.byteLength(content);
-        if (totalBytes + size > maxBytes) break;
+        const remaining = maxBytes - totalBytes;
+        if (remaining <= 0) break;
+        const excerpt = buildRepairSourceExcerpt(filePath, content, normalizedOutput, remaining);
+        const size = Buffer.byteLength(excerpt);
         totalBytes += size;
-        chunks.push(`--- ${filePath}\n${content}`);
+        chunks.push(`--- ${filePath}\n${excerpt}`);
       } catch {
         // file may not exist
       }
@@ -547,4 +703,48 @@ function resolveRuntimeProfile(profileId?: string): GeneratedAppProfile {
 
 function safeBuildOutput(stderr: string, stdout: string): string {
   return normalizeBuildLog(stderr, stdout, { maxBytes: 8_000 });
+}
+
+function logBuildFailure(
+  jobId: string,
+  diagnostics: string,
+  phase: "INITIAL" | "FINAL" = "INITIAL",
+): void {
+  console.error(
+    [
+      "----------------------------------------",
+      `SITES BUILD FAILED${phase === "FINAL" ? " AFTER REPAIR" : ""}`,
+      `Job: ${jobId}`,
+      "",
+      diagnostics.slice(-8_000),
+      "----------------------------------------",
+    ].join("\n"),
+  );
+}
+
+function buildRepairSourceExcerpt(
+  filePath: string,
+  content: string,
+  buildOutput: string,
+  maxBytes: number,
+): string {
+  if (Buffer.byteLength(content) <= maxBytes) return content;
+
+  const escapedPath = filePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const lineMatches = Array.from(
+    buildOutput.matchAll(new RegExp(`${escapedPath}[:(](\\d+)`, "g")),
+    (match) => Number(match[1]),
+  ).filter((line) => Number.isInteger(line) && line > 0);
+  const lines = content.split(/\r?\n/);
+  const targetLines = lineMatches.length > 0 ? lineMatches : [1];
+  const included = new Set<number>();
+  for (const target of targetLines.slice(0, 4)) {
+    for (let line = Math.max(1, target - 12); line <= Math.min(lines.length, target + 12); line += 1)
+      included.add(line);
+  }
+  const excerpt = Array.from(included)
+    .sort((left, right) => left - right)
+    .map((line) => `${line}: ${lines[line - 1]}`)
+    .join("\n");
+  return Buffer.from(excerpt).subarray(0, Math.max(0, maxBytes)).toString("utf8");
 }

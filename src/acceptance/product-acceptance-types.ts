@@ -31,7 +31,7 @@ export type ProductQualityDimension =
   | "build"
   | "navigation"
   | "responsiveLayout"
-  | "visualQA"
+  | "browserQA"
   | "runtime"
   | "authentication"
   | "dataPolicies"

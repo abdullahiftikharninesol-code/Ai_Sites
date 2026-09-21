@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { ApplicationError } from "../app/errors/application-error.js";
 import type { AgentToolCall, AgentToolName } from "./agent-types.js";
 import type { ExecutionProvider } from "../execution/execution-provider.js";
 import { validateToolArguments } from "./tool-catalog.js";
@@ -18,6 +19,8 @@ export interface SitesToolExecutorOptions {
   readonly compactObservations?: boolean;
   readonly maxSearchMatches?: number;
   readonly maxSearchBytes?: number;
+  readonly managedFiles?: readonly string[];
+  readonly stage?: string;
 }
 const stringArg = (args: Readonly<Record<string, unknown>>, name: string): string => {
   const value = args[name];
@@ -87,6 +90,7 @@ export class SitesToolExecutor {
       }
       case "write_file": {
         const path = safePath(stringArg(args, "path"));
+        this.#assertWritable(path, "write_file");
         const content = stringArg(args, "content");
         let bytesWritten = 0;
         let sha256 = "";
@@ -113,6 +117,7 @@ export class SitesToolExecutor {
       }
       case "apply_patch": {
         const path = safePath(stringArg(args, "path"));
+        this.#assertWritable(path, "apply_patch");
         const current = await this.execution.readFile(environmentId, path);
         const find = stringArg(args, "find");
         if (!current.includes(find)) throw new Error(`Patch target not found in ${path}`);
@@ -146,7 +151,9 @@ export class SitesToolExecutor {
         const boundedMatches = matches.slice(0, maxMatches);
         let serialized = JSON.stringify(boundedMatches);
         if (Buffer.byteLength(serialized, "utf8") > maxBytes) {
-          serialized = JSON.stringify(boundedMatches.slice(0, Math.max(1, Math.floor(maxMatches / 2))));
+          serialized = JSON.stringify(
+            boundedMatches.slice(0, Math.max(1, Math.floor(maxMatches / 2))),
+          );
         }
         output = serialized;
         break;
@@ -229,10 +236,32 @@ export class SitesToolExecutor {
         name: call.name,
         output: JSON.stringify({
           ok: false,
+          ...(error instanceof ApplicationError ? { code: error.code } : {}),
           error: error instanceof Error ? error.message : "Tool execution failed",
+          ...(error instanceof ApplicationError && error.metadata
+            ? { metadata: error.metadata }
+            : {}),
         }),
       };
     }
+  }
+  #assertWritable(path: string, operation: "write_file" | "apply_patch"): void {
+    const managed = this.options.managedFiles ?? [];
+    const isManaged = managed.some((item) =>
+      item.endsWith("/**") ? path.startsWith(item.slice(0, -2)) : item === path,
+    );
+    if (isManaged)
+      throw new ApplicationError(
+        "MANAGED_FILE_MODIFICATION",
+        `Managed file '${path}' cannot be modified by the model`,
+        {
+          metadata: {
+            path,
+            operation,
+            ...(this.options.stage ? { stage: this.options.stage } : {}),
+          },
+        },
+      );
   }
   #recordWrite(bytes: number): void {
     if (this.#filesWritten + 1 > (this.options.maxFilesWritten ?? Number.POSITIVE_INFINITY))

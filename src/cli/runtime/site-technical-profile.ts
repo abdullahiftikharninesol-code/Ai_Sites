@@ -57,6 +57,8 @@ export const SITE_V1_TECHNICAL_PROFILE: GeneratedAppProfile = {
       "index.html",
       "src/main.tsx",
       "src/vite-env.d.ts",
+      "src/sites-ui/**",
+      "public/__sites/assets/**",
     ],
     editable: ["src/App.tsx", "src/styles.css"],
   },

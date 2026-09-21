@@ -1,0 +1,19 @@
+{
+  "runId": "visual-canary-2026-09-16T06-11-26-607Z-64443690",
+  "provider": "gemini",
+  "model": "gemini-3.6-flash",
+  "realImageContentConfirmed": true,
+  "cases": 5,
+  "errors": 0,
+  "visualReview": {
+    "logicalRequests": 5,
+    "physicalRequests": 6,
+    "retries": 1,
+    "inputTokens": 6365,
+    "outputTokens": 853,
+    "reasoningTokens": 350,
+    "totalTokens": 7568,
+    "latencyMs": 166329
+  },
+  "completedAt": "2026-09-16T06:14:14.635Z"
+}

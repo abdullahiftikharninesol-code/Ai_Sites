@@ -26,10 +26,12 @@ export interface DevJobRecord {
     message: string;
     status?: number;
     providerCode?: string;
+    providerParam?: string;
     requestId?: string;
     retryable?: boolean;
     quotaCategory?: string;
     retryAfterSeconds?: number;
+    diagnostics?: string;
   };
   intelligence?: readonly AgentTaskTelemetry[];
   readonly events: DevJobEvent[];
@@ -44,6 +46,7 @@ export class DevJobManager {
     execute: (onIntelligence: (updates: readonly AgentTaskTelemetry[]) => void) => Promise<{
       projectId: string;
       versionId: string;
+      preview?: { sessionId: string; url: string };
       intelligence?: readonly AgentTaskTelemetry[];
     }>,
   ): DevJobRecord {
@@ -118,9 +121,10 @@ export class DevJobManager {
         job.status = "RUNNING";
         return execute(onIntelligence);
       })
-      .then(({ projectId, versionId, intelligence }) => {
+      .then(({ projectId, versionId, preview, intelligence }) => {
         job.projectId = projectId;
         job.versionId = versionId;
+        if (preview) job.preview = preview;
         if (intelligence) job.intelligence = intelligence;
         job.status = "SUCCEEDED";
         job.currentStage = "COMPLETED";
@@ -160,14 +164,21 @@ export class DevJobManager {
           ...(typeof metadata.providerCode === "string"
             ? { providerCode: metadata.providerCode }
             : {}),
+          ...(typeof metadata.providerParam === "string"
+            ? { providerParam: metadata.providerParam }
+            : {}),
           ...(typeof metadata.requestId === "string" ? { requestId: metadata.requestId } : {}),
           ...(typeof candidate.retryable === "boolean" ? { retryable: candidate.retryable } : {}),
+          ...(typeof metadata.diagnostics === "string"
+            ? { diagnostics: metadata.diagnostics.slice(-8_000) }
+            : {}),
         };
         console.error(
           `[sites] job=${job.id} operation=${operation} status=FAILED code=${job.error.code} message=${job.error.message}`,
           {
             ...(job.error.status !== undefined ? { status: job.error.status } : {}),
             ...(job.error.providerCode ? { providerCode: job.error.providerCode } : {}),
+            ...(job.error.providerParam ? { providerParam: job.error.providerParam } : {}),
             ...(job.error.requestId ? { requestId: job.error.requestId } : {}),
             ...(job.error.retryable !== undefined ? { retryable: job.error.retryable } : {}),
           },

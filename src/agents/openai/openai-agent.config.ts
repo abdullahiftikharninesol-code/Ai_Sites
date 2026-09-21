@@ -18,7 +18,7 @@ export function loadOpenAIAgentConfig(env: NodeJS.ProcessEnv = process.env): Ope
     apiKey,
     model: env.OPENAI_AGENT_MODEL?.trim() || "gpt-5.6",
     reasoningEffort: parseReasoning(env.OPENAI_AGENT_REASONING_EFFORT),
-    timeoutMs: positiveInteger(env.OPENAI_AGENT_TIMEOUT_MS, 60_000, "OPENAI_AGENT_TIMEOUT_MS"),
+    timeoutMs: positiveInteger(env.OPENAI_AGENT_TIMEOUT_MS, 180_000, "OPENAI_AGENT_TIMEOUT_MS"),
     maxRetries: nonNegativeInteger(env.OPENAI_AGENT_MAX_RETRIES, 2, "OPENAI_AGENT_MAX_RETRIES"),
   };
 }

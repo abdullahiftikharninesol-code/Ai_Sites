@@ -7,8 +7,6 @@ const root = await mkdtemp(join(tmpdir(), "sites-hosting-demo-"));
 const common = {
   databasePath: join(root, "sites.db"),
   artifactRoot: join(root, "artifacts"),
-  visualQAEnabled: true,
-  visualQaScenario: true,
 };
 const userId = "hosting-demo" as UserId;
 try {
@@ -18,7 +16,6 @@ try {
     prompt: "Create a hosted product site",
     planningMode: "deterministic",
     agentProvider: "mock",
-    visualQAEnabled: true,
   });
   const d1 = await a.deploymentService.deploy({ siteId: v1.siteId, versionId: v1.versionId });
   await a.deploymentService.publish(d1);
@@ -40,7 +37,6 @@ try {
     versionId: v1.versionId,
     instruction: "Change heading",
     agentProvider: "mock",
-    visualQAEnabled: true,
   });
   const d2 = await b.deploymentService.deploy({ siteId: v1.siteId, versionId: v2.newVersionId });
   await b.deploymentService.publish(d2);
@@ -50,7 +46,7 @@ try {
   console.log(`Rollback V1: true; ${Date.now() - started}ms`);
   await b.deploymentService.unpublish(v1.siteId);
   console.log(
-    `Unpublish status: ${(await fetch(g2.url(slug))).status}\nV1 artifact retained: ${await b.artifacts.exists(d1.deploymentArtifactRef!)}\nCleanup: environments=${b.execution.getActiveEnvironmentCount()}, browsers=${b.browserRenderer.activeBrowserCount}`,
+    `Unpublish status: ${(await fetch(g2.url(slug))).status}\nV1 artifact retained: ${await b.artifacts.exists(d1.deploymentArtifactRef!)}\nCleanup: environments=${b.execution.getActiveEnvironmentCount()}`,
   );
   await g2.close();
   await b.close();

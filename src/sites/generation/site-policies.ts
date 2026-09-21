@@ -50,7 +50,6 @@ export class SiteDependencyPolicy {
     "react-dom",
     "react-router-dom",
     "lucide-react",
-    "framer-motion",
     "vite",
     "typescript",
     "@vitejs/plugin-react",

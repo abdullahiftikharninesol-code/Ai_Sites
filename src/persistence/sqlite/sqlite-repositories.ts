@@ -227,7 +227,7 @@ export class SqliteSiteVersionCommitter implements SiteVersionCommitter {
 function insertVersion(db: SqliteDatabase, version: SiteVersion): void {
   db.connection
     .prepare(
-      `INSERT INTO site_versions (id,site_id,version_number,parent_version_id,source_artifact_ref,source_manifest_ref,build_artifact_ref,build_status,site_spec_json,site_spec_schema_version,technical_profile_id,template_id,template_version,change_summary_json,visual_qa_status,visual_qa_score,visual_qa_artifact_ref,final_screenshot_refs_json,usage_summary_json,runtime_schema_version,created_at) VALUES (@id,@site,@number,@parent,@source,@manifest,@build,@buildStatus,@spec,@specVersion,@profile,@template,@templateVersion,@changes,@qaStatus,@qaScore,@qaArtifact,@screenshots,@usage,@runtimeSchemaVersion,@created)`,
+      `INSERT INTO site_versions (id,site_id,version_number,parent_version_id,source_artifact_ref,source_manifest_ref,asset_manifest_artifact_ref,build_artifact_ref,build_status,site_spec_json,site_spec_schema_version,technical_profile_id,template_id,template_version,change_summary_json,visual_qa_status,visual_qa_score,visual_qa_artifact_ref,final_screenshot_refs_json,browser_qa_status,browser_qa_artifact_ref,browser_qa_screenshot_refs_json,visual_review_status,visual_review_id,visual_review_artifact_ref,visual_review_screenshot_refs_json,visual_repair_attempt_id,visual_repair_attempt_status,visual_repair_attempt_artifact_ref,usage_summary_json,runtime_schema_version,created_at) VALUES (@id,@site,@number,@parent,@source,@manifest,@assetManifest,@build,@buildStatus,@spec,@specVersion,@profile,@template,@templateVersion,@changes,@qaStatus,@qaScore,@qaArtifact,@screenshots,@browserQaStatus,@browserQaArtifact,@browserQaScreenshots,@visualReviewStatus,@visualReviewId,@visualReviewArtifact,@visualReviewScreenshots,@visualRepairAttemptId,@visualRepairAttemptStatus,@visualRepairAttemptArtifact,@usage,@runtimeSchemaVersion,@created)`,
     )
     .run({
       id: version.id,
@@ -236,6 +236,7 @@ function insertVersion(db: SqliteDatabase, version: SiteVersion): void {
       parent: version.parentVersionId ?? null,
       source: version.sourceArtifactRef,
       manifest: version.sourceManifestRef ?? null,
+      assetManifest: version.assetManifestArtifactRef ?? null,
       build: version.buildArtifactRef ?? null,
       buildStatus: version.buildStatus,
       spec: SqliteMappers.json(version.siteSpec),
@@ -248,6 +249,16 @@ function insertVersion(db: SqliteDatabase, version: SiteVersion): void {
       qaScore: version.visualQAScore ?? null,
       qaArtifact: version.visualQAArtifactRef ?? null,
       screenshots: SqliteMappers.json(version.finalScreenshotRefs),
+      browserQaStatus: version.browserQAStatus ?? null,
+      browserQaArtifact: version.browserQAArtifactRef ?? null,
+      browserQaScreenshots: SqliteMappers.json(version.browserQAScreenshotRefs),
+      visualReviewStatus: version.visualReviewStatus ?? null,
+      visualReviewId: version.visualReviewId ?? null,
+      visualReviewArtifact: version.visualReviewArtifactRef ?? null,
+      visualReviewScreenshots: SqliteMappers.json(version.visualReviewScreenshotRefs),
+      visualRepairAttemptId: version.visualRepairAttemptId ?? null,
+      visualRepairAttemptStatus: version.visualRepairAttemptStatus ?? null,
+      visualRepairAttemptArtifact: version.visualRepairAttemptArtifactRef ?? null,
       usage: SqliteMappers.json(version.usageSummary),
       runtimeSchemaVersion: version.runtimeSchemaVersion ?? null,
       created: version.createdAt.toISOString(),

@@ -133,6 +133,22 @@ export function getInferenceContextPolicy(
         },
       };
 
+    case "ASSET_PLANNING":
+      return {
+        stage,
+        tools: [],
+        contextStrategy: "ZERO_WORKSPACE",
+        outputPolicy: {
+          defaultMaxOutputTokens: options?.overrideMaxOutput ?? 1_500,
+          minOutputTokens: 256,
+          maxOutputTokens: 2_048,
+          safetyMarginTokens: 256,
+          complexityAware: false,
+        },
+        reasoningPolicy: options?.overrideReasoning ?? "LOW",
+        observationPolicy: { compactReceipts: true },
+      };
+
     case "GENERATE_SITE": {
       const computedOutput = options?.overrideMaxOutput ??
         (options?.siteSpec
@@ -174,6 +190,26 @@ export function getInferenceContextPolicy(
         observationPolicy: {
           compactReceipts: true,
           normalizeBuildLogs: true,
+          maxSearchMatches: 5,
+          maxSearchBytes: 2_000,
+        },
+      };
+
+    case "MOTION_REPAIR":
+      return {
+        stage,
+        tools: getStageAgentTools("MOTION_REPAIR"),
+        contextStrategy: "TARGETED_FILES",
+        outputPolicy: {
+          defaultMaxOutputTokens: options?.overrideMaxOutput ?? 2_048,
+          minOutputTokens: 512,
+          maxOutputTokens: 4_096,
+          safetyMarginTokens: 256,
+          complexityAware: false,
+        },
+        reasoningPolicy: options?.overrideReasoning ?? "LOW",
+        observationPolicy: {
+          compactReceipts: true,
           maxSearchMatches: 5,
           maxSearchBytes: 2_000,
         },

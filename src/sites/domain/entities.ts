@@ -27,6 +27,7 @@ export interface SiteVersion {
   readonly parentVersionId?: VersionId;
   readonly sourceArtifactRef: string;
   readonly sourceManifestRef?: string;
+  readonly assetManifestArtifactRef?: string;
   readonly buildArtifactRef?: string;
   readonly buildStatus: BuildStatus;
   readonly siteSpec?: SiteSpec;
@@ -38,6 +39,16 @@ export interface SiteVersion {
   readonly visualQAScore?: number;
   readonly visualQAArtifactRef?: string;
   readonly finalScreenshotRefs?: readonly string[];
+  readonly browserQAStatus?: "PASSED" | "PASSED_WITH_WARNINGS" | "FAILED";
+  readonly browserQAArtifactRef?: string;
+  readonly browserQAScreenshotRefs?: readonly string[];
+  readonly visualReviewStatus?: "PASS" | "NEEDS_REPAIR" | "FAIL" | "INCONCLUSIVE";
+  readonly visualReviewId?: string;
+  readonly visualReviewArtifactRef?: string;
+  readonly visualReviewScreenshotRefs?: readonly string[];
+  readonly visualRepairAttemptId?: string;
+  readonly visualRepairAttemptStatus?: string;
+  readonly visualRepairAttemptArtifactRef?: string;
   readonly usageSummary?: Readonly<Record<string, unknown>>;
   readonly runtimeSchemaVersion?: number;
   readonly createdAt: Date;

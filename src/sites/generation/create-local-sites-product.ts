@@ -29,17 +29,13 @@ import { InMemoryProgressBus } from "../application/progress.js";
 import { SitesOrchestrator } from "../application/sites-orchestrator.js";
 import { LocalSiteGenerationPipeline } from "./local-site-generation-pipeline.js";
 import { StarterTemplateRegistry } from "./starter-template-registry.js";
-import { BrowserRenderer } from "../../visual-qa/browser-renderer.js";
-import { DeterministicVisualQAProvider } from "../../visual-qa/deterministic-visual-qa.provider.js";
-import { loadVisualQAConfig } from "../../visual-qa/visual-qa-config.js";
-import { VisualQARunner } from "../../visual-qa/visual-qa-runner.js";
+import { BrowserQARunner } from "../../browser-qa/browser-qa-runner.js";
 import type { SiteRuntimeProvider } from "../../site-runtime/site-runtime-provider.js";
-import {
-  AgentEditPlanner,
-  AgentIntentClassifier,
-  AgentPlanningPipeline,
-  VisualAgentReviewer,
-} from "../../agents/intelligence/agent-intelligence.js";
+import { AgentPlanningPipeline } from "../../agents/intelligence/agent-intelligence.js";
+import { ArtifactMediaStore } from "../assets/media-store.js";
+import { AdapterBackedAssetResolver, PlaceholderAssetSourceAdapter } from "../assets/source-adapters.js";
+import { CarFallbackAssetSourceAdapter } from "../assets/source-adapters.js";
+import { readFileSync } from "node:fs";
 export interface LocalSitesProductOptions {
   readonly executionRoot: string;
   readonly artifactRoot: string;
@@ -47,9 +43,7 @@ export interface LocalSitesProductOptions {
   readonly keepWorkspace?: boolean;
   readonly agentRegistry?: AgentProviderRegistry;
   readonly orchestrationAgent?: AgentProvider;
-  readonly visualQAEnabled?: boolean;
-  readonly visualQAMaxRepairAttempts?: number;
-  readonly visualQaScenario?: boolean;
+  readonly browserQAEnabled?: boolean;
   readonly localCliScenario?: boolean;
   readonly artifacts?: ArtifactStore;
   readonly projects?: SiteProjectRepository;
@@ -76,10 +70,7 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
   const design = new DeterministicDesignPlanner();
   const registry = options.agentRegistry ?? new AgentProviderRegistry();
   const mockAgent = new MockAgentProvider({
-    localCliScenario: options.localCliScenario ?? true,
-    ...(options.visualQaScenario !== undefined
-      ? { visualQaScenario: options.visualQaScenario }
-      : {}),
+    localCliScenario: options.localCliScenario ?? false,
   });
   if (!options.agentRegistry) registry.register(mockAgent);
   const gateway = new InProcessAgentGateway(registry);
@@ -94,22 +85,8 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
     sourceDirectory: options.templateRoot ?? resolve("tests/fixtures/react-vite-site"),
   };
   templates.register(template);
-  const visualConfig = loadVisualQAConfig({
-    ...process.env,
-    VISUAL_QA_ENABLED: String(options.visualQAEnabled ?? false),
-    ...(options.visualQAMaxRepairAttempts !== undefined
-      ? { MAX_VISUAL_REPAIR_ATTEMPTS: String(options.visualQAMaxRepairAttempts) }
-      : {}),
-  });
-  const browserRenderer = new BrowserRenderer(artifacts);
-  const visualQA = options.visualQAEnabled
-    ? new VisualQARunner(
-        browserRenderer,
-        new DeterministicVisualQAProvider(visualConfig.passScore),
-        artifacts,
-        visualConfig,
-      )
-    : undefined;
+  const browserQA = new BrowserQARunner({ artifacts });
+  const mediaStore = new ArtifactMediaStore(artifacts);
   const pipeline = new LocalSiteGenerationPipeline({
     execution,
     runtime,
@@ -123,9 +100,11 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
       mode: "AGENT_WITH_FALLBACK",
       strategy: "COMBINED",
     }),
-    editPlanning: new AgentEditPlanner(orchestrationAgent),
-    intentClassifier: new AgentIntentClassifier(orchestrationAgent),
-    visualReview: new VisualAgentReviewer(orchestrationAgent),
+    assetResolver: new AdapterBackedAssetResolver(mediaStore, [
+      new CarFallbackAssetSourceAdapter(readFileSync(new URL("../assets/default-car-fallback.png", import.meta.url))),
+      new PlaceholderAssetSourceAdapter(),
+    ]),
+    assetMediaStore: mediaStore,
     ...(options.agentRegistry && options.orchestrationAgent
       ? {
           agentRequirements: new AgentRequirementsPlanner(gateway, options.orchestrationAgent.id),
@@ -135,7 +114,7 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
     progress,
     templates,
     template,
-    ...(visualQA ? { visualQA } : {}),
+    browserQA,
     ...(options.versionCommitter ? { versionCommitter: options.versionCommitter } : {}),
     ...(options.runtimeProvider ? { runtimeProvider: options.runtimeProvider } : {}),
   });
@@ -162,7 +141,6 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
     progress,
     technicalProfile: SITE_V1_TECHNICAL_PROFILE,
     template,
-    browserRenderer,
-    visualQA,
+    browserQA,
   };
 }
