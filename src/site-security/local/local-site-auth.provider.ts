@@ -1,123 +1,140 @@
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import Database from "better-sqlite3";
 import { argon2id, argon2Verify } from "hash-wasm";
 import { ApplicationError } from "../../app/errors/application-error.js";
 import type { SiteId } from "../../shared/types.js";
-import type { SiteAuthProvider, SiteUser } from "../site-auth-provider.js";
-type Row = Record<string, unknown>;
+import type { SiteAuthProvider, SiteSession, SiteUser } from "../site-auth-provider.js";
+
+interface StoredUser extends SiteUser {
+  readonly passwordHash: string;
+}
+interface StoredSession extends SiteSession {
+  readonly tokenHash: string;
+  readonly revokedAt?: Date;
+}
+interface AuthMemoryState {
+  readonly users: Map<string, StoredUser>;
+  readonly sessions: Map<string, StoredSession>;
+}
+
+const namedStates = new Map<string, AuthMemoryState>();
+const emptyState = (): AuthMemoryState => ({ users: new Map(), sessions: new Map() });
+
+/** Execution-only authentication provider for tests and local workflows. */
 export class LocalSiteAuthProvider implements SiteAuthProvider {
-  readonly id = "local-auth";
-  readonly #db: Database.Database;
+  readonly id = "memory-auth";
+  readonly #state: AuthMemoryState;
+
   constructor(
-    path: string,
+    namespace = ":memory:",
     private readonly now: () => number = Date.now,
-    private readonly sessionTtlMs = 7 * 86400000,
+    private readonly sessionTtlMs = 7 * 86_400_000,
   ) {
-    const p = path === ":memory:" ? path : resolve(path);
-    if (p !== ":memory:") mkdirSync(dirname(p), { recursive: true });
-    this.#db = new Database(p);
-    this.#db.exec(
-      `CREATE TABLE IF NOT EXISTS site_users(id TEXT PRIMARY KEY,site_id TEXT NOT NULL,email TEXT NOT NULL,password_hash TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(site_id,email));CREATE TABLE IF NOT EXISTS site_sessions(id TEXT PRIMARY KEY,site_id TEXT NOT NULL,user_id TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,revoked_at TEXT,FOREIGN KEY(user_id) REFERENCES site_users(id));`,
-    );
+    if (namespace === ":memory:") this.#state = emptyState();
+    else {
+      const existing = namedStates.get(namespace);
+      this.#state = existing ?? emptyState();
+      namedStates.set(namespace, this.#state);
+    }
   }
-  async createUser(siteId: SiteId, email: string, password: string) {
+
+  async createUser(siteId: SiteId, email: string, password: string): Promise<SiteUser> {
     const normalized = this.#email(email);
     if (password.length < 10 || password.length > 256)
       throw new ApplicationError("AUTH_PASSWORD_INVALID", "Password must be 10 to 256 characters");
-    const id = randomUUID(),
-      now = new Date(this.now()),
-      passwordHash = await argon2id({
-        password,
-        salt: randomBytes(16),
-        memorySize: 19456,
-        iterations: 2,
-        parallelism: 1,
-        hashLength: 32,
-        outputType: "encoded",
-      });
-    try {
-      this.#db
-        .prepare("INSERT INTO site_users VALUES (?,?,?,?,?,?,?)")
-        .run(id, siteId, normalized, passwordHash, "ACTIVE", now.toISOString(), now.toISOString());
-    } catch {
+    if ([...this.#state.users.values()].some((user) => user.siteId === siteId && user.email === normalized))
       throw new ApplicationError("AUTH_EMAIL_TAKEN", "An account already exists for this email");
-    }
-    return {
-      id,
+    const now = new Date(this.now());
+    const user: StoredUser = {
+      id: randomUUID(),
       siteId,
       email: normalized,
       status: "ACTIVE",
       createdAt: now,
       updatedAt: now,
-    } as SiteUser;
+      passwordHash: await argon2id({
+        password,
+        salt: randomBytes(16),
+        memorySize: 19_456,
+        iterations: 2,
+        parallelism: 1,
+        hashLength: 32,
+        outputType: "encoded",
+      }),
+    };
+    this.#state.users.set(user.id, user);
+    return this.#publicUser(user);
   }
-  async authenticate(siteId: SiteId, email: string, password: string) {
-    const row = this.#db
-      .prepare("SELECT * FROM site_users WHERE site_id=? AND email=? AND status='ACTIVE'")
-      .get(siteId, this.#email(email)) as Row | undefined;
-    if (!row || !(await argon2Verify({ hash: String(row.password_hash), password })))
+
+  async authenticate(siteId: SiteId, email: string, password: string): Promise<SiteUser> {
+    const normalized = this.#email(email);
+    const user = [...this.#state.users.values()].find(
+      (item) => item.siteId === siteId && item.email === normalized && item.status === "ACTIVE",
+    );
+    if (!user || !(await argon2Verify({ hash: user.passwordHash, password })))
       throw new ApplicationError("AUTH_INVALID_CREDENTIALS", "Invalid email or password");
-    return this.#user(row);
+    return this.#publicUser(user);
   }
-  createSession(siteId: SiteId, userId: string) {
-    const token = randomBytes(32).toString("base64url"),
-      createdAt = new Date(this.now()),
-      expiresAt = new Date(this.now() + this.sessionTtlMs),
-      id = randomUUID();
-    this.#db
-      .prepare("INSERT INTO site_sessions VALUES (?,?,?,?,?,?,NULL)")
-      .run(
-        id,
-        siteId,
-        userId,
-        this.#token(token),
-        createdAt.toISOString(),
-        expiresAt.toISOString(),
-      );
-    return Promise.resolve({ session: { id, siteId, userId, createdAt, expiresAt }, token });
+
+  async createSession(
+    siteId: SiteId,
+    userId: string,
+  ): Promise<{ session: SiteSession; token: string }> {
+    const token = randomBytes(32).toString("base64url");
+    const createdAt = new Date(this.now());
+    const stored: StoredSession = {
+      id: randomUUID(),
+      siteId,
+      userId,
+      tokenHash: this.#token(token),
+      createdAt,
+      expiresAt: new Date(this.now() + this.sessionTtlMs),
+    };
+    this.#state.sessions.set(stored.id, stored);
+    const { tokenHash: _tokenHash, revokedAt: _revokedAt, ...session } = stored;
+    return { session, token };
   }
-  validateSession(siteId: SiteId, token: string) {
-    const row = this.#db
-      .prepare(
-        "SELECT u.* FROM site_sessions s JOIN site_users u ON u.id=s.user_id WHERE s.site_id=? AND s.token_hash=? AND s.revoked_at IS NULL AND s.expires_at>?",
-      )
-      .get(siteId, this.#token(token), new Date(this.now()).toISOString()) as Row | undefined;
-    return Promise.resolve(row ? this.#user(row) : undefined);
+
+  async validateSession(siteId: SiteId, token: string): Promise<SiteUser | undefined> {
+    const hash = this.#token(token);
+    const session = [...this.#state.sessions.values()].find(
+      (item) =>
+        item.siteId === siteId &&
+        item.tokenHash === hash &&
+        !item.revokedAt &&
+        item.expiresAt.getTime() > this.now(),
+    );
+    const user = session ? this.#state.users.get(session.userId) : undefined;
+    return user?.status === "ACTIVE" ? this.#publicUser(user) : undefined;
   }
-  revokeSession(siteId: SiteId, token: string) {
-    this.#db
-      .prepare("UPDATE site_sessions SET revoked_at=? WHERE site_id=? AND token_hash=?")
-      .run(new Date(this.now()).toISOString(), siteId, this.#token(token));
-    return Promise.resolve();
+
+  async revokeSession(siteId: SiteId, token: string): Promise<void> {
+    const hash = this.#token(token);
+    for (const [id, session] of this.#state.sessions)
+      if (session.siteId === siteId && session.tokenHash === hash)
+        this.#state.sessions.set(id, { ...session, revokedAt: new Date(this.now()) });
   }
-  revokeAllUserSessions(siteId: SiteId, userId: string) {
-    this.#db
-      .prepare("UPDATE site_sessions SET revoked_at=? WHERE site_id=? AND user_id=?")
-      .run(new Date(this.now()).toISOString(), siteId, userId);
-    return Promise.resolve();
+
+  async revokeAllUserSessions(siteId: SiteId, userId: string): Promise<void> {
+    for (const [id, session] of this.#state.sessions)
+      if (session.siteId === siteId && session.userId === userId)
+        this.#state.sessions.set(id, { ...session, revokedAt: new Date(this.now()) });
   }
-  close() {
-    this.#db.close();
-  }
-  #email(value: string) {
+
+  close(): void {}
+
+  #email(value: string): string {
     const email = value.trim().toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
       throw new ApplicationError("AUTH_INVALID_CREDENTIALS", "Invalid email or password");
     return email;
   }
-  #token(value: string) {
+
+  #token(value: string): string {
     return createHash("sha256").update(value).digest("hex");
   }
-  #user(row: Row): SiteUser {
-    return {
-      id: String(row.id),
-      siteId: String(row.site_id) as SiteId,
-      email: String(row.email),
-      status: String(row.status) as SiteUser["status"],
-      createdAt: new Date(String(row.created_at)),
-      updatedAt: new Date(String(row.updated_at)),
-    };
+
+  #publicUser(user: StoredUser): SiteUser {
+    const { passwordHash: _passwordHash, ...value } = user;
+    return structuredClone(value);
   }
 }

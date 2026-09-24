@@ -83,28 +83,7 @@ export class MapAssetSourceAdapter implements AssetSourceAdapter {
   }
 }
 
-/** Bundled local visual used when an automotive request has no external provider. */
-export class CarFallbackAssetSourceAdapter implements AssetSourceAdapter {
-  readonly id = "sites-car-fallback";
-  readonly sourceType = "SYSTEM" as const;
-  readonly available = true;
-  constructor(private readonly bytes: Uint8Array) {}
-
-  async resolve(intent: AssetIntent, _budget: AssetProviderBudget): Promise<AssetCandidate | undefined> {
-    if (!/\b(?:car|cars|auto|automotive|vehicle|vehicles|motor|motors|dealership|roadster|coupe|suv)\b/i.test(`${intent.description} ${intent.purpose}`))
-      return undefined;
-    return {
-      intentId: intent.intentId,
-      bytes: this.bytes,
-      contentType: "image/png",
-      sourceType: "SYSTEM",
-      width: 1536,
-      height: 1024,
-      provenance: { sourceType: "SYSTEM", providerId: this.id },
-    };
-  }
-}
-
+/** Neutral, deterministic local fallback for an otherwise unresolved image. */
 export class PlaceholderAssetSourceAdapter implements AssetSourceAdapter {
   readonly id = "sites-placeholder";
   readonly sourceType = "PLACEHOLDER" as const;
@@ -125,7 +104,7 @@ export interface AssetSourcePolicy {
 }
 
 export const DEFAULT_ASSET_SOURCE_POLICY: AssetSourcePolicy = Object.freeze({
-  allowedSources: ["USER_UPLOAD", "SYSTEM", "GENERATED", "STOCK", "PLACEHOLDER"] as const,
+  allowedSources: ["USER_UPLOAD", "GENERATED", "STOCK", "SYSTEM", "PLACEHOLDER"] as const,
 });
 
 export class AdapterBackedAssetResolver {

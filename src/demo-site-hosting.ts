@@ -5,12 +5,12 @@ import { createLocalPersistentSitesProduct } from "./sites/generation/create-loc
 import type { UserId } from "./shared/types.js";
 const root = await mkdtemp(join(tmpdir(), "sites-hosting-demo-"));
 const common = {
-  databasePath: join(root, "sites.db"),
   artifactRoot: join(root, "artifacts"),
 };
 const userId = "hosting-demo" as UserId;
 try {
   const a = createLocalPersistentSitesProduct({ ...common, executionRoot: join(root, "a") });
+  await a.connectPersistence();
   const v1 = await a.orchestrator.generateWebsite({
     userId,
     prompt: "Create a hosted product site",
@@ -28,6 +28,7 @@ try {
   await g.close();
   await a.close();
   const b = createLocalPersistentSitesProduct({ ...common, executionRoot: join(root, "b") });
+  await b.connectPersistence();
   const g2 = b.createHostingGateway("127.0.0.1", 0);
   await g2.start();
   console.log(`Restart served V1: ${(await fetch(g2.url(slug))).status === 200}`);

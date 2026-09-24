@@ -23,9 +23,9 @@ External validation remains intentionally deferred. Daytona is implemented but n
 
 Local architecture:
 
-- Platform metadata: SQLite.
+- Platform metadata: MongoDB through Mongoose.
 - Artifacts: `LocalArtifactStore`.
-- Generated-site runtime data: a deliberately separate SQLite database.
+- Generated-site runtime data: MongoDB collections owned by the Sites runtime provider.
 - Execution: `LocalExecutionProvider` for trusted development only.
 - Hosting: static `LocalHostingProvider` plus managed runtime gateway.
 

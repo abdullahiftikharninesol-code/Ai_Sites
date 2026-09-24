@@ -35,7 +35,7 @@ export const browserQARuntimeChecks: readonly BrowserQACheckExecutor[] = [
             checkId: "broken-images",
             category: "ASSET",
             status: "FAIL",
-            severity: "ERROR",
+            severity: "WARNING",
             message: `${broken.length} visible image${broken.length === 1 ? "" : "s"} failed to load`,
             evidence: broken.map((url): BrowserQAEvidence => ({ type: "network", url, resourceType: "image", failureText: "Image naturalWidth is zero" })),
           }

@@ -6,8 +6,6 @@ import { createLocalPersistentSitesProduct } from "./sites/generation/create-loc
 import type { UserId } from "./shared/types.js";
 const root = await mkdtemp(join(tmpdir(), "sites-domain-demo-")),
   common = {
-    databasePath: join(root, "sites.db"),
-    runtimeDatabasePath: join(root, "runtime.sqlite"),
     artifactRoot: join(root, "artifacts"),
   },
   userId = "domain-demo" as UserId,
@@ -32,6 +30,7 @@ const hostGet = (base: string, host: string, path = "/") =>
   });
 try {
   const a = createLocalPersistentSitesProduct({ ...common, executionRoot: join(root, "a") });
+  await a.connectPersistence();
   const v1 = await a.orchestrator.generateWebsite({
       userId,
       prompt: "Create a custom-domain product site",
@@ -60,6 +59,7 @@ try {
   await a.close();
   const b = createLocalPersistentSitesProduct({ ...common, executionRoot: join(root, "b") }),
     gateway2 = b.createHostingGateway("127.0.0.1", 0);
+  await b.connectPersistence();
   await gateway2.start();
   const address2 = gateway2.url("unused").replace(/\/sites\/unused\/$/, "/");
   console.log(

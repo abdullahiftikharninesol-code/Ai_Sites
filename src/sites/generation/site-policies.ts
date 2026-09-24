@@ -1,5 +1,6 @@
 import { ApplicationError } from "../../app/errors/application-error.js";
 import type { LocalExecutionProvider } from "../../execution/local/local-execution.provider.js";
+import { APPROVED_UI_PACKAGE_VERSIONS } from "./optional-dependencies.js";
 export type SiteGenerationWarningCode =
   | "UNSUPPORTED_FEATURE_IGNORED"
   | "PLACEHOLDER_ASSET_USED"
@@ -45,16 +46,19 @@ export class SitesV1ScopeValidator {
   }
 }
 export class SiteDependencyPolicy {
+  // Approved optional UI packages are sourced from the single registry that also
+  // drives import validation and installation, so package.json policy cannot
+  // drift from what a generated site is actually allowed to import.
   readonly allowed = new Set([
     "react",
     "react-dom",
     "react-router-dom",
-    "lucide-react",
     "vite",
     "typescript",
     "@vitejs/plugin-react",
     "@types/react",
     "@types/react-dom",
+    ...Object.keys(APPROVED_UI_PACKAGE_VERSIONS),
   ]);
   validate(names: readonly string[]): void {
     const rejected = names.filter((name) => !this.allowed.has(name));

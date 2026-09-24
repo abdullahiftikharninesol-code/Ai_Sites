@@ -28,9 +28,9 @@ await projects.save({
   createdAt: new Date(),
   updatedAt: new Date(),
 });
-let runtime = new LocalSiteRuntimeProvider(join(dir, "runtime.sqlite")),
-  authProvider = new LocalSiteAuthProvider(join(dir, "auth.sqlite")),
-  secrets = new LocalSiteSecretStore(join(dir, "secrets.sqlite"), key);
+let runtime = new LocalSiteRuntimeProvider(join(dir, "runtime-state")),
+  authProvider = new LocalSiteAuthProvider(join(dir, "auth-state")),
+  secrets = new LocalSiteSecretStore(join(dir, "secret-state"), key);
 await runtime.provisionRuntime(siteId, {
   enabled: true,
   collections: [
@@ -119,9 +119,9 @@ try {
   runtime.close();
   authProvider.close();
   secrets.close();
-  runtime = new LocalSiteRuntimeProvider(join(dir, "runtime.sqlite"));
-  authProvider = new LocalSiteAuthProvider(join(dir, "auth.sqlite"));
-  secrets = new LocalSiteSecretStore(join(dir, "secrets.sqlite"), key);
+  runtime = new LocalSiteRuntimeProvider(join(dir, "runtime-state"));
+  authProvider = new LocalSiteAuthProvider(join(dir, "auth-state"));
+  secrets = new LocalSiteSecretStore(join(dir, "secret-state"), key);
   console.log(
     "[RESTART] identity/data/secret counts:",
     Boolean(await authProvider.validateSession(siteId, cookie.slice("sites_session=".length))),

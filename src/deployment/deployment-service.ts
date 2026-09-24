@@ -4,10 +4,10 @@ import type { LocalExecutionProvider } from "../execution/local/local-execution.
 import type { ArtifactStore } from "../persistence/artifact-store.js";
 import type {
   SiteDeploymentRepository,
+  SitePublicationRepository,
   SiteProjectRepository,
   SiteVersionRepository,
 } from "../persistence/repositories.js";
-import type { SqliteDatabase } from "../persistence/sqlite/sqlite-database.js";
 import type { DeploymentId, SiteId, VersionId } from "../shared/types.js";
 import type { SiteDeployment } from "../sites/domain/entities.js";
 import type { LocalSiteGenerationPipeline } from "../sites/generation/local-site-generation-pipeline.js";
@@ -36,10 +36,9 @@ export class DeploymentService {
     private readonly pipeline: LocalSiteGenerationPipeline,
     private readonly execution: LocalExecutionProvider,
     private readonly artifacts: ArtifactStore,
-    private readonly projects: SiteProjectRepository,
+    private readonly projects: SiteProjectRepository & Partial<SitePublicationRepository>,
     private readonly versions: SiteVersionRepository,
     private readonly deployments: SiteDeploymentRepository,
-    private readonly db: SqliteDatabase,
     private readonly runtimeBaseUrl = "http://127.0.0.1:8090",
     private readonly securityScanner = new SiteArtifactSecurityScanner(),
   ) {}
@@ -152,16 +151,23 @@ export class DeploymentService {
       await this.pipeline.disposeRestoredEnvironment(restored.environmentId);
     }
   }
-  publish(deployment: SiteDeployment): Promise<void> {
+  async publish(deployment: SiteDeployment): Promise<void> {
     try {
-      this.db.connection.transaction(() => {
-        this.db.connection
-          .prepare(
-            "UPDATE site_projects SET published_version_id=?,published_deployment_id=?,updated_at=? WHERE id=?",
-          )
-          .run(deployment.versionId, deployment.id, new Date().toISOString(), deployment.siteId);
-      })();
-      return Promise.resolve();
+      if (this.projects.setPublication)
+        await this.projects.setPublication(deployment.siteId, {
+          versionId: deployment.versionId,
+          deploymentId: deployment.id,
+        });
+      else {
+        const project = await this.projects.getById(deployment.siteId);
+        if (!project) throw new ApplicationError("SITE_NOT_FOUND", "Site not found");
+        await this.projects.save({
+          ...project,
+          publishedVersionId: deployment.versionId,
+          publishedDeploymentId: deployment.id,
+          updatedAt: new Date(),
+        });
+      }
     } catch (cause) {
       throw new ApplicationError("PUBLISH_FAILED", "Atomic publish failed", { cause });
     }
@@ -175,10 +181,11 @@ export class DeploymentService {
   async unpublish(siteId: SiteId) {
     const project = await this.projects.getById(siteId);
     if (!project) throw new ApplicationError("SITE_NOT_FOUND", "Site not found");
-    this.db.connection
-      .prepare(
-        "UPDATE site_projects SET published_version_id=NULL,published_deployment_id=NULL,updated_at=? WHERE id=?",
-      )
-      .run(new Date().toISOString(), siteId);
+    if (this.projects.setPublication) await this.projects.setPublication(siteId);
+    else {
+      const { publishedVersionId: _version, publishedDeploymentId: _deployment, ...current } =
+        project;
+      await this.projects.save({ ...current, updatedAt: new Date() });
+    }
   }
 }

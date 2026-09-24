@@ -1,12 +1,18 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { resolve, join } from "node:path";
-import { createLocalPersistentSitesProduct } from "../sites/generation/create-local-persistent-sites-product.js";
+import { createMongoPersistentSitesProduct } from "../sites/generation/create-mongo-persistent-sites-product.js";
 import type { DeploymentId, SiteId, UserId, VersionId } from "../shared/types.js";
 import { DevJobManager } from "./dev-job-manager.js";
 import { DevelopmentPreviewManager } from "./development-preview-manager.js";
 import { createAgentProviderRegistry } from "../agents/registry/create-agent-provider-registry.js";
 import { loadConfig } from "../app/config/environment.js";
 import type { SiteSourceSnapshot } from "../sites/generation/source-snapshot.js";
+import { deriveSiteName } from "../sites/generation/site-name.js";
+import { loadPersistenceConfig } from "../persistence/persistence-config.js";
+import type { MongoConnectionManager } from "../persistence/mongodb/mongo-connection.js";
+import { ArtifactMediaStore } from "../sites/assets/media-store.js";
+import { ingestUserImage, userAssetsManifest, type UserProvidedAsset } from "../sites/assets/user-asset-ingestion.js";
 
 export interface PlaygroundConfig {
   host: string;
@@ -20,20 +26,25 @@ export interface PlaygroundConfig {
   dataRoot: string;
   agentProvider: string;
   agentPlanningEnabled?: boolean;
+  databaseUri?: string;
 }
-export const loadPlaygroundConfig = (env: NodeJS.ProcessEnv = process.env): PlaygroundConfig => ({
-  host: env.SITES_DEV_SERVER_HOST ?? "127.0.0.1",
-  port: Number(env.SITES_DEV_SERVER_PORT ?? 4310),
-  webOrigins: playgroundOrigins(env),
-  hostingHost: "127.0.0.1",
-  hostingPort: Number(env.SITES_DEV_HOSTING_PORT ?? 4311),
-  runtimeHost: "127.0.0.1",
-  runtimePort: Number(env.SITES_DEV_RUNTIME_PORT ?? 8090),
-  previewIdleTtlMs: Number(env.SITES_DEV_PREVIEW_IDLE_TTL_MS ?? 3_600_000),
-  dataRoot: resolve(env.SITES_DEV_DATA_ROOT ?? join(".sites-runtime", "playground")),
-  agentProvider: env.SITES_DEV_AGENT_PROVIDER?.trim() || "mock",
-  agentPlanningEnabled: env.SITES_DEV_AGENT_PLANNING === "true",
-});
+export const loadPlaygroundConfig = (env: NodeJS.ProcessEnv = process.env): PlaygroundConfig => {
+  const persistence = loadPersistenceConfig(env);
+  return {
+    host: env.SITES_DEV_SERVER_HOST ?? "127.0.0.1",
+    port: Number(env.SITES_DEV_SERVER_PORT ?? 4310),
+    webOrigins: playgroundOrigins(env),
+    hostingHost: "127.0.0.1",
+    hostingPort: Number(env.SITES_DEV_HOSTING_PORT ?? 4311),
+    runtimeHost: "127.0.0.1",
+    runtimePort: Number(env.SITES_DEV_RUNTIME_PORT ?? 8090),
+    previewIdleTtlMs: Number(env.SITES_DEV_PREVIEW_IDLE_TTL_MS ?? 3_600_000),
+    dataRoot: resolve(env.SITES_DEV_DATA_ROOT ?? join(".sites-runtime", "playground")),
+    agentProvider: env.SITES_DEV_AGENT_PROVIDER?.trim() || "mock",
+    agentPlanningEnabled: env.SITES_DEV_AGENT_PLANNING === "true",
+    ...(persistence.databaseUri ? { databaseUri: persistence.databaseUri } : {}),
+  };
+};
 
 const playgroundOrigins = (env: NodeJS.ProcessEnv): readonly string[] => {
   const configured = env.SITES_PLAYGROUND_ORIGINS?.split(",")
@@ -52,8 +63,13 @@ export class PlaygroundService {
   readonly previews;
   readonly hosting;
   readonly runtimeGateway;
+  readonly #mediaStore: ArtifactMediaStore;
+  readonly #uploadedAssets = new Map<string, UserProvidedAsset>();
   #started = false;
-  constructor(readonly config: PlaygroundConfig = loadPlaygroundConfig()) {
+  constructor(
+    readonly config: PlaygroundConfig = loadPlaygroundConfig(),
+    mongoConnection?: MongoConnectionManager,
+  ) {
     const providerId = config.agentProvider === "mock-agent" ? "mock" : config.agentProvider;
     this.agentProviderId = providerId;
     const realAgentComposition = (() => {
@@ -64,13 +80,14 @@ export class PlaygroundService {
     })();
     this.agentModel =
       realAgentComposition?.orchestrationAgent.getCapabilities().models[0] ?? "mock-sites-v1";
-    this.product = createLocalPersistentSitesProduct({
-      databasePath: join(config.dataRoot, "sites.sqlite"),
-      runtimeDatabasePath: join(config.dataRoot, "runtime.sqlite"),
+    this.product = createMongoPersistentSitesProduct({
+      ...(config.databaseUri ? { databaseUri: config.databaseUri } : {}),
+      ...(mongoConnection ? { mongoConnection } : {}),
       artifactRoot: join(config.dataRoot, "artifacts"),
       executionRoot: join(config.dataRoot, "execution"),
       ...(realAgentComposition ?? {}),
     });
+    this.#mediaStore = new ArtifactMediaStore(this.product.artifacts);
     this.jobs = new DevJobManager(this.product.progress);
     this.previews = new DevelopmentPreviewManager(
       this.product.pipeline,
@@ -88,6 +105,7 @@ export class PlaygroundService {
     if (this.#started) return;
     await mkdir(this.config.dataRoot, { recursive: true });
     try {
+      await this.product.connectPersistence();
       await this.hosting.start();
       await this.runtimeGateway.start();
       this.#started = true;
@@ -95,20 +113,39 @@ export class PlaygroundService {
       // Both close operations are idempotent and prevent a partial startup from
       // leaving one of the local ports occupied.
       await Promise.allSettled([this.runtimeGateway.close(), this.hosting.close()]);
+      await this.product.close();
       throw error;
     }
   }
-  generate(prompt: string) {
+  databaseStatus() {
+    return this.product.databaseStatus();
+  }
+  async ingestImage(upload: { readonly originalName: string; readonly mimeType: string; readonly bytes: Uint8Array }) {
+    const asset = await ingestUserImage(this.#mediaStore, upload);
+    this.#uploadedAssets.set(asset.id, asset);
+    return { id: asset.id, originalName: asset.originalName, mimeType: asset.mimeType, managedPath: asset.managedPath };
+  }
+  #assets(ids: readonly string[] | undefined, referenceIds: readonly string[] = []) {
+    const assets = (ids ?? []).map((id) => this.#uploadedAssets.get(id));
+    if (assets.some((asset) => !asset)) throw this.#error("USER_ASSET_NOT_FOUND", "One or more selected images are no longer available");
+    if (!assets.length && referenceIds.length) throw this.#error("INVALID_REQUEST", "Design references must be selected attachments");
+    return assets.length ? userAssetsManifest(assets as UserProvidedAsset[], referenceIds) : undefined;
+  }
+  generate(prompt: string, attachmentIds?: readonly string[], referenceIds: readonly string[] = []) {
+    const assetManifest = this.#assets(attachmentIds, referenceIds);
     return this.jobs.start("GENERATE", async (onIntelligence) => {
       const result = await this.product.orchestrator.generateWebsite({
         userId: this.userId,
         prompt,
+        // Deterministic, local naming: a readable project name must not cost a call.
+        projectName: deriveSiteName(prompt),
         // Planning is deterministic by default so one click spends provider
         // capacity on coding rather than on an extra planning request.
         planningMode: this.config.agentPlanningEnabled ? "agent-with-fallback" : "deterministic",
         agentProvider: this.agentProviderId,
         browserQAEnabled: true,
         retainPreview: true,
+        ...(assetManifest ? { assetManifest } : {}),
         onIntelligence,
       });
       const preview = await this.previews.adopt(result.siteId, result.versionId, result.preview.environmentId, {
@@ -123,10 +160,11 @@ export class PlaygroundService {
       };
     });
   }
-  async edit(siteId: string, prompt: string, baseVersionId?: string) {
+  async edit(siteId: string, prompt: string, baseVersionId?: string, attachmentIds?: readonly string[], referenceIds: readonly string[] = []) {
     const project = await this.#project(siteId);
     const versionId = (baseVersionId ?? project.latestVersionId) as VersionId | undefined;
     if (!versionId) throw this.#error("VERSION_NOT_FOUND", "No base version exists");
+    const assetManifest = this.#assets(attachmentIds, referenceIds);
     return this.jobs.start("EDIT", async (onIntelligence) => {
       const result = await this.product.orchestrator.editWebsite({
         userId: this.userId,
@@ -137,6 +175,7 @@ export class PlaygroundService {
         agentPlanningEnabled: this.config.agentPlanningEnabled === true,
         browserQAEnabled: true,
         retainPreview: true,
+        ...(assetManifest ? { assetManifest } : {}),
         onIntelligence,
       });
       const preview = await this.previews.adopt(result.siteId, result.newVersionId, result.preview.environmentId, {
@@ -278,6 +317,29 @@ export class PlaygroundService {
       ...(file.encoding ? { encoding: file.encoding } : {}),
     };
   }
+  async renameSite(siteId: string, name: string) {
+    const trimmed = name.trim().slice(0, 60);
+    if (!trimmed) throw this.#error("INVALID_REQUEST", "A site name is required");
+    const project = await this.#project(siteId);
+    await this.product.projects.save({ ...project, name: trimmed, updatedAt: new Date() });
+    return { projectId: project.id, name: trimmed };
+  }
+  async createPersistenceTestSite(name: string) {
+    const trimmed = name.trim().slice(0, 60);
+    if (!trimmed) throw this.#error("INVALID_REQUEST", "A site name is required");
+    const now = new Date();
+    const id = randomUUID() as SiteId;
+    await this.product.projects.save({
+      id,
+      ownerId: this.userId,
+      name: trimmed,
+      slug: `site-${id.slice(0, 8)}`,
+      status: "DRAFT",
+      createdAt: now,
+      updatedAt: now,
+    });
+    return { projectId: id, name: trimmed };
+  }
   async deleteSite(siteId: string) {
     const project = await this.#project(siteId);
     if (this.jobs.hasActiveProject(project.id))
@@ -285,8 +347,7 @@ export class PlaygroundService {
     const activePreview = this.previews.list().find((session) => session.siteId === project.id);
     if (activePreview) await this.previews.stop(activePreview.id);
     await this.product.siteRuntime.deleteRuntime(project.id);
-    const artifactKeys = this.product.database.deleteSite(project.id);
-    await Promise.all(artifactKeys.map((key) => this.product.artifacts.delete(key)));
+    await this.product.deleteSite(project.id);
     return { deleted: true };
   }
   async startPreview(siteId: string, versionId: string) {

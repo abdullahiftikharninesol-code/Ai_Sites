@@ -87,6 +87,9 @@ export class MockExecutionProvider implements ExecutionProvider {
     if (value === undefined) throw new Error(`File not found: ${path}`);
     return value.toString("utf8");
   }
+  async fileExists(environmentId: string, path: string): Promise<boolean> {
+    return this.#workspace(environmentId).files.has(normalizePath(path));
+  }
   async readFileBytes(environmentId: string, path: string): Promise<Uint8Array> {
     const value = this.#workspace(environmentId).files.get(normalizePath(path));
     if (value === undefined) throw new Error(`File not found: ${path}`);

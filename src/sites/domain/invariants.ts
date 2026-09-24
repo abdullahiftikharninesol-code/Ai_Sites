@@ -18,7 +18,11 @@ export function assertSiteVersion(version: SiteVersion): void {
 }
 
 export function assertSiteJob(job: SiteJob): void {
-  if (!Number.isFinite(job.progress) || job.progress < 0 || job.progress > 100)
-    fail("Job progress must be between 0 and 100");
-  if (job.completedAt && !job.startedAt) fail("A completed job must have started");
+  for (const [label, value] of [
+    ["logicalCalls", job.logicalCalls],
+    ["physicalRequests", job.physicalRequests],
+    ["retries", job.retries],
+  ] as const)
+    if (!Number.isInteger(value) || value < 0) fail(`${label} must be a non-negative integer`);
+  if (job.updatedAt < job.createdAt) fail("updatedAt cannot precede createdAt");
 }

@@ -4,16 +4,15 @@ import { join } from "node:path";
 import { createLocalPersistentSitesProduct } from "./sites/generation/create-local-persistent-sites-product.js";
 import type { UserId } from "./shared/types.js";
 const root = await mkdtemp(join(tmpdir(), "sites-persistent-demo-"));
-const databasePath = join(root, "sites.db");
 const artifactRoot = join(root, "artifacts");
 const userId = "persistent-demo-user" as UserId;
 console.log(`Persistent demo root: ${root}`);
 try {
   const first = createLocalPersistentSitesProduct({
-    databasePath,
     artifactRoot,
     executionRoot: join(root, "runtime-1"),
   });
+  await first.connectPersistence();
   const generated = await first.orchestrator.generateWebsite({
     userId,
     prompt: "Create a responsive restart-safe product website",
@@ -26,10 +25,10 @@ try {
   await first.close();
   console.log("Instance A database closed");
   const second = createLocalPersistentSitesProduct({
-    databasePath,
     artifactRoot,
     executionRoot: join(root, "runtime-2"),
   });
+  await second.connectPersistence();
   const loaded = await second.queries.getProject(generated.siteId);
   console.log(
     `Instance B reload: ${loaded.project.name}; latest ${loaded.latestVersion?.versionNumber}`,
@@ -47,10 +46,10 @@ try {
   console.log(`Instance B: V2 ${edited.newVersionId}; Browser QA ${edited.browserQA?.status ?? "NOT_RUN"}`);
   await second.close();
   const third = createLocalPersistentSitesProduct({
-    databasePath,
     artifactRoot,
     executionRoot: join(root, "runtime-3"),
   });
+  await third.connectPersistence();
   const project = await third.queries.getProject(generated.siteId);
   const versions = await third.queries.listVersions(generated.siteId);
   console.log(
@@ -58,7 +57,6 @@ try {
   );
   console.log(`Lineage: ${versions.items[1]?.parentVersionId} → ${versions.items[1]?.id}`);
   console.log(`Latest pointer: ${project.project.latestVersionId}`);
-  console.log(`Durable storage: ${third.artifacts.storageBytesForSite(generated.siteId)} bytes`);
   console.log(
     `Screenshots persisted: ${versions.items.flatMap((version) => version.finalScreenshotRefs ?? []).length}`,
   );

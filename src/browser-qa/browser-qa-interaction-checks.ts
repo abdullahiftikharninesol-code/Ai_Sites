@@ -32,7 +32,7 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
             checkId: "responsive-overflow",
             category: "RESPONSIVE",
             status: "FAIL",
-            severity: "ERROR",
+            severity: "WARNING",
             message: `Document overflows the viewport by ${overflowPx}px`,
             evidence: [{ type: "layout", ...layout, overflowPx }],
           }
@@ -64,7 +64,7 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
             checkId: "interaction-smoke",
             category: "INTERACTION",
             status: "FAIL",
-            severity: "ERROR",
+            severity: "WARNING",
             message: "Expandable control did not expose a changed state or visible controlled content",
             evidence: [{
               type: "element",
@@ -92,7 +92,7 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
               checkId: "interaction-smoke",
               category: "INTERACTION",
               status: "FAIL",
-              severity: "ERROR",
+              severity: "WARNING",
               message: "Representative details/summary control did not change state",
             }
           : {
@@ -140,7 +140,7 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
       await control.click({ timeout: 2_000 }).catch(() => undefined);
       return result(context, after !== before && visible
         ? { checkId: "interaction.mobile-nav", category: "INTERACTION", status: "PASS", severity: "ERROR", message: "Mobile navigation opened and exposed its controlled menu" }
-        : { checkId: "interaction.mobile-nav", category: "INTERACTION", status: "FAIL", severity: "ERROR", message: "Mobile navigation toggle did not expose its controlled menu" });
+        : { checkId: "interaction.mobile-nav", category: "INTERACTION", status: "FAIL", severity: "WARNING", message: "Mobile navigation toggle did not expose its controlled menu" });
     },
   },
   {
@@ -164,7 +164,7 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
         return issues.slice(0, 25);
       });
       return result(context, findings.length
-        ? { checkId: "form-smoke", category: "FORM", status: "FAIL", severity: "ERROR", message: `${findings.length} form smoke finding${findings.length === 1 ? "" : "s"}`, evidence: findings.map((message): BrowserQAEvidence => ({ type: "element", locatorDescription: "form control", accessibleName: message })) }
+        ? { checkId: "form-smoke", category: "FORM", status: "FAIL", severity: "WARNING", message: `${findings.length} form smoke finding${findings.length === 1 ? "" : "s"}`, evidence: findings.map((message): BrowserQAEvidence => ({ type: "element", locatorDescription: "form control", accessibleName: message })) }
         : { checkId: "form-smoke", category: "FORM", status: "PASS", severity: "ERROR", message: "Form controls have names and labels; no submission was triggered" });
     },
   },

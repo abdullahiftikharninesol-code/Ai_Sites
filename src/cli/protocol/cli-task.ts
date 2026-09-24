@@ -9,6 +9,8 @@ export interface CliTask {
   readonly userRequest: string;
   readonly siteSpec?: SiteSpec;
   readonly assetManifest?: AssetManifest;
+  /** Transient images supplied to this coder request; never persisted in project/job records. */
+  readonly referenceImages?: readonly import("../../agents/agent-types.js").AgentImagePart[];
   readonly target?: { readonly path: string; readonly find: string; readonly replace: string };
   readonly generationMode?: "FAST_GENERATION" | "ITERATIVE_FALLBACK";
   readonly runContext?: import("../../agents/budget/inference-run-context.js").InferenceRunContext;

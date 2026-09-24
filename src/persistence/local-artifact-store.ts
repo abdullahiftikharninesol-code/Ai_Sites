@@ -44,6 +44,9 @@ export class LocalArtifactStore implements ArtifactStore {
   async delete(key: string) {
     await rm(this.#path(key), { force: true });
   }
+  async deletePrefix(prefix: string) {
+    await rm(this.#path(prefix), { recursive: true, force: true });
+  }
   async exists(key: string) {
     try {
       await stat(this.#path(key));

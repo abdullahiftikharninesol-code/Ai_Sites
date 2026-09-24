@@ -27,6 +27,25 @@ export class InMemorySiteProjectRepository implements SiteProjectRepository {
   async listByOwner(ownerId: string) {
     return page([...this.#items.values()].filter((item) => item.ownerId === ownerId));
   }
+  async setPublication(
+    siteId: SiteId,
+    publication?: { readonly versionId: VersionId; readonly deploymentId: DeploymentId },
+  ) {
+    const project = this.#items.get(siteId);
+    if (!project) return;
+    if (publication)
+      this.#items.set(siteId, {
+        ...project,
+        publishedVersionId: publication.versionId,
+        publishedDeploymentId: publication.deploymentId,
+        updatedAt: new Date(),
+      });
+    else {
+      const { publishedVersionId: _version, publishedDeploymentId: _deployment, ...current } =
+        project;
+      this.#items.set(siteId, { ...current, updatedAt: new Date() });
+    }
+  }
 }
 export class InMemorySiteVersionRepository implements SiteVersionRepository {
   readonly #items = new Map<VersionId, SiteVersion>();

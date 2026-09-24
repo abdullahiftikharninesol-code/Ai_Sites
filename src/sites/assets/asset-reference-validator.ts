@@ -1,6 +1,6 @@
 import { ApplicationError } from "../../app/errors/application-error.js";
 import type { ExecutionProvider } from "../../execution/execution-provider.js";
-import type { AssetManifest } from "./asset-domain.js";
+import { isVisualReferenceAsset, type AssetManifest } from "./asset-domain.js";
 
 export interface AssetReferenceDiagnostic {
   readonly path: string;
@@ -38,7 +38,7 @@ export async function validateAssetReferences(
   environmentId: string,
   manifest?: AssetManifest,
 ): Promise<readonly AssetReferenceDiagnostic[]> {
-  const allowed = new Set((manifest?.assets ?? []).flatMap((asset) => asset.publicPath ? [asset.publicPath] : []));
+  const allowed = new Set((manifest?.assets ?? []).flatMap((asset) => asset.publicPath && !isVisualReferenceAsset(asset) ? [asset.publicPath] : []));
   const diagnostics: AssetReferenceDiagnostic[] = [];
   for (const entry of await execution.listFiles(environmentId)) {
     if (entry.type !== "FILE" || !(entry.path === "index.html" || entry.path.startsWith("src/") || entry.path.startsWith("public/"))) continue;
@@ -68,4 +68,13 @@ export async function validateAssetReferences(
     }
   }
   return diagnostics;
+}
+
+/** Every accepted user upload is required to appear in generated source. */
+export async function validateRequiredUserAssetReferences(execution: Pick<ExecutionProvider, "listFiles" | "readFile">, environmentId: string, manifest?: AssetManifest): Promise<void> {
+  const required = (manifest?.assets ?? []).filter((asset) => asset.sourceType === "USER_UPLOAD" && !isVisualReferenceAsset(asset) && asset.publicPath);
+  if (!required.length) return;
+  const source = await Promise.all((await execution.listFiles(environmentId)).filter((entry) => entry.type === "FILE" && (entry.path === "index.html" || entry.path.startsWith("src/"))).map((entry) => execution.readFile(environmentId, entry.path)));
+  const missing = required.find((asset) => !source.some((content) => content.includes(asset.publicPath!)));
+  if (missing) throw new ApplicationError("USER_ASSET_NOT_REFERENCED", `Required user image was not referenced: ${missing.provenance.userUploadName ?? missing.assetId}`, { metadata: { assetId: missing.assetId, originalName: missing.provenance.userUploadName } });
 }

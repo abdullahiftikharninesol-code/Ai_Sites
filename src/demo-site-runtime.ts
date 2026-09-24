@@ -8,8 +8,6 @@ import type { UserId } from "./shared/types.js";
 
 const root = await mkdtemp(join(tmpdir(), "sites-runtime-demo-"));
 const common = {
-  databasePath: join(root, "platform", "sites.db"),
-  runtimeDatabasePath: join(root, "runtime", "sites-runtime.db"),
   artifactRoot: join(root, "artifacts"),
 };
 const userId = "runtime-demo" as UserId;
@@ -18,6 +16,7 @@ try {
     ...common,
     executionRoot: join(root, "execution-a"),
   });
+  await first.connectPersistence();
   const runtimeGateway = first.createRuntimeGateway(["http://127.0.0.1:8088"], "127.0.0.1", 8090);
   await runtimeGateway.start();
   console.log("[RUNTIME] gateway ready");
@@ -72,6 +71,7 @@ try {
     ...common,
     executionRoot: join(root, "execution-b"),
   });
+  await second.connectPersistence();
   const restarted = (
     await second.siteRuntimeService.list(
       v1.siteId,

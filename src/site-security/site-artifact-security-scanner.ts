@@ -16,8 +16,7 @@ const forbiddenNames = [
   "OPENROUTER_API_KEY",
   "DAYTONA_API_KEY",
 ];
-const forbiddenFiles =
-  /(^|\/)(?:auth|secrets?|runtime)(?:-[^/]*)?\.sqlite(?:-(?:wal|shm))?$|(^|\/)(?:\.env(?:\..*)?)$/i;
+const forbiddenFiles = /(^|\/)(?:\.env(?:\..*)?)$/i;
 export class SiteArtifactSecurityScanner {
   scan(files: readonly SecurityScanFile[], kind: "source" | "deployment" = "source"): void {
     for (const file of files) {

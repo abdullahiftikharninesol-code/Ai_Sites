@@ -1,83 +1,83 @@
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
-import Database from "better-sqlite3";
 import { ApplicationError } from "../../app/errors/application-error.js";
 import type { SiteId } from "../../shared/types.js";
-import type { SiteSecretStore } from "../site-secret-store.js";
-type Row = Record<string, unknown>;
+import type { SiteSecretMetadata, SiteSecretStore } from "../site-secret-store.js";
+
+interface StoredSecret extends SiteSecretMetadata {
+  readonly ciphertext: Buffer;
+  readonly iv: Buffer;
+  readonly tag: Buffer;
+}
+
+const namedStates = new Map<string, Map<string, StoredSecret>>();
+const secretKey = (siteId: SiteId, name: string) => `${siteId}\u0000${name}`;
+
+/** Execution-only encrypted secret store for tests and local workflows. */
 export class LocalSiteSecretStore implements SiteSecretStore {
-  readonly #db: Database.Database;
+  readonly #secrets: Map<string, StoredSecret>;
+
   constructor(
-    path: string,
+    namespace = ":memory:",
     private readonly key: Buffer,
   ) {
     if (key.length !== 32) throw new Error("Secret master key must be 32 bytes");
-    const p = path === ":memory:" ? path : resolve(path);
-    if (p !== ":memory:") mkdirSync(dirname(p), { recursive: true });
-    this.#db = new Database(p);
-    this.#db.exec(
-      "CREATE TABLE IF NOT EXISTS site_secrets(id TEXT PRIMARY KEY,site_id TEXT NOT NULL,name TEXT NOT NULL,ciphertext BLOB NOT NULL,iv BLOB NOT NULL,tag BLOB NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(site_id,name))",
-    );
+    if (namespace === ":memory:") this.#secrets = new Map();
+    else {
+      const existing = namedStates.get(namespace);
+      this.#secrets = existing ?? new Map();
+      namedStates.set(namespace, this.#secrets);
+    }
   }
-  setSecret(siteId: SiteId, name: string, value: string) {
+
+  async setSecret(siteId: SiteId, name: string, value: string): Promise<SiteSecretMetadata> {
     if (!/^[A-Z][A-Z0-9_]{2,63}$/.test(name))
       throw new ApplicationError("RUNTIME_VALIDATION_FAILED", "Invalid secret name");
-    const iv = randomBytes(12),
-      cipher = createCipheriv("aes-256-gcm", this.key, iv);
-    const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]),
-      tag = cipher.getAuthTag(),
-      now = new Date(),
-      existing = this.#db
-        .prepare("SELECT id,created_at FROM site_secrets WHERE site_id=? AND name=?")
-        .get(siteId, name) as Row | undefined,
-      id = existing ? String(existing.id) : randomUUID(),
-      created = existing ? new Date(String(existing.created_at)) : now;
-    this.#db
-      .prepare(
-        "INSERT INTO site_secrets VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(site_id,name) DO UPDATE SET ciphertext=excluded.ciphertext,iv=excluded.iv,tag=excluded.tag,updated_at=excluded.updated_at",
-      )
-      .run(id, siteId, name, ciphertext, iv, tag, created.toISOString(), now.toISOString());
-    return Promise.resolve({ id, siteId, name, createdAt: created, updatedAt: now });
+    const iv = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", this.key, iv);
+    const existing = this.#secrets.get(secretKey(siteId, name));
+    const now = new Date();
+    const stored: StoredSecret = {
+      id: existing?.id ?? randomUUID(),
+      siteId,
+      name,
+      ciphertext: Buffer.concat([cipher.update(value, "utf8"), cipher.final()]),
+      iv,
+      tag: cipher.getAuthTag(),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.#secrets.set(secretKey(siteId, name), stored);
+    return this.#metadata(stored);
   }
-  async getSecret(siteId: SiteId, name: string) {
-    await Promise.resolve();
-    const r = this.#db
-      .prepare("SELECT * FROM site_secrets WHERE site_id=? AND name=?")
-      .get(siteId, name) as Row | undefined;
-    if (!r) return undefined;
+
+  async getSecret(siteId: SiteId, name: string): Promise<string | undefined> {
+    const stored = this.#secrets.get(secretKey(siteId, name));
+    if (!stored) return undefined;
     try {
-      const decipher = createDecipheriv("aes-256-gcm", this.key, r.iv as Buffer);
-      decipher.setAuthTag(r.tag as Buffer);
-      return Buffer.concat([decipher.update(r.ciphertext as Buffer), decipher.final()]).toString(
-        "utf8",
-      );
+      const decipher = createDecipheriv("aes-256-gcm", this.key, stored.iv);
+      decipher.setAuthTag(stored.tag);
+      return Buffer.concat([decipher.update(stored.ciphertext), decipher.final()]).toString("utf8");
     } catch (cause) {
       throw new ApplicationError("SECRET_DECRYPTION_FAILED", "Unable to decrypt site secret", {
         cause,
       });
     }
   }
-  deleteSecret(siteId: SiteId, name: string) {
-    this.#db.prepare("DELETE FROM site_secrets WHERE site_id=? AND name=?").run(siteId, name);
-    return Promise.resolve();
+
+  async deleteSecret(siteId: SiteId, name: string): Promise<void> {
+    this.#secrets.delete(secretKey(siteId, name));
   }
-  listSecretMetadata(siteId: SiteId) {
-    return Promise.resolve(
-      (
-        this.#db
-          .prepare("SELECT id,site_id,name,created_at,updated_at FROM site_secrets WHERE site_id=?")
-          .all(siteId) as Row[]
-      ).map((r) => ({
-        id: String(r.id),
-        siteId: String(r.site_id) as SiteId,
-        name: String(r.name),
-        createdAt: new Date(String(r.created_at)),
-        updatedAt: new Date(String(r.updated_at)),
-      })),
-    );
+
+  async listSecretMetadata(siteId: SiteId): Promise<readonly SiteSecretMetadata[]> {
+    return [...this.#secrets.values()]
+      .filter((stored) => stored.siteId === siteId)
+      .map((stored) => this.#metadata(stored));
   }
-  close() {
-    this.#db.close();
+
+  close(): void {}
+
+  #metadata(stored: StoredSecret): SiteSecretMetadata {
+    const { ciphertext: _ciphertext, iv: _iv, tag: _tag, ...metadata } = stored;
+    return structuredClone(metadata);
   }
 }

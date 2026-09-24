@@ -49,12 +49,14 @@ export const browserQACoreCheckExecutors: readonly BrowserQACheckExecutor[] = [
     definition: definition("runtime.console-error", "CONSOLE", "ERROR", 1_000),
     async execute(context) {
       const errors = context.events.consoleErrors;
+      // Advisory: a console error is a defect worth reporting, but the page
+      // still rendered. A crash surfaces as runtime.page-error, which blocks.
       if (errors.length)
         return result(context, {
           checkId: "runtime.console-error",
           category: "CONSOLE",
           status: "FAIL",
-          severity: "ERROR",
+          severity: "WARNING",
           message: `${errors.length} console error${errors.length === 1 ? "" : "s"}`,
           evidence: errors,
         });
@@ -149,28 +151,32 @@ export const browserQACoreCheckExecutors: readonly BrowserQACheckExecutor[] = [
     async execute(context) {
       const findings = await context.page.evaluate(() => {
         const links = [...document.querySelectorAll<HTMLAnchorElement>("a[href]")];
-        const issues: string[] = [];
+        const unsafe: string[] = [];
+        const advisory: string[] = [];
         for (const link of links) {
           const href = link.getAttribute("href")?.trim() ?? "";
           if (!href) {
-            issues.push("empty href");
+            advisory.push("empty href");
             continue;
           }
-          if (/^(?:javascript|data):/i.test(href)) issues.push(`unsafe scheme: ${href.slice(0, 120)}`);
+          if (/^(?:javascript|data):/i.test(href)) unsafe.push(`unsafe scheme: ${href.slice(0, 120)}`);
           if (href.startsWith("#") && href.length > 1 && !document.getElementById(href.slice(1)))
-            issues.push(`missing fragment target: ${href.slice(0, 120)}`);
-          if (href.startsWith("/") && href.startsWith("//")) issues.push(`protocol-relative link: ${href.slice(0, 120)}`);
+            advisory.push(`missing fragment target: ${href.slice(0, 120)}`);
+          if (href.startsWith("/") && href.startsWith("//")) advisory.push(`protocol-relative link: ${href.slice(0, 120)}`);
         }
-        return issues.slice(0, 50);
+        return { unsafe: unsafe.slice(0, 50), advisory: advisory.slice(0, 50) };
       });
-      return result(context, findings.length
+      // An unsafe scheme is a security defect and blocks. A dangling anchor or
+      // empty href is a polish defect: report it, do not discard the site.
+      const linkIssues = [...findings.unsafe, ...findings.advisory];
+      return result(context, linkIssues.length
         ? {
             checkId: "internal-links",
             category: "ROUTING",
             status: "FAIL",
-            severity: "ERROR",
-            message: `${findings.length} invalid internal link finding${findings.length === 1 ? "" : "s"}`,
-            evidence: findings.map((message): BrowserQAEvidence => ({ type: "element", locatorDescription: "a[href]", accessibleName: message })),
+            severity: findings.unsafe.length ? "ERROR" : "WARNING",
+            message: `${linkIssues.length} invalid internal link finding${linkIssues.length === 1 ? "" : "s"}`,
+            evidence: linkIssues.map((message): BrowserQAEvidence => ({ type: "element", locatorDescription: "a[href]", accessibleName: message })),
           }
         : {
             checkId: "internal-links",

@@ -66,14 +66,16 @@ export class BrowserQACheckRegistry {
 export const BROWSER_QA_CHECK_DEFINITIONS: readonly BrowserQACheckDefinition[] = [
   { checkId: "page-readiness", version: 1, category: "RUNTIME", defaultSeverity: "ERROR", scope: "PAGE", timeoutMs: 5_000 },
   { checkId: "runtime.page-error", version: 1, category: "RUNTIME", defaultSeverity: "ERROR", scope: "PAGE", timeoutMs: 1_000 },
-  { checkId: "runtime.console-error", version: 1, category: "CONSOLE", defaultSeverity: "ERROR", scope: "PAGE", timeoutMs: 1_000 },
+  { checkId: "runtime.console-error", version: 1, category: "CONSOLE", defaultSeverity: "WARNING", scope: "PAGE", timeoutMs: 1_000 },
   { checkId: "network.failed-request", version: 1, category: "NETWORK", defaultSeverity: "ERROR", scope: "PAGE", timeoutMs: 1_000 },
   { checkId: "route.load", version: 1, category: "ROUTING", defaultSeverity: "ERROR", scope: "ROUTE", timeoutMs: 5_000, applicability: ({ hasRoutes }) => hasRoutes },
-  { checkId: "internal-links", version: 1, category: "ROUTING", defaultSeverity: "ERROR", scope: "PAGE", timeoutMs: 3_000 },
-  { checkId: "broken-images", version: 1, category: "ASSET", defaultSeverity: "ERROR", scope: "VIEWPORT", timeoutMs: 3_000, applicability: ({ hasAssets }) => hasAssets },
-  { checkId: "responsive-overflow", version: 1, category: "RESPONSIVE", defaultSeverity: "ERROR", scope: "VIEWPORT", timeoutMs: 2_000 },
-  { checkId: "interaction-smoke", version: 1, category: "INTERACTION", defaultSeverity: "ERROR", scope: "INTERACTION", timeoutMs: 3_000 },
-  { checkId: "form-smoke", version: 1, category: "FORM", defaultSeverity: "ERROR", scope: "INTERACTION", timeoutMs: 3_000, applicability: ({ hasForms }) => hasForms },
+  // ERROR blocks the version; WARNING is reported on the version instead.
+  // Only "the site does not work" and safety boundaries block.
+  { checkId: "internal-links", version: 1, category: "ROUTING", defaultSeverity: "WARNING", scope: "PAGE", timeoutMs: 3_000 },
+  { checkId: "broken-images", version: 1, category: "ASSET", defaultSeverity: "WARNING", scope: "VIEWPORT", timeoutMs: 3_000, applicability: ({ hasAssets }) => hasAssets },
+  { checkId: "responsive-overflow", version: 1, category: "RESPONSIVE", defaultSeverity: "WARNING", scope: "VIEWPORT", timeoutMs: 2_000 },
+  { checkId: "interaction-smoke", version: 1, category: "INTERACTION", defaultSeverity: "WARNING", scope: "INTERACTION", timeoutMs: 3_000 },
+  { checkId: "form-smoke", version: 1, category: "FORM", defaultSeverity: "WARNING", scope: "INTERACTION", timeoutMs: 3_000, applicability: ({ hasForms }) => hasForms },
   { checkId: "accessibility-smoke", version: 1, category: "ACCESSIBILITY", defaultSeverity: "WARNING", scope: "PAGE", timeoutMs: 3_000 },
 ];
 

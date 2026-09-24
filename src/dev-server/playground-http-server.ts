@@ -5,6 +5,8 @@ import {
   loadPlaygroundConfig,
   type PlaygroundConfig,
 } from "./playground-service.js";
+import { attachSitesSocketServer } from "../sites/socket/sites-socket.js";
+import type { Server as SocketIoServer } from "socket.io";
 
 const readJson = async (req: IncomingMessage) => {
   const chunks: Buffer[] = [];
@@ -26,6 +28,17 @@ const readJson = async (req: IncomingMessage) => {
     throw Object.assign(new Error("Request body must be valid JSON"), { code: "INVALID_REQUEST" });
   }
 };
+const readBytes = async (req: IncomingMessage, maximum = 10 * 1024 * 1024) => {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const bytes = Buffer.from(chunk as Uint8Array);
+    size += bytes.length;
+    if (size > maximum) throw Object.assign(new Error("Image is too large"), { code: "IMAGE_TOO_LARGE" });
+    chunks.push(bytes);
+  }
+  return new Uint8Array(Buffer.concat(chunks));
+};
 const safeError = (error: unknown) => {
   const value = (error ?? {}) as { code?: unknown; message?: unknown };
   const allowed = new Set([
@@ -39,6 +52,11 @@ const safeError = (error: unknown) => {
     "DEPLOYMENT_BUILD_FAILED",
     "SOURCE_NOT_FOUND",
     "SOURCE_FILE_NOT_FOUND",
+    "UNSUPPORTED_IMAGE_TYPE",
+    "IMAGE_TOO_LARGE",
+    "IMAGE_INGESTION_FAILED",
+    "USER_ASSET_NOT_FOUND",
+    "USER_ASSET_NOT_REFERENCED",
   ]);
   const code =
     typeof value.code === "string" && allowed.has(value.code) ? value.code : "DEV_REQUEST_FAILED";
@@ -56,6 +74,7 @@ export class PlaygroundHttpServer {
   readonly service: PlaygroundService;
   readonly config: PlaygroundConfig;
   #server: Server | undefined;
+  #socketServer: SocketIoServer | undefined;
   constructor(config = loadPlaygroundConfig(), service?: PlaygroundService) {
     if (!["127.0.0.1", "localhost", "::1"].includes(config.host))
       throw new Error("The unauthenticated playground must bind to a loopback address");
@@ -65,11 +84,19 @@ export class PlaygroundHttpServer {
   async start() {
     await this.service.start();
     this.#server = createServer((req, res) => void this.#handle(req, res));
+    this.#socketServer = attachSitesSocketServer(this.#server, this.service, {
+      allowedOrigins: this.config.webOrigins,
+    });
     try {
       await new Promise<void>((resolve, reject) =>
         this.#server!.once("error", reject).listen(this.config.port, this.config.host, resolve),
       );
     } catch (error) {
+      if (this.#socketServer)
+        await new Promise<void>((resolve) => {
+          void this.#socketServer!.close(() => resolve());
+        });
+      this.#socketServer = undefined;
       this.#server = undefined;
       await this.service.close();
       throw error;
@@ -79,8 +106,14 @@ export class PlaygroundHttpServer {
   }
   async close() {
     const server = this.#server;
+    const socketServer = this.#socketServer;
     this.#server = undefined;
-    if (server)
+    this.#socketServer = undefined;
+    if (socketServer)
+      await new Promise<void>((resolve) => {
+        void socketServer.close(() => resolve());
+      });
+    else if (server)
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
         server.closeAllConnections();
@@ -114,11 +147,25 @@ export class PlaygroundHttpServer {
           agentProvider: this.service.agentProviderId,
           agentModel: this.service.agentModel,
           executionProvider: "local",
+          database: this.service.databaseStatus(),
         });
+      if (method === "POST" && path === "/api/dev/persistence/sites") {
+        const body = await readJson(req);
+        if (typeof body.name !== "string")
+          throw Object.assign(new Error("name is required"), { code: "INVALID_REQUEST" });
+        return this.#json(res, 201, await this.service.createPersistenceTestSite(body.name));
+      }
+      if (method === "POST" && path === "/api/dev/assets") {
+        const originalName = url.searchParams.get("name") ?? req.headers["x-sites-file-name"];
+        const mimeType = url.searchParams.get("mime") ?? req.headers["content-type"];
+        if (typeof originalName !== "string" || typeof mimeType !== "string")
+          throw Object.assign(new Error("Image filename and type are required"), { code: "INVALID_REQUEST" });
+        return this.#json(res, 201, await this.service.ingestImage({ originalName, mimeType, bytes: await readBytes(req) }));
+      }
       if (method === "POST" && path === "/api/dev/sites") {
         const body = await readJson(req),
           prompt = this.#prompt(body.prompt);
-        const job = this.service.generate(prompt);
+        const job = this.service.generate(prompt, this.#attachmentIds(body.attachments), this.#attachmentIds(body.referenceAttachments) ?? []);
         return this.#json(res, 202, { jobId: job.id });
       }
       if (method === "GET" && path === "/api/dev/sites")
@@ -138,18 +185,28 @@ export class PlaygroundHttpServer {
             match[1]!,
             this.#prompt(body.prompt),
             typeof body.baseVersionId === "string" ? body.baseVersionId : undefined,
+            this.#attachmentIds(body.attachments),
+            this.#attachmentIds(body.referenceAttachments) ?? [],
           );
         return this.#json(res, 202, { jobId: job.id, projectId: match[1] });
       }
       match = /^\/api\/dev\/sites\/([^/]+)\/versions\/([^/]+)\/preview$/.exec(path);
       if (method === "POST" && match)
-        return this.#json(res, 201, await this.service.startPreview(match[1]!, match[2]!));
+        return this.#json(
+          res,
+          201,
+          await this.service.startPreview(decodeRouteParam(match[1]!), decodeRouteParam(match[2]!)),
+        );
       match = /^\/api\/dev\/sites\/([^/]+)\/versions\/([^/]+)\/files$/.exec(path);
       if (method === "GET" && match)
         return this.#json(
           res,
           200,
-          await this.service.sourceFiles(match[1]!, match[2]!, url.searchParams.get("path") ?? undefined),
+          await this.service.sourceFiles(
+            decodeRouteParam(match[1]!),
+            decodeRouteParam(match[2]!),
+            url.searchParams.get("path") ?? undefined,
+          ),
         );
       match = /^\/api\/dev\/previews\/([^/]+)$/.exec(path);
       if (method === "GET" && match)
@@ -158,7 +215,11 @@ export class PlaygroundHttpServer {
         return this.#json(res, 200, { stopped: await this.service.stopPreview(match[1]!) });
       match = /^\/api\/dev\/sites\/([^/]+)\/versions\/([^/]+)\/publish$/.exec(path);
       if (method === "POST" && match)
-        return this.#json(res, 201, await this.service.publish(match[1]!, match[2]!));
+        return this.#json(
+          res,
+          201,
+          await this.service.publish(decodeRouteParam(match[1]!), decodeRouteParam(match[2]!)),
+        );
       match = /^\/api\/dev\/sites\/([^/]+)\/rollback$/.exec(path);
       if (method === "POST" && match) {
         const body = await readJson(req);
@@ -176,6 +237,12 @@ export class PlaygroundHttpServer {
       if (method === "GET" && match)
         return this.#json(res, 200, { versions: await this.service.versions(match[1]!) });
       match = /^\/api\/dev\/sites\/([^/]+)$/.exec(path);
+      if (method === "PATCH" && match) {
+        const body = await readJson(req);
+        if (typeof body.name !== "string")
+          throw Object.assign(new Error("name is required"), { code: "INVALID_REQUEST" });
+        return this.#json(res, 200, await this.service.renameSite(match[1]!, body.name));
+      }
       if (method === "DELETE" && match)
         return this.#json(res, 200, await this.service.deleteSite(match[1]!));
       if (method === "GET" && match)
@@ -213,6 +280,14 @@ export class PlaygroundHttpServer {
       });
     return value.trim();
   }
+  #attachmentIds(value: unknown): readonly string[] | undefined {
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !/^user-[a-f0-9-]{36}$/.test(id)))
+      throw Object.assign(new Error("attachments must be managed image IDs"), { code: "INVALID_REQUEST" });
+    if (new Set(value).size !== value.length)
+      throw Object.assign(new Error("attachments must not contain duplicates"), { code: "INVALID_REQUEST" });
+    return value;
+  }
   #headers(req: IncomingMessage, res: ServerResponse) {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cache-Control", "no-store");
@@ -220,8 +295,8 @@ export class PlaygroundHttpServer {
     if (origin && this.config.webOrigins.includes(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
-      res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "content-type");
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "content-type, x-sites-file-name");
     }
   }
   #json(res: ServerResponse, status: number, value: unknown) {
@@ -256,5 +331,13 @@ export class PlaygroundHttpServer {
   #writeSse(res: ServerResponse, event: { type: string; intelligence?: unknown }) {
     const name = event.type === "INTELLIGENCE_TASK_UPDATED" ? "intelligence" : "progress";
     res.write(`event: ${name}\ndata: ${JSON.stringify(event)}\n\n`);
+  }
+}
+
+function decodeRouteParam(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw Object.assign(new Error("Invalid URL path parameter"), { code: "INVALID_REQUEST" });
   }
 }

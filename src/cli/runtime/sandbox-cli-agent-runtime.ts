@@ -21,7 +21,7 @@ export class SandboxCliAgentRuntime {
     if (signal?.aborted)
       throw new ApplicationError("JOB_CANCELLED", "Sandbox CLI task was cancelled");
     const serialized = JSON.stringify(task);
-    if (/(API_KEY|DATABASE_URL|SQLITE|HOSTING_SECRET)/i.test(serialized))
+    if (/(API_KEY|DATABASE_URL|HOSTING_SECRET)/i.test(serialized))
       throw new ApplicationError(
         "VALIDATION_FAILED",
         "Sandbox CLI task contains forbidden backend credential fields",

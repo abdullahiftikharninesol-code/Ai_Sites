@@ -112,12 +112,11 @@ for (const scenario of scenarios) {
         detail: actionFeature ? "Named action requirement represented" : "No action provisioned",
       });
       const product = createLocalPersistentSitesProduct({
-        databasePath: join(scenarioRoot, "sites.sqlite"),
-        runtimeDatabasePath: join(scenarioRoot, "runtime.sqlite"),
         artifactRoot: retainedArtifactRoot,
         executionRoot: join(scenarioRoot, "execution"),
       });
       try {
+        await product.connectPersistence();
         const generated = await product.orchestrator.generateWebsite({
           userId: "acceptance-user" as UserId,
           projectName: scenario.name,

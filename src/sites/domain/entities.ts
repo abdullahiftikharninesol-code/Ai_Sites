@@ -8,6 +8,10 @@ export interface SiteProject {
   readonly id: SiteId;
   readonly ownerId: UserId;
   readonly name: string;
+  readonly originalPrompt?: string;
+  readonly versionNumber?: number;
+  readonly lastOperation?: "GENERATE" | "EDIT";
+  readonly lastEditPrompt?: string;
   readonly slug: string;
   readonly status: SiteProjectStatus;
   readonly latestVersionId?: VersionId;
@@ -54,28 +58,33 @@ export interface SiteVersion {
   readonly createdAt: Date;
 }
 
-export const SITE_JOB_TYPES = [
-  "GENERATE_SITE",
-  "EDIT_SITE",
-  "BUILD_SITE",
-  "VISUAL_QA",
-  "SAVE_VERSION",
-  "DEPLOY_SITE",
-] as const;
-export type SiteJobType = (typeof SITE_JOB_TYPES)[number];
+export type SiteJobOperation = "GENERATE" | "EDIT";
 export type SiteJobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
 
 export interface SiteJob {
   readonly id: JobId;
   readonly siteId: SiteId;
   readonly userId: UserId;
-  readonly type: SiteJobType;
+  readonly operation: SiteJobOperation;
   readonly status: SiteJobStatus;
-  readonly progress: number;
-  readonly error?: { readonly code: string; readonly message: string };
+  readonly stage: string;
+  readonly provider: string;
+  readonly model?: string;
+  readonly inputTokens?: number;
+  readonly cachedInputTokens?: number;
+  readonly outputTokens?: number;
+  readonly reasoningTokens?: number;
+  readonly totalTokens?: number;
+  readonly logicalCalls: number;
+  readonly physicalRequests: number;
+  readonly retries: number;
+  readonly modelOutputReceived: boolean;
+  readonly websiteGenerated: boolean;
+  readonly errorCode?: string;
+  readonly errorMessage?: string;
+  readonly retryable?: boolean;
   readonly createdAt: Date;
-  readonly startedAt?: Date;
-  readonly completedAt?: Date;
+  readonly updatedAt: Date;
 }
 
 export interface SiteDeployment {

@@ -11,6 +11,15 @@ export interface SiteProjectRepository {
   save(project: SiteProject): Promise<void>;
   listByOwner(ownerId: string, cursor?: string): Promise<Page<SiteProject>>;
 }
+export interface SitePublicationRepository {
+  setPublication(
+    siteId: SiteId,
+    publication?: {
+      readonly versionId: VersionId;
+      readonly deploymentId: DeploymentId;
+    },
+  ): Promise<void>;
+}
 export interface SiteVersionRepository {
   getById(id: VersionId): Promise<SiteVersion | undefined>;
   save(version: SiteVersion): Promise<void>;

@@ -15,6 +15,7 @@ export const ASSET_SOURCE_TYPES = [
 export type AssetSourceType = (typeof ASSET_SOURCE_TYPES)[number];
 
 export const ASSET_ROLES = [
+  "REFERENCE",
   "HERO",
   "CONTENT",
   "BACKGROUND",
@@ -28,6 +29,10 @@ export const ASSET_ROLES = [
   "DECORATIVE",
 ] as const;
 export type AssetRole = (typeof ASSET_ROLES)[number];
+
+/** A reference guides source generation and is never a website media element. */
+export const isVisualReferenceAsset = (asset: Pick<ResolvedAsset, "role" | "sourceType">): boolean =>
+  asset.role === "REFERENCE" && asset.sourceType === "USER_UPLOAD";
 
 export const ASSET_RESOLUTION_STATUSES = ["PENDING", "RESOLVED", "FALLBACK", "FAILED"] as const;
 export type AssetResolutionStatus = (typeof ASSET_RESOLUTION_STATUSES)[number];

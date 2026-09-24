@@ -61,6 +61,7 @@ export interface BrowserQACheckExecutor {
 
 export interface BrowserQARunnerPolicy {
   readonly browserLaunchTimeoutMs: number;
+  readonly browserLaunchRetries: number;
   readonly navigationTimeoutMs: number;
   readonly perPageTimeoutMs: number;
   readonly totalTimeoutMs: number;
@@ -71,7 +72,8 @@ export interface BrowserQARunnerPolicy {
 }
 
 export const DEFAULT_BROWSER_QA_RUNNER_POLICY: BrowserQARunnerPolicy = Object.freeze({
-  browserLaunchTimeoutMs: 15_000,
+  browserLaunchTimeoutMs: 30_000,
+  browserLaunchRetries: 1,
   navigationTimeoutMs: 15_000,
   perPageTimeoutMs: 30_000,
   totalTimeoutMs: 120_000,
@@ -94,16 +96,19 @@ export interface BrowserQARunRequest {
 export interface BrowserQARunnerOptions {
   readonly artifacts?: ArtifactStore;
   readonly now?: () => Date;
+  readonly launchBrowser?: (options: { readonly headless: boolean; readonly timeout: number }) => Promise<Browser>;
 }
 
 export class BrowserQARunner {
   readonly #artifacts: ArtifactStore | undefined;
   readonly #now: () => Date;
+  readonly #launchBrowser: NonNullable<BrowserQARunnerOptions["launchBrowser"]>;
   #activeBrowsers = 0;
 
   constructor(options: BrowserQARunnerOptions = {}) {
     this.#artifacts = options.artifacts;
     this.#now = options.now ?? (() => new Date());
+    this.#launchBrowser = options.launchBrowser ?? ((launchOptions) => chromium.launch(launchOptions));
   }
 
   get activeBrowserCount(): number {
@@ -123,7 +128,7 @@ export class BrowserQARunner {
     const checks: BrowserQACheckResult[] = [];
     const screenshotRefs: string[] = [];
     const screenshots: BrowserQAScreenshotDescriptor[] = [];
-    const browser = await chromium.launch({ headless: true, timeout: policy.browserLaunchTimeoutMs });
+    const browser = await this.#launchWithRetry(policy);
     this.#activeBrowsers++;
     try {
       for (const viewport of viewports) {
@@ -165,6 +170,17 @@ export class BrowserQARunner {
       completedAt: completed.toISOString(),
       durationMs: completed.getTime() - started.getTime(),
     });
+  }
+
+  async #launchWithRetry(policy: BrowserQARunnerPolicy): Promise<Browser> {
+    const retries = Math.max(0, Math.floor(policy.browserLaunchRetries));
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.#launchBrowser({ headless: true, timeout: policy.browserLaunchTimeoutMs });
+      } catch (error) {
+        if (attempt >= retries || !isPlaywrightTimeout(error)) throw error;
+      }
+    }
   }
 
   async #runPage(input: {
@@ -353,6 +369,10 @@ function validatePreviewUrl(value: string): URL {
   }
   if (!/^https?:$/.test(url.protocol)) throw new BrowserQAPolicyError("Browser QA preview target must use HTTP(S)");
   return url;
+}
+
+function isPlaywrightTimeout(error: unknown): boolean {
+  return error instanceof Error && error.name === "TimeoutError";
 }
 
 function validateOrigin(value: string): string {

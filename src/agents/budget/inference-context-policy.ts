@@ -241,7 +241,7 @@ export function getInferenceContextPolicy(
         outputPolicy: {
           defaultMaxOutputTokens: options?.overrideMaxOutput ?? 4_096,
           minOutputTokens: 1_024,
-          maxOutputTokens: 8_192,
+          maxOutputTokens: 16_384,
           safetyMarginTokens: 256,
           complexityAware: false,
         },

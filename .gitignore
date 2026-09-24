@@ -1,5 +1,8 @@
 node_modules/
 dist/
+web/.next/
+web/out/
+*.tsbuildinfo
 coverage/
 .env
 .env.*

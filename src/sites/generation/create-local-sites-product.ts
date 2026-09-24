@@ -34,8 +34,6 @@ import type { SiteRuntimeProvider } from "../../site-runtime/site-runtime-provid
 import { AgentPlanningPipeline } from "../../agents/intelligence/agent-intelligence.js";
 import { ArtifactMediaStore } from "../assets/media-store.js";
 import { AdapterBackedAssetResolver, PlaceholderAssetSourceAdapter } from "../assets/source-adapters.js";
-import { CarFallbackAssetSourceAdapter } from "../assets/source-adapters.js";
-import { readFileSync } from "node:fs";
 export interface LocalSitesProductOptions {
   readonly executionRoot: string;
   readonly artifactRoot: string;
@@ -100,10 +98,7 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
       mode: "AGENT_WITH_FALLBACK",
       strategy: "COMBINED",
     }),
-    assetResolver: new AdapterBackedAssetResolver(mediaStore, [
-      new CarFallbackAssetSourceAdapter(readFileSync(new URL("../assets/default-car-fallback.png", import.meta.url))),
-      new PlaceholderAssetSourceAdapter(),
-    ]),
+    assetResolver: new AdapterBackedAssetResolver(mediaStore, [new PlaceholderAssetSourceAdapter()]),
     assetMediaStore: mediaStore,
     ...(options.agentRegistry && options.orchestrationAgent
       ? {

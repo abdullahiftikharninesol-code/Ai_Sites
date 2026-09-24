@@ -25,6 +25,12 @@ export interface GeneratedImportValidatorOptions {
   readonly allowedAliases?: Readonly<Record<string, readonly string[]>>;
   readonly allowedPackageSubpaths?: Readonly<Record<string, readonly string[]>>;
   readonly allowNodeBuiltins?: boolean;
+  /**
+   * Approved optional packages the generated site may import. They are installed
+   * only when actually imported, so they are absent from the resolved manifest
+   * until then. Anything outside this set still fails exactly as before.
+   */
+  readonly approvedPackages?: Readonly<Record<string, string>>;
 }
 
 const sourceExtensions = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -176,7 +182,8 @@ export class GeneratedImportValidator {
     const packageRoot = packageRootOf(specifier);
     if (
       !Object.prototype.hasOwnProperty.call(this.manifest.dependencies, packageRoot) &&
-      !Object.prototype.hasOwnProperty.call(this.manifest.devDependencies, packageRoot)
+      !Object.prototype.hasOwnProperty.call(this.manifest.devDependencies, packageRoot) &&
+      !Object.prototype.hasOwnProperty.call(this.options.approvedPackages ?? {}, packageRoot)
     )
       return this.diagnostic(
         "UNKNOWN_PACKAGE_IMPORT",
@@ -265,6 +272,47 @@ export function resolveLocalImportPath(
     if (indexes.length === 1) return indexes[0];
   }
   return undefined;
+}
+
+/**
+ * Every bare package root imported by generated source. Shares the validator's
+ * traversal so detection and validation can never disagree about what an import is.
+ */
+export async function collectImportedPackageRoots(
+  execution: ExecutionProvider,
+  environmentId: string,
+): Promise<ReadonlySet<string>> {
+  const roots = new Set<string>();
+  const entries = (await execution.listFiles(environmentId)).filter((entry) => entry.type === "FILE");
+  for (const entry of entries) {
+    const path = entry.path.replaceAll("\\", "/");
+    if (!path.startsWith("src/") || !sourceExtensions.has(posix.extname(path))) continue;
+    const sourceFile = ts.createSourceFile(
+      path,
+      await execution.readFile(environmentId, entry.path),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const visit = (node: ts.Node): void => {
+      if (
+        (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+        node.moduleSpecifier &&
+        ts.isStringLiteral(node.moduleSpecifier)
+      )
+        roots.add(packageRootOf(node.moduleSpecifier.text));
+      if (
+        ts.isCallExpression(node) &&
+        (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+          (ts.isIdentifier(node.expression) && node.expression.text === "require"))
+      ) {
+        const argument = node.arguments[0];
+        if (argument && ts.isStringLiteral(argument)) roots.add(packageRootOf(argument.text));
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+  }
+  return roots;
 }
 
 export function packageRootOf(specifier: string): string {

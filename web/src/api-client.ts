@@ -1,4 +1,6 @@
-/// <reference types="vite/client" />
+import { sitesEnvironment } from "./lib/environment.ts";
+
+export { DEFAULT_SITES_DEV_API_URL } from "./lib/environment.ts";
 
 export interface SiteSummary {
   projectId: string;
@@ -128,8 +130,6 @@ export interface SourceFile {
 export interface SourceFileContent extends SourceFile {
   content: string;
 }
-const configuredApiUrl: unknown = import.meta.env.VITE_SITES_DEV_API_URL;
-export const DEFAULT_SITES_DEV_API_URL = "http://127.0.0.1:4310";
 export const formatProviderName = (value: string): string =>
   value.charAt(0).toUpperCase() + value.slice(1);
 export class PlaygroundApiConnectionError extends Error {
@@ -142,9 +142,7 @@ export class PlaygroundApiConnectionError extends Error {
 }
 export class PlaygroundApiClient {
   constructor(
-    readonly baseUrl = typeof configuredApiUrl === "string"
-      ? configuredApiUrl
-      : DEFAULT_SITES_DEV_API_URL,
+    readonly baseUrl = sitesEnvironment.apiUrl,
   ) {}
   async #request<T>(path: string, init?: RequestInit): Promise<T> {
     let response: Response;
@@ -184,21 +182,40 @@ export class PlaygroundApiClient {
   site(id: string) {
     return this.#request<SiteDetail>(`/api/dev/sites/${encodeURIComponent(id)}`);
   }
+  renameSite(id: string, name: string) {
+    return this.#request<{ projectId: string; name: string }>(
+      `/api/dev/sites/${encodeURIComponent(id)}`,
+      { method: "PATCH", body: JSON.stringify({ name }) },
+    );
+  }
   deleteSite(id: string) {
     return this.#request<{ deleted: boolean }>(`/api/dev/sites/${encodeURIComponent(id)}`, {
       method: "DELETE",
     });
   }
-  async generate(prompt: string) {
+  async uploadImage(file: File) {
+    const query = new URLSearchParams({ name: file.name, mime: file.type });
+    const response = await fetch(`${this.baseUrl}/api/dev/assets?${query}`, {
+      method: "POST",
+      // text/plain keeps this local raw-byte upload CORS-simple; the real
+      // image MIME is validated by the server from the query value.
+      headers: { "content-type": "text/plain" },
+      body: file,
+    });
+    const value = await response.json() as { id?: string; error?: { message?: string } };
+    if (!response.ok || !value.id) throw new Error(value.error?.message ?? "Unable to upload image");
+    return value as { id: string; originalName: string; mimeType: string; managedPath: string };
+  }
+  async generate(prompt: string, attachments: readonly string[] = [], referenceAttachments: readonly string[] = []) {
     return this.#request<{ jobId: string }>("/api/dev/sites", {
       method: "POST",
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, ...(attachments.length ? { attachments } : {}), ...(referenceAttachments.length ? { referenceAttachments } : {}) }),
     });
   }
-  async edit(siteId: string, prompt: string, baseVersionId?: string) {
+  async edit(siteId: string, prompt: string, baseVersionId?: string, attachments: readonly string[] = [], referenceAttachments: readonly string[] = []) {
     return this.#request<{ jobId: string }>(`/api/dev/sites/${encodeURIComponent(siteId)}/edit`, {
       method: "POST",
-      body: JSON.stringify({ prompt, ...(baseVersionId ? { baseVersionId } : {}) }),
+      body: JSON.stringify({ prompt, ...(baseVersionId ? { baseVersionId } : {}), ...(attachments.length ? { attachments } : {}), ...(referenceAttachments.length ? { referenceAttachments } : {}) }),
     });
   }
   job(id: string, signal?: AbortSignal) {
@@ -235,7 +252,10 @@ export class PlaygroundApiClient {
       previewUrl: string;
       environmentId: string;
       workspacePath: string;
-    }>(`/api/dev/sites/${siteId}/versions/${versionId}/preview`, { method: "POST" });
+    }>(
+      `/api/dev/sites/${encodeURIComponent(siteId)}/versions/${encodeURIComponent(versionId)}/preview`,
+      { method: "POST" },
+    );
   }
   previewInstance(id: string) {
     return this.#request<LocalInstanceStatus>(`/api/dev/previews/${encodeURIComponent(id)}`);
@@ -251,22 +271,24 @@ export class PlaygroundApiClient {
     );
   }
   stopPreview(id: string) {
-    return this.#request<{ stopped: boolean }>(`/api/dev/previews/${id}`, { method: "DELETE" });
+    return this.#request<{ stopped: boolean }>(`/api/dev/previews/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
   }
   publish(siteId: string, versionId: string) {
     return this.#request<{ deploymentId: string; hostedUrl: string }>(
-      `/api/dev/sites/${siteId}/versions/${versionId}/publish`,
+      `/api/dev/sites/${encodeURIComponent(siteId)}/versions/${encodeURIComponent(versionId)}/publish`,
       { method: "POST" },
     );
   }
   rollback(siteId: string, deploymentId: string) {
-    return this.#request<SiteDetail>(`/api/dev/sites/${siteId}/rollback`, {
+    return this.#request<SiteDetail>(`/api/dev/sites/${encodeURIComponent(siteId)}/rollback`, {
       method: "POST",
       body: JSON.stringify({ deploymentId }),
     });
   }
   unpublish(siteId: string) {
-    return this.#request<{ unpublished: boolean }>(`/api/dev/sites/${siteId}/unpublish`, {
+    return this.#request<{ unpublished: boolean }>(`/api/dev/sites/${encodeURIComponent(siteId)}/unpublish`, {
       method: "POST",
     });
   }

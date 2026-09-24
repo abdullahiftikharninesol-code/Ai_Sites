@@ -1,6 +1,6 @@
 export type AgentRole = "system" | "user" | "assistant" | "tool";
 /** Narrow, provider-neutral image input contract. Screenshots only; never arbitrary SVG/HTML. */
-export type AgentImageMimeType = "image/png";
+export type AgentImageMimeType = "image/png" | "image/jpeg" | "image/webp";
 export interface AgentImagePart {
   readonly mimeType: AgentImageMimeType;
   readonly data: Uint8Array;
@@ -127,6 +127,14 @@ export interface AgentRequest {
   readonly transportHook?: TransportHook;
   readonly reasoningPolicy?: ReasoningPolicy;
   readonly responseContract?: AgentResponseContract;
+  /** Routes requests that share a prefix to the same prompt cache. */
+  readonly promptCacheKey?: string;
+  /**
+   * Length in characters of the leading, request-stable portion of the first user
+   * message. Providers that support explicit cache breakpoints may split there;
+   * the rest ignore it and send the message unchanged.
+   */
+  readonly cachePrefixChars?: number;
 }
 export interface AgentResponse {
   readonly id: string;

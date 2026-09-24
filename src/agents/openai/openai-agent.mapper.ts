@@ -23,6 +23,7 @@ export interface OpenAIResponseRequest {
   readonly tools: readonly OpenAIFunctionTool[];
   readonly store: false;
   readonly parallel_tool_calls: true;
+  readonly prompt_cache_key?: string;
   readonly max_output_tokens?: number;
   readonly reasoning?: { readonly effort: string };
   readonly text?: {
@@ -59,6 +60,51 @@ export function mapToolDefinition(tool: AgentToolDefinition): OpenAIFunctionTool
     strict: true,
   };
 }
+/**
+ * Splits the first user message at the caller's stable/variable boundary and
+ * marks it with an explicit cache breakpoint, so the reusable prefix ends exactly
+ * where the prompt stops being stable instead of wherever the implicit
+ * breakpoint lands. Falls back to a plain message when there is nothing to split.
+ */
+function userInputItem(
+  message: AgentRequest["messages"][number],
+  request: AgentRequest,
+  position: number,
+): OpenAIInputItem {
+  if (message.imageParts?.length) {
+    return {
+      role: message.role,
+      content: [
+        ...message.imageParts.map((part) => ({
+          type: "input_image",
+          image_url: `data:${part.mimeType};base64,${Buffer.from(part.data).toString("base64")}`,
+        })),
+        ...(message.content ? [{ type: "input_text", text: message.content }] : []),
+      ],
+    };
+  }
+  const boundary = request.cachePrefixChars;
+  if (
+    position !== 0 ||
+    message.role !== "user" ||
+    boundary === undefined ||
+    boundary <= 0 ||
+    boundary >= message.content.length
+  )
+    return { role: message.role, content: message.content };
+  return {
+    role: message.role,
+    content: [
+      {
+        type: "input_text",
+        text: message.content.slice(0, boundary),
+        prompt_cache_breakpoint: { mode: "explicit" },
+      },
+      { type: "input_text", text: message.content.slice(boundary) },
+    ],
+  };
+}
+
 export function mapAgentRequest(
   request: AgentRequest,
   reasoningEffort?: string,
@@ -86,7 +132,7 @@ export function mapAgentRequest(
         });
       continue;
     }
-    if (message.role !== "system") input.push({ role: message.role, content: message.content });
+    if (message.role !== "system") input.push(userInputItem(message, request, input.length));
   }
   return {
     model: request.model,
@@ -95,6 +141,7 @@ export function mapAgentRequest(
     tools: (request.tools ?? []).map(mapToolDefinition),
     store: false,
     parallel_tool_calls: true,
+    ...(request.promptCacheKey ? { prompt_cache_key: request.promptCacheKey } : {}),
     ...(request.maxOutputTokens ? { max_output_tokens: request.maxOutputTokens } : {}),
     ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
     ...(request.responseContract?.type === "JSON_SCHEMA"

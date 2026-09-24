@@ -16,15 +16,35 @@ export interface BuildRepairPatchBundle {
   readonly patches: readonly { readonly path: string; readonly find: string; readonly replace: string }[];
 }
 
+/** "unique" must match exactly once; "all" replaces every exact occurrence. */
+export type SiteEditPatchMode = "unique" | "all";
+
+export interface SiteEditPatch {
+  readonly path: string;
+  readonly find: string;
+  readonly replace: string;
+  readonly mode: SiteEditPatchMode;
+}
+
 export interface SiteEditPatchBundle {
-  readonly patches: readonly { readonly path: string; readonly find: string; readonly replace: string }[];
+  readonly patches: readonly SiteEditPatch[];
 }
 
 export const SITE_EDIT_PATCH_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unknown>> = Object.freeze({
   type: "object", additionalProperties: false, required: ["patches"],
-  properties: { patches: { type: "array", minItems: 1, maxItems: 4, items: {
-    type: "object", additionalProperties: false, required: ["path", "find", "replace"],
-    properties: { path: { type: "string" }, find: { type: "string", minLength: 1 }, replace: { type: "string" } },
+  properties: { patches: { type: "array", minItems: 1, maxItems: 8, items: {
+    type: "object", additionalProperties: false, required: ["path", "find", "replace", "mode"],
+    properties: {
+      path: { type: "string" },
+      find: { type: "string", minLength: 1 },
+      replace: { type: "string" },
+      mode: {
+        type: "string",
+        enum: ["unique", "all"],
+        description:
+          "unique: 'find' must occur exactly once, so include surrounding source context. all: replace every exact occurrence, for deliberate repeated renames.",
+      },
+    },
   } } },
 });
 
@@ -32,18 +52,22 @@ export function validateSiteEditPatchBundle(value: unknown): SiteEditPatchBundle
   if (!value || typeof value !== "object" || !Array.isArray((value as { patches?: unknown }).patches))
     throw new ApplicationError("VALIDATION_FAILED", "SiteEditPatchBundle must contain a patches array");
   const patches = (value as { patches: readonly unknown[] }).patches;
-  if (patches.length === 0 || patches.length > 4)
+  if (patches.length === 0 || patches.length > 8)
     throw new ApplicationError("VALIDATION_FAILED", "Site edit patch count is outside the allowed range");
-  const paths = new Set<string>();
+  // Several patches may target one file: "change the headline and the CTA" is a
+  // single ordinary edit, and each patch is applied against freshly read content.
   return Object.freeze({ patches: Object.freeze(patches.map((item) => {
     if (!item || typeof item !== "object") throw new ApplicationError("VALIDATION_FAILED", "Invalid site edit patch");
-    const patch = item as { path?: unknown; find?: unknown; replace?: unknown };
+    const patch = item as { path?: unknown; find?: unknown; replace?: unknown; mode?: unknown };
     if (typeof patch.path !== "string" || typeof patch.find !== "string" || !patch.find ||
       typeof patch.replace !== "string" || !safePath(patch.path) || !editableSourcePath(patch.path) ||
-      patch.path.startsWith("src/sites-ui/") || paths.has(patch.path))
-      throw new ApplicationError("MANAGED_FILE_MODIFICATION", `Site edit patch contains a disallowed or duplicate path: ${String(patch.path)}`);
-    paths.add(patch.path);
-    return Object.freeze({ path: patch.path, find: patch.find, replace: patch.replace });
+      isManagedSitePath(patch.path))
+      throw new ApplicationError("MANAGED_FILE_MODIFICATION", `Site edit patch contains a disallowed path: ${String(patch.path)}`);
+    if (patch.mode !== undefined && patch.mode !== "unique" && patch.mode !== "all")
+      throw new ApplicationError("VALIDATION_FAILED", `Site edit patch mode must be "unique" or "all": ${String(patch.mode)}`);
+    // Providers without strict schema support may omit the mode; unique is the safe default.
+    const mode: SiteEditPatchMode = patch.mode === "all" ? "all" : "unique";
+    return Object.freeze({ path: patch.path, find: patch.find, replace: patch.replace, mode });
   })) });
 }
 
@@ -55,11 +79,27 @@ export async function applySiteEditPatchBundle(
   const changed: string[] = [];
   for (const patch of bundle.patches) {
     const source = await execution.readFile(environmentId, patch.path);
+    const matches = countOccurrences(source, patch.find);
+    if (matches === 0)
+      throw new ApplicationError(
+        "VALIDATION_FAILED",
+        `Edit find text was not found in ${patch.path}. It must match the file byte-for-byte.`,
+        { metadata: { path: patch.path, mode: patch.mode, matches: 0 } },
+      );
+    // Ambiguity stays an error rather than a guess: picking an occurrence would
+    // silently edit the wrong place.
+    if (patch.mode === "unique" && matches > 1)
+      throw new ApplicationError(
+        "VALIDATION_FAILED",
+        `Edit find text matched ${matches} times in ${patch.path}; a unique patch needs more surrounding source context as an anchor, or mode "all" when every occurrence is meant.`,
+        { metadata: { path: patch.path, mode: patch.mode, matches } },
+      );
     const first = source.indexOf(patch.find);
-    if (first < 0) throw new ApplicationError("VALIDATION_FAILED", `Edit find text was not found in ${patch.path}`);
-    const second = source.indexOf(patch.find, first + patch.find.length);
-    if (second >= 0) throw new ApplicationError("VALIDATION_FAILED", `Edit find text is ambiguous in ${patch.path}`);
-    await execution.writeFile(environmentId, patch.path, source.slice(0, first) + patch.replace + source.slice(first + patch.find.length));
+    const next =
+      patch.mode === "all"
+        ? source.split(patch.find).join(patch.replace)
+        : source.slice(0, first) + patch.replace + source.slice(first + patch.find.length);
+    await execution.writeFile(environmentId, patch.path, next);
     changed.push(patch.path);
   }
   return Object.freeze(changed);
@@ -81,7 +121,7 @@ export function validateBuildRepairPatchBundle(value: unknown): BuildRepairPatch
   return Object.freeze({ patches: Object.freeze(patches.map((item) => {
     if (!item || typeof item !== "object") throw new ApplicationError("VALIDATION_FAILED", "Invalid build repair patch");
     const patch = item as { path?: unknown; find?: unknown; replace?: unknown };
-    if (typeof patch.path !== "string" || typeof patch.find !== "string" || !patch.find || typeof patch.replace !== "string" || !safePath(patch.path) || !editableSourcePath(patch.path) || patch.path.startsWith("src/sites-ui/"))
+    if (typeof patch.path !== "string" || typeof patch.find !== "string" || !patch.find || typeof patch.replace !== "string" || !safePath(patch.path) || !editableSourcePath(patch.path) || isManagedSitePath(patch.path))
       throw new ApplicationError("MANAGED_FILE_MODIFICATION", `Build repair patch contains a disallowed path: ${String(patch.path)}`);
     return Object.freeze({ path: patch.path, find: patch.find, replace: patch.replace });
   })) });
@@ -123,6 +163,16 @@ export const SITE_CODER_FILE_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unknown
   },
 });
 
+function countOccurrences(haystack: string, needle: string): number {
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index >= 0) {
+    count += 1;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
 function safePath(path: string): boolean {
   return path.length > 0 && !path.startsWith("/") && !path.startsWith("\\") &&
     !/^[A-Za-z]:/.test(path) && !path.split("/").includes("..") && !path.includes("\\");
@@ -137,6 +187,21 @@ export function normalizeSiteCoderPath(input: string): string {
   if (!segments.length || segments.some((segment) => !segment || segment === "." || segment === ".."))
     throw new ApplicationError("MANAGED_FILE_MODIFICATION", `Site coder bundle contains a disallowed path: ${input}`);
   return segments.join("/");
+}
+
+const MANAGED_SITE_FILES: readonly string[] = [
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+  "vite.config.ts",
+  "index.html",
+  "src/main.tsx",
+  "src/vite-env.d.ts",
+];
+
+/** Sites owns these files; generation, edit, and repair all honour the same boundary. */
+export function isManagedSitePath(path: string): boolean {
+  return path.startsWith("src/sites-ui/") || MANAGED_SITE_FILES.includes(path);
 }
 
 function editableSourcePath(path: string): boolean {
@@ -160,15 +225,7 @@ export function validateSiteCoderFileBundle(value: unknown, requirements?: Gener
     const path = normalizeSiteCoderPath(rawPath);
     if (!safePath(path) || !editableSourcePath(path))
       throw new ApplicationError("MANAGED_FILE_MODIFICATION", `Site coder bundle contains a disallowed path: ${rawPath}`);
-    if (path.startsWith("src/sites-ui/") || [
-      "package.json",
-      "package-lock.json",
-      "tsconfig.json",
-      "vite.config.ts",
-      "index.html",
-      "src/main.tsx",
-      "src/vite-env.d.ts",
-    ].includes(path))
+    if (isManagedSitePath(path))
       throw new ApplicationError("MANAGED_FILE_MODIFICATION", `Site coder bundle cannot modify managed file: ${path}`);
     if (paths.has(path)) throw new ApplicationError("VALIDATION_FAILED", `Duplicate SiteCoderFileBundle path: ${path}`);
     paths.add(path);

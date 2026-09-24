@@ -250,6 +250,9 @@ export class LocalExecutionProvider implements ExecutionProvider {
       "npm ci",
       "npm ci --prefer-offline --no-audit --no-fund",
       "npm install",
+      // Installing an approved optional package after generation, with the same
+      // flags as the starter install.
+      "npm install --prefer-offline --no-audit --no-fund",
       "npm run build",
       "npm test",
       "npx tsc --noEmit",
