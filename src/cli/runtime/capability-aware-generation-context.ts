@@ -70,6 +70,7 @@ export function buildCapabilityAwareGenerationContext(
     ...(references.length ? [
       `Design references: ${references.map((asset) => asset.provenance.userUploadName ?? asset.assetId).join(", ")}. Their image content is attached separately for visual analysis, not as website media paths.`,
       "Match the entire reference page: its dominant background, page frame, navigation, hero arrangement, content sequence, visual density, cards, controls, typography, and accent colours. Build nested interface previews as real HTML/CSS/React. Do not display or animate the reference image itself. Follow the user's requested content while preserving the reference composition.",
+      "Reference interaction contract: reproduce the visible navigation and build each destination as a usable page or view, not just the screenshot's first screen. Every visible button, link, menu, tab, search field, and form must have a meaningful action. Use React state and local browser storage for demo data when no backend capability exists; do not claim a remote integration or persistence exists. Do not use dead links, alert-only handlers, empty callbacks, or static page labels as substitutes for behavior.",
     ] : []),
     ...(userAssets.length ? [
       `USER PROVIDED ASSETS (required use): ${userAssets.map((asset) => `${asset.logicalAssetId} path: ${asset.publicPath} original: ${asset.provenance.userUploadName ?? "image"}`).join("; ")}`,

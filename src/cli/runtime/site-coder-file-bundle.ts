@@ -2,6 +2,7 @@ import { ApplicationError } from "../../app/errors/application-error.js";
 import type { ExecutionProvider } from "../../execution/execution-provider.js";
 import type { GenerationCompletionManifest, GenerationCompletionRequirements } from "../../agents/validation/generation-completion.js";
 import { GenerationCompletionValidator } from "../../agents/validation/generation-completion.js";
+import { validateSiteNameCandidate } from "../../sites/generation/site-name.js";
 
 export interface SiteCoderFileBundleFile {
   readonly path: string;
@@ -9,6 +10,7 @@ export interface SiteCoderFileBundleFile {
 }
 
 export interface SiteCoderFileBundle {
+  readonly siteName?: string | undefined;
   readonly files: readonly SiteCoderFileBundleFile[];
 }
 
@@ -144,8 +146,9 @@ export async function applyBuildRepairPatchBundle(
 export const SITE_CODER_FILE_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unknown>> = Object.freeze({
   type: "object",
   additionalProperties: false,
-  required: ["files"],
+  required: ["siteName", "files"],
   properties: {
+    siteName: { type: "string", minLength: 1, maxLength: 60 },
     files: {
       type: "array",
       minItems: 1,
@@ -160,6 +163,16 @@ export const SITE_CODER_FILE_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unknown
         },
       },
     },
+  },
+});
+
+/** Broad edits reuse the file-bundle shape but must not rename an existing site. */
+export const SITE_CODER_EDIT_FILE_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unknown>> = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  required: ["files"],
+  properties: {
+    files: (SITE_CODER_FILE_BUNDLE_JSON_SCHEMA.properties as Record<string, unknown>).files,
   },
 });
 
@@ -238,7 +251,8 @@ export function validateSiteCoderFileBundle(value: unknown, requirements?: Gener
       if (!paths.has(required)) throw new ApplicationError("GENERATION_INCOMPLETE", `Site coder bundle is missing required file: ${required}`);
     }
   }
-  return Object.freeze({ files: Object.freeze(normalized) });
+  const siteName = validateSiteNameCandidate((value as { siteName?: unknown }).siteName);
+  return Object.freeze({ ...(siteName ? { siteName } : {}), files: Object.freeze(normalized) });
 }
 
 export async function materializeSiteCoderFileBundle(

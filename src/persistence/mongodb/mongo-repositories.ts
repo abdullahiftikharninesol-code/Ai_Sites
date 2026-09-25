@@ -248,7 +248,10 @@ export class MongoSiteVersionCommitter implements SiteVersionCommitter {
       };
       const update: Record<string, unknown> = { $set: set };
       if (operation === "EDIT") set.lastEditPrompt = project.lastEditPrompt ?? "";
-      else update.$unset = { lastEditPrompt: 1 };
+      else {
+        set.name = project.name;
+        update.$unset = { lastEditPrompt: 1 };
+      }
       const updated = await this.models.projects
         .findOneAndUpdate({ _id: project.id, versionNumber: current.versionNumber }, update, {
           new: true,

@@ -8,6 +8,14 @@ import {
 import { attachSitesSocketServer } from "../sites/socket/sites-socket.js";
 import type { Server as SocketIoServer } from "socket.io";
 
+export function normalizePlaygroundPrompt(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length < 3 || value.length > 20_000)
+    throw Object.assign(new Error("prompt must contain 3 to 20000 characters"), {
+      code: "INVALID_REQUEST",
+    });
+  return value.trim();
+}
+
 const readJson = async (req: IncomingMessage) => {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -274,11 +282,7 @@ export class PlaygroundHttpServer {
     }
   }
   #prompt(value: unknown) {
-    if (typeof value !== "string" || value.trim().length < 3 || value.length > 20_000)
-      throw Object.assign(new Error("prompt must contain 3 to 20000 characters"), {
-        code: "INVALID_REQUEST",
-      });
-    return value.trim();
+    return normalizePlaygroundPrompt(value);
   }
   #attachmentIds(value: unknown): readonly string[] | undefined {
     if (value === undefined) return undefined;

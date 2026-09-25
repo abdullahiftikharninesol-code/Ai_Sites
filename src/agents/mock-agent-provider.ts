@@ -35,6 +35,7 @@ export class MockAgentProvider implements AgentProvider {
       text: true,
       tools: true,
       vision: true,
+      visionInputMimeTypes: ["image/png", "image/jpeg", "image/webp"] as const,
       toolCalling: true,
       streaming: false,
       cachedInput: true,
@@ -79,7 +80,7 @@ export class MockAgentProvider implements AgentProvider {
       const response: AgentResponse = {
         id: `mock-response-${this.#responseId++}`,
         model: request.model,
-        message: { role: "assistant", content: JSON.stringify({ files: [
+        message: { role: "assistant", content: JSON.stringify({ siteName: "Mock Site", files: [
           { path: "src/App.tsx", content: `${this.#options.generateBrokenSource ? 'const brokenValue: string = 123;\n' : ""}export function App() { return <div className="app">${pageElements}</div>; }\n` },
           {
             path: "src/styles.css",

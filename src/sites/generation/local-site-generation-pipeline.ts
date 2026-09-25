@@ -73,6 +73,7 @@ import { browserQARuntimeChecks } from "../../browser-qa/browser-qa-runtime-chec
 import { persistBrowserQAReport } from "../../browser-qa/browser-qa-persistence.js";
 import type { VisualQAReport } from "../../visual-qa/visual-qa-types.js";
 import type { VisualRepairAttempt, VisualReview } from "../../visual-review/visual-review-domain.js";
+import { deriveSiteName, resolveGeneratedSiteName } from "./site-name.js";
 export interface GenerateWebsiteRequest {
   readonly userId: UserId;
   readonly prompt: string;
@@ -171,13 +172,16 @@ export class LocalSiteGenerationPipeline {
   }
   async generate(request: GenerateWebsiteRequest): Promise<SiteGenerationResult> {
     const requestProfile = analyzeRequestProfile(request.prompt);
+    const hasVisualReference = request.assetManifest?.assets.some(isVisualReferenceAsset) ?? false;
     const siteId = randomUUID() as SiteId;
     const jobId = randomUUID() as JobId;
     const runContext = createInferenceRunContext({
       runId: jobId,
       limits: {
-        maxLogicalRequests: requestProfile.complexity === "COMPLEX" ? 3 : 2,
-        maxPhysicalRequests: requestProfile.complexity === "COMPLEX" ? 5 : 4,
+        // A reference generation reserves one corrective call for interaction
+        // validation, in addition to optional planning and the primary bundle.
+        maxLogicalRequests: (requestProfile.complexity === "COMPLEX" ? 3 : 2) + (hasVisualReference ? 1 : 0),
+        maxPhysicalRequests: (requestProfile.complexity === "COMPLEX" ? 5 : 4) + (hasVisualReference ? 1 : 0),
       },
       ...(request.signal ? { signal: request.signal } : {}),
     });
@@ -218,7 +222,7 @@ export class LocalSiteGenerationPipeline {
     const project: SiteProject = {
       id: siteId,
       ownerId: request.userId,
-      name: request.projectName?.trim() || "Generated Site",
+      name: deriveSiteName(request.prompt, request.projectName),
       originalPrompt: request.prompt,
       slug: `site-${siteId.slice(0, 8)}`,
       status: "DRAFT",
@@ -266,7 +270,10 @@ export class LocalSiteGenerationPipeline {
         ? await this.deps.runtimeProvider.provisionRuntime(siteId, siteSpec.runtime)
         : undefined;
     const environment = await this.deps.execution.createEnvironment({});
-    let codeGenerationCompleted = false;
+    // CODE_GENERATION is reported RUNNING before the provider call, so every
+    // exit before its PASS report must replace it with a terminal status.
+    let codeGenerationSession: CliAgentSessionReport | undefined;
+    let codeGenerationReported = false;
     let retainEnvironment = false;
     this.#emit(job, "CREATING_ENVIRONMENT", 30, "Created disposable local workspace");
     try {
@@ -298,7 +305,7 @@ export class LocalSiteGenerationPipeline {
             maxAgentTurns: 12,
             maxToolCalls: 40,
             maxBuildRepairs: 1,
-            maxLogicalRequests: requestProfile.complexity === "COMPLEX" ? 3 : 2,
+            maxLogicalRequests: (requestProfile.complexity === "COMPLEX" ? 3 : 2) + (hasVisualReference ? 1 : 0),
             maxContextFiles: 24,
             maxContextBytes: 64_000,
             maxLogBytes: 12_000,
@@ -309,7 +316,7 @@ export class LocalSiteGenerationPipeline {
         request.signal,
         runContext,
       );
-      codeGenerationCompleted = true;
+      codeGenerationSession = session;
       await validateRequiredUserAssetReferences(this.deps.execution, environment.id, assetManifest);
       let intelligenceTelemetry = [
         ...(sitePlanResult ? sitePlanResult.telemetry : []),
@@ -317,6 +324,7 @@ export class LocalSiteGenerationPipeline {
         ...(session.buildRepairInvoked ? [this.#sessionTelemetry("BUILD_REPAIR", session, "PASS")] : []),
       ];
       request.onIntelligence?.(intelligenceTelemetry);
+      codeGenerationReported = true;
       await this.#projectValidator.validate(this.deps.execution, environment.id);
       let previewResult = this.deps.execution.getLatestPreview(environment.id);
       if (!previewResult?.url)
@@ -372,6 +380,14 @@ export class LocalSiteGenerationPipeline {
         kind: "PRODUCTION_BUILD",
         contentType: "application/json",
       });
+      const resolvedName = resolveGeneratedSiteName({
+        prompt: request.prompt,
+        requestedProjectName: request.projectName,
+        structuredSiteName: session.generatedSiteName,
+        documentTitle: session.generatedDocumentTitle,
+      });
+      const resolvedProject: SiteProject = { ...project, name: resolvedName };
+      siteSpec = { ...siteSpec, project: { ...siteSpec.project, name: resolvedName } };
       const versionDraft: UnnumberedSiteVersion = {
         id: versionId,
         siteId,
@@ -390,7 +406,7 @@ export class LocalSiteGenerationPipeline {
         ...(siteRuntime ? { runtimeSchemaVersion: siteRuntime.schemaVersion } : {}),
         createdAt: new Date(),
       };
-      const committedVersion = await this.#commitVersion(project, versionDraft, 1);
+      const committedVersion = await this.#commitVersion(resolvedProject, versionDraft, 1);
       retainEnvironment = request.retainPreview === true;
       job = this.#finalJob(job, runContext.getSummary(), true);
       await this.deps.jobs.save(job);
@@ -416,9 +432,11 @@ export class LocalSiteGenerationPipeline {
       };
     } catch (cause) {
       request.onIntelligence?.([
-        ...(codeGenerationCompleted
+        ...(codeGenerationReported
           ? []
-          : [this.#failureTelemetry("CODE_GENERATION", request.agentProvider, cause)]),
+          : codeGenerationSession
+            ? [this.#failedSessionTelemetry("CODE_GENERATION", codeGenerationSession, cause)]
+            : [this.#failureTelemetry("CODE_GENERATION", request.agentProvider, cause)]),
       ]);
       throw cause;
     } finally {
@@ -718,6 +736,16 @@ export class LocalSiteGenerationPipeline {
       toolCalls: 0,
       ...(status === "UNSUPPORTED" ? { errorCategory: "UNSUPPORTED_CAPABILITY" } : {}),
       status,
+    };
+  }
+  #failedSessionTelemetry(
+    taskKind: AgentTaskTelemetry["taskKind"],
+    session: CliAgentSessionReport,
+    cause: unknown,
+  ): AgentTaskTelemetry {
+    return {
+      ...this.#sessionTelemetry(taskKind, session, "FAILED"),
+      errorCategory: (cause as { code?: string }).code ?? "AGENT_FAILED",
     };
   }
   #failureTelemetry(

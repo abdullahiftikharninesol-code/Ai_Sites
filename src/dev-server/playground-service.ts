@@ -8,7 +8,6 @@ import { DevelopmentPreviewManager } from "./development-preview-manager.js";
 import { createAgentProviderRegistry } from "../agents/registry/create-agent-provider-registry.js";
 import { loadConfig } from "../app/config/environment.js";
 import type { SiteSourceSnapshot } from "../sites/generation/source-snapshot.js";
-import { deriveSiteName } from "../sites/generation/site-name.js";
 import { loadPersistenceConfig } from "../persistence/persistence-config.js";
 import type { MongoConnectionManager } from "../persistence/mongodb/mongo-connection.js";
 import { ArtifactMediaStore } from "../sites/assets/media-store.js";
@@ -137,8 +136,6 @@ export class PlaygroundService {
       const result = await this.product.orchestrator.generateWebsite({
         userId: this.userId,
         prompt,
-        // Deterministic, local naming: a readable project name must not cost a call.
-        projectName: deriveSiteName(prompt),
         // Planning is deterministic by default so one click spends provider
         // capacity on coding rather than on an extra planning request.
         planningMode: this.config.agentPlanningEnabled ? "agent-with-fallback" : "deterministic",

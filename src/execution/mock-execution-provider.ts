@@ -19,6 +19,8 @@ interface Workspace {
   readonly files: Map<string, Buffer>;
   builds: number;
   readonly createdAt: Date;
+  lastBuild?: CommandResult;
+  latestPreview?: PreviewResult;
 }
 
 const normalizePath = (path: string): string => {
@@ -113,7 +115,7 @@ export class MockExecutionProvider implements ExecutionProvider {
     );
     const success = !configuredFailure && !sourceFailure;
     const finishedAt = new Date(startedAt.getTime() + 25);
-    return {
+    const result: CommandResult = {
       exitCode: success ? 0 : 1,
       stdout: success ? "mock build complete" : "",
       stderr: success ? "" : "TypeScript error: BROKEN marker",
@@ -122,15 +124,43 @@ export class MockExecutionProvider implements ExecutionProvider {
       finishedAt,
       durationMs: 25,
     };
+    workspace.lastBuild = result;
+    return result;
   }
   async startPreview(environmentId: string, request: PreviewRequest): Promise<PreviewResult> {
     this.#workspace(environmentId);
     if (this.#failPreview) throw new ApplicationError("PREVIEW_FAILED", "Mock preview failed");
-    return {
+    const preview: PreviewResult = {
       mode: "PROVIDER_URL",
       url: `http://preview.local/${environmentId}`,
       port: request.port,
     };
+    this.#workspace(environmentId).latestPreview = preview;
+    return preview;
+  }
+  getUsageMetrics(environmentId: string) {
+    const workspace = this.#workspace(environmentId);
+    return {
+      environmentCreationMs: 0,
+      filesWritten: workspace.files.size,
+      bytesWritten: [...workspace.files.values()].reduce((total, value) => total + value.byteLength, 0),
+      commandsExecuted: workspace.builds,
+      commandDurationMs: workspace.builds * 25,
+      installDurationMs: 0,
+      buildDurationMs: workspace.builds * 25,
+      previewStartupMs: 0,
+      previewHttpReadyMs: 0,
+    };
+  }
+  getLatestPreview(environmentId: string): PreviewResult | undefined {
+    return this.#workspace(environmentId).latestPreview;
+  }
+  getLastBuildSuccess(environmentId: string): boolean | undefined {
+    const build = this.#workspace(environmentId).lastBuild;
+    return build ? build.exitCode === 0 && !build.timedOut : undefined;
+  }
+  getLastBuildResult(environmentId: string): CommandResult | undefined {
+    return this.#workspace(environmentId).lastBuild;
   }
   #workspace(id: string): Workspace {
     const workspace = this.#workspaces.get(id);

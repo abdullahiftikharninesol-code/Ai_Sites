@@ -18,18 +18,42 @@ import { Skeleton } from "./components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { Textarea } from "./components/ui/textarea";
 import { Tooltip } from "./components/ui/tooltip";
-import { ImageAttachments, pastedImages, type ImageAttachment } from "./components/image-attachments";
+import { ImageAttachments, attachmentUsageForPrompt, pastedImages, type ImageAttachment } from "./components/image-attachments";
 
-const northSmilePrompt = `Create a modern responsive website for a dental clinic called NorthSmile Dental.
-
-Pages: Home, Services, Dentists and Contact. Include a welcoming hero, clinic benefits, featured services, three dentist profiles, patient testimonials, opening hours and an appointment form. Use a clean medical aesthetic, strong typography, polished cards, clear navigation and responsive desktop/mobile layout.`;
 const defaultPrompt = "Build a modern digital consulting company website with Home, Services, About, Testimonials and Contact. Include a working contact form.";
 const presets = [
-  { id: "saas", label: "SaaS", prompt: "Create a polished SaaS landing page for an AI productivity product with pricing, feature sections, testimonials and a sign-up CTA." },
-  { id: "agency", label: "Agency", prompt: "Create a premium creative agency website with a bold hero, services, selected work, team, testimonials and a contact form." },
-  { id: "portfolio", label: "Portfolio", prompt: "Create a modern personal portfolio with an introduction, selected projects, skills, about section and contact form." },
-  { id: "restaurant", label: "Restaurant", prompt: "Create a responsive website for a neighborhood restaurant called Ember & Grain with menu, chef story, opening hours, location and reservation form." },
-  { id: "dental", label: "Dental clinic", prompt: northSmilePrompt },
+  { id: "business", label: "Business", prompt: `Build a professional website for “BrightFix”, a home repair and maintenance company.
+
+Include a strong hero, services, why choose us, customer testimonials, service areas, project image placeholders, FAQ, contact form and a clear Request a Quote CTA.
+
+Use a clean trustworthy visual style and make it fully responsive.` },
+  { id: "landing-page", label: "Landing page", prompt: `Create a modern product landing page for “TaskPilot”, an AI-powered task management tool for small teams.
+
+Include a hero, product benefits, interactive product preview, features, integrations, testimonials, pricing preview, FAQ and final signup CTA.
+
+Use a polished modern SaaS design with subtle animations.` },
+  { id: "online-store", label: "Online store", prompt: `Build a premium online store for “North & Loom”, a modern clothing brand.
+
+Create a home page with hero promotion, categories, featured products, product cards, sale badges, newsletter signup and footer.
+
+Also create a product-detail experience with gallery placeholders, sizes, quantity controls and Add to Cart interactions.
+
+Use frontend mock data only.` },
+  { id: "dashboard", label: "Dashboard", prompt: `Create an operations dashboard for “PulseOps”.
+
+Include sidebar navigation, KPI cards, revenue analytics, project status charts, recent activity, task management, team performance and responsive tables.
+
+Use realistic mock data and working filters, tabs and dropdowns.` },
+  { id: "portfolio", label: "Portfolio", prompt: `Build a premium personal portfolio for a product designer named Alex Morgan.
+
+Include an introduction, selected projects, detailed case-study cards, experience, skills, testimonials, about section and contact CTA.
+
+Use an editorial modern design with strong typography and subtle motion.` },
+  { id: "booking", label: "Booking", prompt: `Build a booking website for “Serene Studio”, a wellness and beauty business.
+
+Include services, pricing, specialists, availability, testimonials, FAQ, location, contact details and an interactive appointment-booking flow using frontend state.
+
+Make it mobile-friendly and easy for customers to book.` },
 ];
 type ConnectionState = "loading" | "online" | "offline";
 type WorkspaceMode = "PREVIEW" | "CODE";
@@ -55,6 +79,7 @@ export function App() {
   const api = useMemo(() => new PlaygroundApiClient(), []);
   const jobController = useRef<AbortController | undefined>(undefined);
   const editing = useRef(false);
+  const requestInFlight = useRef(false);
   const [sites, setSites] = useState<SiteSummary[]>([]);
   const [detail, setDetail] = useState<SiteDetail>();
   const [selectedVersion, setSelectedVersion] = useState<string>();
@@ -166,7 +191,8 @@ export function App() {
   });
   const finishSuccess = async (job: JobStatus, siteId?: string) => { const projectId = siteId ?? job.projectId; await reloadSites(); if (projectId) { await openSite(projectId); navigate(`/sites/${encodeURIComponent(projectId)}`); } if (job.preview && job.versionId) setPreview({ id: job.preview.sessionId, url: job.preview.url, versionId: job.versionId }); };
   const generate = async () => {
-    if (prompt.trim().length < 3) return;
+    if (requestInFlight.current || prompt.trim().length < 3) return;
+    requestInFlight.current = true;
     const request = prompt.trim();
     editing.current = false;
     setBusy(true); setError(""); setActiveJob(undefined); setMode("PREVIEW");
@@ -177,7 +203,7 @@ export function App() {
     ]);
     try {
       const uploaded = await Promise.all(attachments.map(({ file }) => api.uploadImage(file)));
-      const { jobId } = await api.generate(request, uploaded.map(({ id }) => id), uploaded.filter((_, index) => attachments[index]?.usage === "REFERENCE").map(({ id }) => id));
+      const { jobId } = await api.generate(request, uploaded.map(({ id }) => id), uploaded.filter((_, index) => attachments[index] && attachmentUsageForPrompt(attachments[index]!, request) === "REFERENCE").map(({ id }) => id));
       await finishSuccess(await followJob(jobId));
       setAttachments([]);
       settleTurn("Your website is ready to explore. Ask for a change whenever you like.");
@@ -185,10 +211,11 @@ export function App() {
       const job = (reason as { job?: JobStatus }).job; if (job) setActiveJob(job);
       const message = friendlyError(job, readableError(reason, "We couldn't finish this website."));
       setError(message); settleTurn(message);
-    } finally { setBusy(false); }
+    } finally { requestInFlight.current = false; setBusy(false); }
   };
   const edit = async () => {
-    if (!detail || editPrompt.trim().length < 3) return;
+    if (requestInFlight.current || !detail || editPrompt.trim().length < 3) return;
+    requestInFlight.current = true;
     const siteId = detail.project.projectId;
     const request = editPrompt.trim();
     editing.current = true;
@@ -201,7 +228,7 @@ export function App() {
     setEditPrompt("");
     try {
       const uploaded = await Promise.all(editAttachments.map(({ file }) => api.uploadImage(file)));
-      const { jobId } = await api.edit(siteId, request, selectedVersion, uploaded.map(({ id }) => id), uploaded.filter((_, index) => editAttachments[index]?.usage === "REFERENCE").map(({ id }) => id));
+      const { jobId } = await api.edit(siteId, request, selectedVersion, uploaded.map(({ id }) => id), uploaded.filter((_, index) => editAttachments[index] && attachmentUsageForPrompt(editAttachments[index]!, request) === "REFERENCE").map(({ id }) => id));
       await finishSuccess(await followJob(jobId), siteId);
       setEditAttachments([]);
       settleTurn("Here is your updated website.");
@@ -209,7 +236,7 @@ export function App() {
       const job = (reason as { job?: JobStatus }).job; if (job) setActiveJob(job);
       const message = friendlyError(job, readableError(reason, "We couldn't apply that change."), "EDIT");
       setEditPrompt((current) => current.trim() ? current : request); setError(message); settleTurn(message);
-    } finally { setBusy(false); }
+    } finally { requestInFlight.current = false; setBusy(false); }
   };
   const confirmDelete = async () => {
     const site = pendingDelete;

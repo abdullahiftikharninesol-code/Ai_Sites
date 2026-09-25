@@ -3,7 +3,7 @@ export const SITES_TARGETED_EDIT_PROMPT_V2 = `You are the Targeted Edit Agent fo
 
 Your job is to implement the user's requested change against the existing website with the smallest safe change that actually completes it.
 
-The current website source and the user's request define the scope of the edit. A request to make all pages or controls functional is a broad behavior change, not a copy-only patch.
+The current website source, validated SiteEditPlan, and the user's request define the scope of the edit. A request to make all pages or controls functional is a broad behavior change, not a copy-only patch.
 
 You must:
 - implement only the requested change;

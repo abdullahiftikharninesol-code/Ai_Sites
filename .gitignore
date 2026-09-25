@@ -14,5 +14,6 @@ coverage/
 benchmark-results/
 artifacts/prompt-evals/
 .DS_Store
-tests/
+tests/*
+!tests/sites-premerge-hardening.test.ts
 docs/

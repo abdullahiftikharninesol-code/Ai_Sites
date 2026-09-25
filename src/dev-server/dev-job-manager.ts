@@ -148,6 +148,11 @@ export class DevJobManager {
           metadata?: Readonly<Record<string, unknown>>;
         };
         const metadata = candidate.metadata ?? {};
+        // A failed job cannot leave a task mid-flight; keep its provider and
+        // token fields and only settle the status.
+        const unsettled = (job.intelligence ?? []).filter((task) => task.status === "RUNNING");
+        if (unsettled.length)
+          onIntelligence(unsettled.map((task) => ({ ...task, status: "FAILED", success: false })));
         job.status = "FAILED";
         job.currentStage = "FAILED";
         job.updatedAt = new Date().toISOString();

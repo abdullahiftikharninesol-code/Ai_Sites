@@ -18,6 +18,7 @@ import {
 import {
   selectEditContextFiles,
   isBroadFunctionalEdit,
+  broadFunctionalEditChangesStyle,
   BASELINE_STYLESHEET,
   type EditContextFile,
 } from "./edit-context-selection.js";
@@ -60,6 +61,7 @@ import { validateAssetReferences } from "../../sites/assets/asset-reference-vali
 import { applyDeterministicAutofix, applyDeterministicBuildRepair } from "../../sites/generation/deterministic-autofix.js";
 import {
   SITE_CODER_FILE_BUNDLE_JSON_SCHEMA,
+  SITE_CODER_EDIT_FILE_BUNDLE_JSON_SCHEMA,
   BUILD_REPAIR_PATCH_BUNDLE_JSON_SCHEMA,
   applyBuildRepairPatchBundle,
   materializeSiteCoderFileBundle,
@@ -77,6 +79,7 @@ import {
 } from "../../agents/shared/structured-response-parser.js";
 import { SITES_UI_REGISTRY } from "../../sites/generation/sites-ui-registry.js";
 import { buildCapabilityAwareGenerationContext } from "./capability-aware-generation-context.js";
+import { validateReferenceInteractions } from "./reference-interaction-validator.js";
 import {
   getDefaultProfile,
   getProfile,
@@ -99,11 +102,24 @@ export interface CliAgentSessionReport {
   readonly generationMode?: "FAST_GENERATION" | "ITERATIVE_FALLBACK" | "TARGETED_EDIT";
   readonly deterministicAutofixes?: readonly string[];
   readonly buildRepairInvoked?: boolean;
+  readonly generatedSiteName?: string | undefined;
+  readonly generatedDocumentTitle?: string | undefined;
 }
 export type CliAgentProgressListener = (
   state: "GENERATING" | "BUILDING" | "PREVIEW_READY" | "COMPLETED",
   message: string,
 ) => void;
+
+const generatedDocumentTitle = (bundle: SiteCoderFileBundle): string | undefined => {
+  for (const file of bundle.files) {
+    const assignment = /document\.title\s*=\s*["'`]([^"'`\r\n]{1,60})["'`]/u.exec(file.content);
+    if (assignment?.[1]) return assignment[1];
+    const element = /<title[^>]*>([^<\r\n]{1,60})<\/title>/iu.exec(file.content);
+    if (element?.[1]) return element[1].trim();
+  }
+  return undefined;
+};
+
 export class LocalCliAgentRuntime {
   constructor(
     private readonly gateway: AgentGateway,
@@ -313,6 +329,8 @@ export class LocalCliAgentRuntime {
     const boundedStructuredOperation = operation === "GENERATE_SITE" || operation === "EDIT_SITE";
     let bundle: SiteCoderFileBundle | undefined;
     let generationCompletion: GenerationCompletionTelemetry | undefined;
+    let generationAttempts = 1;
+    let rejectedGenerationAttempts = 0;
     let directUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
     let directModel = capabilities.models[0] ?? "unknown";
     this.progress?.("GENERATING", operation === "EDIT_SITE" ? "Applying bounded edit patch" : "Generating bounded source file bundle");
@@ -325,7 +343,9 @@ export class LocalCliAgentRuntime {
       } : {
         type: "JSON_SCHEMA" as const,
         name: "SiteCoderFileBundle",
-        schema: SITE_CODER_FILE_BUNDLE_JSON_SCHEMA,
+        schema: operation === "GENERATE_SITE"
+          ? SITE_CODER_FILE_BUNDLE_JSON_SCHEMA
+          : SITE_CODER_EDIT_FILE_BUNDLE_JSON_SCHEMA,
         strict: true,
       };
       // Everything ahead of the boundary repeats across requests for this site,
@@ -335,9 +355,9 @@ export class LocalCliAgentRuntime {
           ? "Return exactly one JSON object matching the SiteCoderFileBundle schema. This is a broad functional edit of the existing site: return complete contents only for editable source files you change. Preserve its design, text, and layout. Do not call tools."
           : operation === "EDIT_SITE"
             ? "Return exactly one JSON object matching the SiteEditPatchBundle schema. Make the smallest requested source edit and do not call tools."
-            : "Return exactly one JSON object matching the SiteCoderFileBundle schema. Do not call tools.",
+            : "Return exactly one JSON object matching the SiteCoderFileBundle schema, including a compact siteName that identifies the generated website. Do not call tools.",
         operation === "EDIT_SITE" && broadFunctionalEdit
-          ? "Make the existing visible navigation and controls genuinely interactive using React state and local browser storage where appropriate. Provide working view changes, search/filtering, menus, dialogs and form actions that fit the existing UI; do not claim a remote backend exists. Keep every current section and visual treatment. Do not modify Sites-managed files or dependency manifests."
+          ? "Make the existing visible navigation and controls genuinely interactive using React state and local browser storage where appropriate. Provide working view changes, search/filtering, menus, dialogs and form actions that fit the existing UI; do not claim a remote backend exists. Keep the original JSX shell, className values, sections, and visual treatment. For functionality-only edits, never rewrite an existing stylesheet; add and import a new CSS file only if new controls need styles. Do not modify Sites-managed files or dependency manifests."
           : operation === "EDIT_SITE"
           ? [
               "Only patch the requested editable source file; never modify package manifests, configuration, lockfiles, or Sites-managed files.",
@@ -374,28 +394,30 @@ export class LocalCliAgentRuntime {
       const imageParts = task.referenceImages ?? [];
       if (imageParts.length && (!capabilities.vision || imageParts.some((part) => !capabilities.visionInputMimeTypes?.includes(part.mimeType))))
         throw new ApplicationError("UNSUPPORTED_CAPABILITY", "The selected coding model cannot read design reference images");
-      const response = await gatewayProvider.createResponse({
+      const primaryMessage = {
+        role: "user" as const,
+        content: [
+          stableLead,
+          context.slice(discovered.stableChars),
+          operation === "GENERATE_SITE" && completionRequirements ? `Required pages/views: ${completionRequirements.requiredPages.join(", ")}\nRequired sections/features: ${completionRequirements.requiredSections.join(", ")}. Implement these semantically using appropriate React routes, state, tabs, views, or components. Legacy data-sites-page and data-sites-section attributes are optional and are not required.` : "",
+          // A targeted edit works from current source, not from the original brief.
+          projectedSiteSpec && operation === "GENERATE_SITE"
+            ? `SiteSpec: ${JSON.stringify(projectedSiteSpec)}`
+            : "",
+          `User request: ${task.userRequest}`,
+          ...(imageParts.length ? [
+            "DESIGN REFERENCE: The attached image shows the website to build. Recreate the whole visible page as responsive React components and CSS, including its page shell, section order, background tone, typography, spacing, buttons, and detailed interface elements. If the screenshot contains an app preview inside a hero, rebuild that preview as UI within the hero; do not turn the entire page into the app or replace the hero with the screenshot. Treat generic SiteSpec style and scaffold art direction as fallback only where the reference is silent. Do not use the reference bitmap as an img, background, canvas, animation frame, or decorative overlay. Do not substitute a new visual concept. Avoid entrance and background animations unless the user asks for motion.",
+            "FUNCTIONAL REFERENCE REQUIREMENT: Follow the visual reference AND implement every visible navigation destination and control as a usable React page/view or action. A screenshot of one page does not limit the site to one functional page. Make search filter relevant data, buttons open real dialogs or navigate, forms validate and submit to approved/local state, and tabs/menus change content. Persist demo changes in localStorage where appropriate. Do not output placeholder hrefs, inert buttons, alert-only actions, or claims of live backend features that are not available.",
+          ] : []),
+        ].filter(Boolean).join("\n\n"),
+        ...(imageParts.length ? { imageParts } : {}),
+      };
+      let response = await gatewayProvider.createResponse({
         model: capabilities.models[0] ?? "unknown",
         systemInstructions: runtimePrompt.prompt.systemPrompt,
         promptCacheKey: `sites:${task.siteId}:${operation}`,
         cachePrefixChars: stableLead.length + 2,
-        messages: [{
-          role: "user",
-          content: [
-            stableLead,
-            context.slice(discovered.stableChars),
-            operation === "GENERATE_SITE" && completionRequirements ? `Required pages/views: ${completionRequirements.requiredPages.join(", ")}\nRequired sections/features: ${completionRequirements.requiredSections.join(", ")}. Implement these semantically using appropriate React routes, state, tabs, views, or components. Legacy data-sites-page and data-sites-section attributes are optional and are not required.` : "",
-            // A targeted edit works from current source, not from the original brief.
-            projectedSiteSpec && operation === "GENERATE_SITE"
-              ? `SiteSpec: ${JSON.stringify(projectedSiteSpec)}`
-              : "",
-            `User request: ${task.userRequest}`,
-            ...(imageParts.length ? [
-              "DESIGN REFERENCE: The attached image shows the website to build. Recreate the whole visible page as responsive React components and CSS, including its page shell, section order, background tone, typography, spacing, buttons, and detailed interface elements. If the screenshot contains an app preview inside a hero, rebuild that preview as UI within the hero; do not turn the entire page into the app or replace the hero with the screenshot. Treat generic SiteSpec style and scaffold art direction as fallback only where the reference is silent. Do not use the reference bitmap as an img, background, canvas, animation frame, or decorative overlay. Do not substitute a new visual concept. Avoid entrance and background animations unless the user asks for motion.",
-            ] : []),
-          ].filter(Boolean).join("\n\n"),
-          ...(imageParts.length ? { imageParts } : {}),
-        }],
+        messages: [primaryMessage],
         maxOutputTokens: requestedOutputAllowance,
         reasoningPolicy: stagePolicy.reasoningPolicy,
         responseContract,
@@ -405,7 +427,7 @@ export class LocalCliAgentRuntime {
         response,
         operation === "EDIT_SITE" ? "Targeted edit" : "Site coder",
       );
-      const parsed = parseStructuredResponse<SiteCoderFileBundle | import("./site-coder-file-bundle.js").SiteEditPatchBundle>({
+      let parsed = parseStructuredResponse<SiteCoderFileBundle | import("./site-coder-file-bundle.js").SiteEditPatchBundle>({
         content: response.message.content,
         contract: responseContract,
         capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
@@ -414,18 +436,63 @@ export class LocalCliAgentRuntime {
           : validateSiteCoderFileBundle(value, completionRequirements),
         errorContext: operation === "EDIT_SITE" ? "Site edit" : "Site coder",
       }).value;
+      const responses = [response];
+      if (operation === "GENERATE_SITE" && imageParts.length) {
+        try {
+          validateReferenceInteractions(parsed as SiteCoderFileBundle);
+        } catch (cause) {
+          if (!(cause instanceof ApplicationError) || cause.code !== "GENERATION_INCOMPLETE") throw cause;
+          generationAttempts = 2;
+          rejectedGenerationAttempts = 1;
+          this.progress?.("GENERATING", "Repairing non-functional reference controls");
+          response = await gatewayProvider.createResponse({
+            model: capabilities.models[0] ?? "unknown",
+            systemInstructions: runtimePrompt.prompt.systemPrompt,
+            promptCacheKey: `sites:${task.siteId}:${operation}`,
+            cachePrefixChars: stableLead.length + 2,
+            messages: [
+              primaryMessage,
+              { role: "assistant", content: response.message.content },
+              { role: "user", content: [
+                "The previous SiteCoderFileBundle was rejected because reference-based sites must be functional.",
+                cause.message,
+                "Return the complete corrected SiteCoderFileBundle. Preserve the reference design and all working code, but replace every reported inert control with a meaningful React action, navigation destination, dialog, state change, or valid form submission. Do not use alert-only handlers or placeholder links.",
+              ].join("\n\n") },
+            ],
+            maxOutputTokens: requestedOutputAllowance,
+            reasoningPolicy: stagePolicy.reasoningPolicy,
+            responseContract,
+            ...(signal ? { signal } : {}),
+          });
+          responses.push(response);
+          assertStructuredResponseComplete(response, "Reference interaction repair");
+          parsed = parseStructuredResponse<SiteCoderFileBundle>({
+            content: response.message.content,
+            contract: responseContract,
+            capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
+            validate: (value) => validateSiteCoderFileBundle(value, completionRequirements),
+            errorContext: "Reference interaction repair",
+          }).value;
+          validateReferenceInteractions(parsed);
+        }
+      }
       if (operation === "EDIT_SITE" && !broadFunctionalEdit) {
         await applySiteEditPatchBundle(this.execution, environmentId, parsed as import("./site-coder-file-bundle.js").SiteEditPatchBundle);
       } else {
-        const generatedBundle = parsed as SiteCoderFileBundle;
+        const submittedBundle = parsed as SiteCoderFileBundle;
+        const generatedBundle = broadFunctionalEdit && !broadFunctionalEditChangesStyle(task.userRequest)
+          ? { ...submittedBundle, files: submittedBundle.files.filter((file) => !file.path.endsWith(".css") || !before.has(file.path)) }
+          : submittedBundle;
+        if (!generatedBundle.files.length)
+          throw new ApplicationError("VALIDATION_FAILED", "The functionality edit did not include an application source file");
         bundle = generatedBundle;
         await materializeSiteCoderFileBundle(this.execution, environmentId, generatedBundle);
       }
-      directUsage = {
-        inputTokens: response.usage.inputTokens,
-        cachedInputTokens: response.usage.cachedInputTokens ?? 0,
-        outputTokens: response.usage.outputTokens,
-      };
+      directUsage = responses.reduce((usage, item) => ({
+        inputTokens: usage.inputTokens + item.usage.inputTokens,
+        cachedInputTokens: usage.cachedInputTokens + (item.usage.cachedInputTokens ?? 0),
+        outputTokens: usage.outputTokens + item.usage.outputTokens,
+      }), { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
       directModel = response.model;
     }
     let autofixResult = await applyDeterministicAutofix(this.execution, environmentId);
@@ -441,7 +508,11 @@ export class LocalCliAgentRuntime {
           "GENERATION_INCOMPLETE",
           `Site coder bundle failed completion validation: ${completion.issues.map((issue) => issue.message).join("; ")}`,
         );
-      generationCompletion = { attempts: 1, accepted: true, rejectedAttempts: 0 };
+      generationCompletion = {
+        attempts: generationAttempts,
+        accepted: true,
+        rejectedAttempts: rejectedGenerationAttempts,
+      };
     }
     if (operation === "GENERATE_SITE" && completionRequirements && !generationCompletion)
       throw new ApplicationError("GENERATION_INCOMPLETE", "Structured site coder response did not satisfy completion contract");
@@ -620,7 +691,7 @@ export class LocalCliAgentRuntime {
       provider: providerId,
       model: directModel,
       runtime: "LOCAL_CLI",
-      turns: (boundedStructuredOperation ? 1 : 0) + repairModelCalls,
+      turns: (boundedStructuredOperation ? generationAttempts : 0) + repairModelCalls,
       toolCalls: 0,
       buildAttempts: tools.buildAttempts + automaticBuildAttempts,
       finalBuildSuccess: this.execution.getLastBuildSuccess(environmentId) === true,
@@ -631,7 +702,7 @@ export class LocalCliAgentRuntime {
         inputTokens: directUsage.inputTokens + repairInputTokens,
         cachedInputTokens: directUsage.cachedInputTokens + repairCachedInputTokens,
         outputTokens: directUsage.outputTokens + repairOutputTokens,
-        modelCalls: (boundedStructuredOperation ? 1 : 0) + repairModelCalls,
+        modelCalls: (boundedStructuredOperation ? generationAttempts : 0) + repairModelCalls,
         limitReached: false,
         toolCalls: 0,
         executionProvider: this.execution.id,
@@ -658,6 +729,14 @@ export class LocalCliAgentRuntime {
       generationMode: operation === "EDIT_SITE" ? "TARGETED_EDIT" : "FAST_GENERATION",
       deterministicAutofixes: autofixResult.fixes.map((fix) => fix.id),
       buildRepairInvoked: repairModelCalls > 0,
+      ...(operation === "GENERATE_SITE" && bundle?.siteName
+        ? { generatedSiteName: bundle.siteName }
+        : {}),
+      ...(operation === "GENERATE_SITE" && bundle
+        ? generatedDocumentTitle(bundle)
+          ? { generatedDocumentTitle: generatedDocumentTitle(bundle) }
+          : {}
+        : {}),
     };
   }
   async #discoverContext(
@@ -698,6 +777,7 @@ export class LocalCliAgentRuntime {
         ...(task.referenceImages?.length ? [
           "A design reference image is attached. Match the ENTIRE page composition visible in it: page type, navbar, hero arrangement, typography, palette, spacing, and sections. If the image is a landing page with an app dashboard inside its hero, build the landing page AND that dashboard UI.",
           "Rebuild any dashboard or interface shown inside the reference with readable HTML, CSS, and React elements. Do not display or animate the screenshot itself.",
+          "Implement the reference's visible navigation as working routes or React views, including the destinations beyond the screenshot. Wire its buttons, menus, tabs, search, and forms to meaningful local behavior. A visual clone with dead controls or alert-only handlers is incomplete. Use browser-local state/storage when no backend was approved; label integrations or server-only actions honestly.",
           "Match the reference's dominant light or dark appearance on initial render. Do not substitute a generic art direction or change the reference's light page into a dark page.",
           "Preserve the existing theme control, but ensure the initial composition and colors follow the reference.",
         ] : [

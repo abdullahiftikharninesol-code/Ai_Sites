@@ -4,7 +4,10 @@ import { Server, type Socket } from "socket.io";
 import type { DevJobEvent, DevJobRecord } from "../../dev-server/dev-job-manager.js";
 import {
   SITES_SOCKET_EVENTS,
+  type SitesCancelJobRequest,
   type SitesClientToServerEvents,
+  type SitesCreateJobRequest,
+  type SitesEditJobRequest,
   type SitesJobAck,
   type SitesJobOperation,
   type SitesJobProgressPayload,
@@ -49,6 +52,20 @@ const requireIdentifier = (value: unknown, name: string): string => {
   return value.trim();
 };
 
+/**
+ * Socket.IO only supplies an acknowledgement when the client asked for one, so
+ * a client that omits it must not be able to throw inside a handler.
+ */
+const safeAcknowledge = (acknowledge: unknown, response: SitesJobAck): void => {
+  if (typeof acknowledge === "function") (acknowledge as (response: SitesJobAck) => void)(response);
+};
+
+/** Emitting without a payload shifts the acknowledgement into the first argument. */
+const socketArguments = <TRequest>(request: unknown, acknowledge: unknown) =>
+  typeof request === "function"
+    ? { request: undefined as Partial<TRequest> | undefined, acknowledge: request as unknown }
+    : { request: request as Partial<TRequest> | undefined, acknowledge };
+
 const rejectedAck = (requestId: string, error: unknown): SitesJobAck => {
   const candidate = (error ?? {}) as { code?: unknown; message?: unknown; retryable?: unknown };
   return {
@@ -85,6 +102,10 @@ const forwardJob = (
 ): void => {
   let terminalSent = false;
   let lastStage = socketStage(job.operation, job.currentStage);
+  // The job manager's JOB_STARTED/JOB_COMPLETED markers restate the pipeline's
+  // own QUEUED and COMPLETED updates at the same public stage and percentage.
+  let lastProgress: { stage: SitesSocketStage; progress: number; message?: string; lifecycle: boolean } | undefined;
+  let completedProgressSent = false;
   let unsubscribe: () => void = () => undefined;
   const emit = <TEvent extends keyof SitesServerToClientEvents>(
     event: TEvent,
@@ -135,7 +156,17 @@ const forwardJob = (
       progress: event.progress ?? (lastStage === "COMPLETED" ? 100 : 0),
       ...(event.message ? { message: event.message } : {}),
     };
-    emit(SITES_SOCKET_EVENTS.JOB_PROGRESS, progress);
+    const lifecycle = event.type === "JOB_STARTED" || event.type === "JOB_COMPLETED";
+    const redundant =
+      (progress.stage === "COMPLETED" && completedProgressSent) ||
+      (lastProgress?.stage === progress.stage &&
+        lastProgress.progress === progress.progress &&
+        (lastProgress.message === progress.message || lifecycle || lastProgress.lifecycle));
+    if (!redundant) {
+      emit(SITES_SOCKET_EVENTS.JOB_PROGRESS, progress);
+      lastProgress = { stage: progress.stage, progress: progress.progress, lifecycle, ...(progress.message ? { message: progress.message } : {}) };
+      if (progress.stage === "COMPLETED") completedProgressSent = true;
+    }
     if (event.type === "JOB_COMPLETED") terminal();
   };
   unsubscribe = service.jobs.subscribe(job.id, onEvent);
@@ -153,22 +184,26 @@ export const registerSitesSocketHandlers = (
       options.resolveOwnerId?.(socket, service) ?? String(service.userId);
     void socket.join(ownerId);
 
-    socket.on(SITES_SOCKET_EVENTS.CREATE_JOB, (request, acknowledge) => {
+    socket.on(SITES_SOCKET_EVENTS.CREATE_JOB, (...args: unknown[]) => {
+      const { request, acknowledge } = socketArguments<SitesCreateJobRequest>(args[0], args[1]);
       const requestId = requestIdFor(request?.requestId);
+      let job: DevJobRecord;
       try {
-        const prompt = requirePrompt(request?.prompt);
-        const job = service.generate(prompt);
-        acknowledge({ success: true, requestId, jobId: job.id, status: "accepted" });
-        console.info(`[sites][socket] accepted requestId=${requestId} jobId=${job.id}`);
-        forwardJob(io, ownerId, service, requestId, job);
+        job = service.generate(requirePrompt(request?.prompt));
       } catch (error) {
-        acknowledge(rejectedAck(requestId, error));
+        safeAcknowledge(acknowledge, rejectedAck(requestId, error));
+        return;
       }
+      safeAcknowledge(acknowledge, { success: true, requestId, jobId: job.id, status: "accepted" });
+      console.info(`[sites][socket] accepted requestId=${requestId} jobId=${job.id}`);
+      forwardJob(io, ownerId, service, requestId, job);
     });
 
-    socket.on(SITES_SOCKET_EVENTS.EDIT_JOB, (request, acknowledge) => {
+    socket.on(SITES_SOCKET_EVENTS.EDIT_JOB, (...args: unknown[]) => {
+      const { request, acknowledge } = socketArguments<SitesEditJobRequest>(args[0], args[1]);
       const requestId = requestIdFor(request?.requestId);
       void (async () => {
+        let job: DevJobRecord;
         try {
           const siteId = requireIdentifier(request?.siteId, "siteId");
           const prompt = requirePrompt(request?.prompt);
@@ -176,19 +211,21 @@ export const registerSitesSocketHandlers = (
             request?.baseVersionId === undefined
               ? undefined
               : requireIdentifier(request.baseVersionId, "baseVersionId");
-          const job = await service.edit(siteId, prompt, baseVersionId);
-          acknowledge({ success: true, requestId, jobId: job.id, status: "accepted" });
-          console.info(`[sites][socket] accepted requestId=${requestId} jobId=${job.id}`);
-          forwardJob(io, ownerId, service, requestId, job);
+          job = await service.edit(siteId, prompt, baseVersionId);
         } catch (error) {
-          acknowledge(rejectedAck(requestId, error));
+          safeAcknowledge(acknowledge, rejectedAck(requestId, error));
+          return;
         }
+        safeAcknowledge(acknowledge, { success: true, requestId, jobId: job.id, status: "accepted" });
+        console.info(`[sites][socket] accepted requestId=${requestId} jobId=${job.id}`);
+        forwardJob(io, ownerId, service, requestId, job);
       })();
     });
 
-    socket.on(SITES_SOCKET_EVENTS.CANCEL_JOB, (request, acknowledge) => {
+    socket.on(SITES_SOCKET_EVENTS.CANCEL_JOB, (...args: unknown[]) => {
+      const { request, acknowledge } = socketArguments<SitesCancelJobRequest>(args[0], args[1]);
       const requestId = requestIdFor(request?.requestId);
-      acknowledge({
+      safeAcknowledge(acknowledge, {
         success: false,
         requestId,
         status: "unsupported",

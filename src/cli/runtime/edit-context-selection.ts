@@ -20,6 +20,11 @@ export function isBroadFunctionalEdit(instruction: string): boolean {
     /\b(all|whole|entire|every|pages?|screens?|buttons?|links?|navigation|features?|site|website|dashboard|app)\b/i.test(instruction);
 }
 
+/** "Preserve the styling" is not permission to rewrite a stylesheet. */
+export function broadFunctionalEditChangesStyle(instruction: string): boolean {
+  return /\b(redesign|restyle|retheme|change (?:the )?(?:style|styling|theme|colors?|colours?|palette)|update (?:the )?(?:style|styling|theme|colors?|colours?|palette))\b/i.test(instruction);
+}
+
 const STYLE_INTENT =
   /\b(colou?rs?|theme|dark|light|palette|font|fonts|typograph\w*|spacing|style|styles|styling|css|background|accent|uppercase|lowercase|capitali[sz]\w*|bold|italic|round\w*|shadow|border|margin|padding|size|sizes|larger|smaller|contrast)\b/i;
 
@@ -73,7 +78,8 @@ export function selectEditContextFiles(
 ): EditContextSelection {
   const entryPath = options.entryPath ?? "src/App.tsx";
   const maxFiles = options.maxFiles ?? 8;
-  const styleIntent = STYLE_INTENT.test(instruction);
+  const styleIntent = STYLE_INTENT.test(instruction) &&
+    (!options.includeAllEditable || broadFunctionalEditChangesStyle(instruction));
   const phrases = phrasesFrom(instruction);
   const terms = termsFrom(instruction);
 
