@@ -7,6 +7,14 @@ import {
 } from "./playground-service.js";
 import { attachSitesSocketServer } from "../sites/socket/sites-socket.js";
 import type { Server as SocketIoServer } from "socket.io";
+import {
+  createAuthUser,
+  type AuthenticatedRequest,
+  type AuthUserMiddleware,
+} from "../auth/auth-user.js";
+import { ownerIdOf } from "../auth/owner-id.js";
+import { sendResponse } from "../auth/send-response.js";
+import { requireSitesSubscription } from "../auth/sites-subscription.js";
 
 export function normalizePlaygroundPrompt(value: unknown): string {
   if (typeof value !== "string" || value.trim().length < 3 || value.length > 20_000)
@@ -42,7 +50,8 @@ const readBytes = async (req: IncomingMessage, maximum = 10 * 1024 * 1024) => {
   for await (const chunk of req) {
     const bytes = Buffer.from(chunk as Uint8Array);
     size += bytes.length;
-    if (size > maximum) throw Object.assign(new Error("Image is too large"), { code: "IMAGE_TOO_LARGE" });
+    if (size > maximum)
+      throw Object.assign(new Error("Image is too large"), { code: "IMAGE_TOO_LARGE" });
     chunks.push(bytes);
   }
   return new Uint8Array(Buffer.concat(chunks));
@@ -65,6 +74,7 @@ const safeError = (error: unknown) => {
     "IMAGE_INGESTION_FAILED",
     "USER_ASSET_NOT_FOUND",
     "USER_ASSET_NOT_REFERENCED",
+    "SUBSCRIPTION_REQUIRED",
   ]);
   const code =
     typeof value.code === "string" && allowed.has(value.code) ? value.code : "DEV_REQUEST_FAILED";
@@ -83,18 +93,39 @@ export class PlaygroundHttpServer {
   readonly config: PlaygroundConfig;
   #server: Server | undefined;
   #socketServer: SocketIoServer | undefined;
-  constructor(config = loadPlaygroundConfig(), service?: PlaygroundService) {
+  readonly #authUser: AuthUserMiddleware;
+  readonly #readsJwtKeyFromEnv: boolean;
+  constructor(
+    config = loadPlaygroundConfig(),
+    service?: PlaygroundService,
+    authUser?: AuthUserMiddleware,
+  ) {
     if (!["127.0.0.1", "localhost", "::1"].includes(config.host))
       throw new Error("The unauthenticated playground must bind to a loopback address");
     this.config = config;
     this.service = service ?? new PlaygroundService(config);
+    this.#authUser = authUser ?? createAuthUser({ identities: this.service.identities });
+    this.#readsJwtKeyFromEnv = !authUser;
   }
   async start() {
+    if (this.#readsJwtKeyFromEnv && !process.env.JWTKEY)
+      console.warn("[sites][auth] JWTKEY is not configured; authenticated routes will fail closed");
     await this.service.start();
     this.#server = createServer((req, res) => void this.#handle(req, res));
-    this.#socketServer = attachSitesSocketServer(this.#server, this.service, {
-      allowedOrigins: this.config.webOrigins,
-    });
+    // The Socket.IO playground keeps its development identity until the
+    // GetChatly socket integration phase; it never reaches authenticated HTTP owners.
+    const socketOwnerId = String(this.service.userId);
+    this.#socketServer = attachSitesSocketServer(
+      this.#server,
+      {
+        userId: socketOwnerId,
+        jobs: this.service.jobs,
+        generate: (prompt) => this.service.generate(socketOwnerId, prompt),
+        edit: (siteId, prompt, baseVersionId) =>
+          this.service.edit(socketOwnerId, siteId, prompt, baseVersionId),
+      },
+      { allowedOrigins: this.config.webOrigins },
+    );
     try {
       await new Promise<void>((resolve, reject) =>
         this.#server!.once("error", reject).listen(this.config.port, this.config.host, resolve),
@@ -128,7 +159,7 @@ export class PlaygroundHttpServer {
       });
     await this.service.close();
   }
-  async #handle(req: IncomingMessage, res: ServerResponse) {
+  async #handle(req: AuthenticatedRequest, res: ServerResponse) {
     this.#headers(req, res);
     if (
       !["GET", "HEAD", "OPTIONS"].includes(req.method ?? "GET") &&
@@ -157,39 +188,67 @@ export class PlaygroundHttpServer {
           executionProvider: "local",
           database: this.service.databaseStatus(),
         });
+      // Every route below is user-scoped. Ownership is derived only from the
+      // authenticated req.user; ownerId/userId/user/createdBy and similar
+      // fields in the body, query or headers are never read.
+      const ownerId = await this.#authenticate(req, res);
+      if (!ownerId) return;
       if (method === "POST" && path === "/api/dev/persistence/sites") {
         const body = await readJson(req);
         if (typeof body.name !== "string")
           throw Object.assign(new Error("name is required"), { code: "INVALID_REQUEST" });
-        return this.#json(res, 201, await this.service.createPersistenceTestSite(body.name));
+        return this.#json(
+          res,
+          201,
+          await this.service.createPersistenceTestSite(ownerId, body.name),
+        );
       }
       if (method === "POST" && path === "/api/dev/assets") {
         const originalName = url.searchParams.get("name") ?? req.headers["x-sites-file-name"];
         const mimeType = url.searchParams.get("mime") ?? req.headers["content-type"];
         if (typeof originalName !== "string" || typeof mimeType !== "string")
-          throw Object.assign(new Error("Image filename and type are required"), { code: "INVALID_REQUEST" });
-        return this.#json(res, 201, await this.service.ingestImage({ originalName, mimeType, bytes: await readBytes(req) }));
+          throw Object.assign(new Error("Image filename and type are required"), {
+            code: "INVALID_REQUEST",
+          });
+        return this.#json(
+          res,
+          201,
+          await this.service.ingestImage(ownerId, {
+            originalName,
+            mimeType,
+            bytes: await readBytes(req),
+          }),
+        );
       }
       if (method === "POST" && path === "/api/dev/sites") {
+        requireSitesSubscription(req.user);
         const body = await readJson(req),
           prompt = this.#prompt(body.prompt);
-        const job = this.service.generate(prompt, this.#attachmentIds(body.attachments), this.#attachmentIds(body.referenceAttachments) ?? []);
+        const job = this.service.generate(
+          ownerId,
+          prompt,
+          this.#attachmentIds(body.attachments),
+          this.#attachmentIds(body.referenceAttachments) ?? [],
+        );
         return this.#json(res, 202, { jobId: job.id });
       }
       if (method === "GET" && path === "/api/dev/sites")
-        return this.#json(res, 200, { sites: await this.service.listSites() });
+        return this.#json(res, 200, { sites: await this.service.listSites(ownerId) });
       let match = /^\/api\/dev\/jobs\/([^/]+)$/.exec(path);
       if (method === "GET" && match) {
-        const job = this.service.jobs.get(match[1]!);
-        if (!job) throw Object.assign(new Error("Job not found"), { code: "INVALID_REQUEST" });
+        const job = this.service.getJob(ownerId, match[1]!);
+        if (!job)
+          return this.#json(res, 404, { error: { code: "NOT_FOUND", message: "Job not found" } });
         return this.#json(res, 200, { ...job, events: undefined });
       }
       match = /^\/api\/dev\/jobs\/([^/]+)\/events$/.exec(path);
-      if (method === "GET" && match) return this.#sse(res, match[1]!);
+      if (method === "GET" && match) return this.#sse(res, ownerId, match[1]!);
       match = /^\/api\/dev\/sites\/([^/]+)\/edit$/.exec(path);
       if (method === "POST" && match) {
+        requireSitesSubscription(req.user);
         const body = await readJson(req),
           job = await this.service.edit(
+            ownerId,
             match[1]!,
             this.#prompt(body.prompt),
             typeof body.baseVersionId === "string" ? body.baseVersionId : undefined,
@@ -203,7 +262,11 @@ export class PlaygroundHttpServer {
         return this.#json(
           res,
           201,
-          await this.service.startPreview(decodeRouteParam(match[1]!), decodeRouteParam(match[2]!)),
+          await this.service.startPreview(
+            ownerId,
+            decodeRouteParam(match[1]!),
+            decodeRouteParam(match[2]!),
+          ),
         );
       match = /^\/api\/dev\/sites\/([^/]+)\/versions\/([^/]+)\/files$/.exec(path);
       if (method === "GET" && match)
@@ -211,6 +274,7 @@ export class PlaygroundHttpServer {
           res,
           200,
           await this.service.sourceFiles(
+            ownerId,
             decodeRouteParam(match[1]!),
             decodeRouteParam(match[2]!),
             url.searchParams.get("path") ?? undefined,
@@ -218,43 +282,53 @@ export class PlaygroundHttpServer {
         );
       match = /^\/api\/dev\/previews\/([^/]+)$/.exec(path);
       if (method === "GET" && match)
-        return this.#json(res, 200, await this.service.previewInspector(match[1]!));
+        return this.#json(res, 200, await this.service.previewInspector(ownerId, match[1]!));
       if (method === "DELETE" && match)
-        return this.#json(res, 200, { stopped: await this.service.stopPreview(match[1]!) });
+        return this.#json(res, 200, {
+          stopped: await this.service.stopPreview(ownerId, match[1]!),
+        });
       match = /^\/api\/dev\/sites\/([^/]+)\/versions\/([^/]+)\/publish$/.exec(path);
       if (method === "POST" && match)
         return this.#json(
           res,
           201,
-          await this.service.publish(decodeRouteParam(match[1]!), decodeRouteParam(match[2]!)),
+          await this.service.publish(
+            ownerId,
+            decodeRouteParam(match[1]!),
+            decodeRouteParam(match[2]!),
+          ),
         );
       match = /^\/api\/dev\/sites\/([^/]+)\/rollback$/.exec(path);
       if (method === "POST" && match) {
         const body = await readJson(req);
         if (typeof body.deploymentId !== "string")
           throw Object.assign(new Error("deploymentId is required"), { code: "INVALID_REQUEST" });
-        return this.#json(res, 200, await this.service.rollback(match[1]!, body.deploymentId));
+        return this.#json(
+          res,
+          200,
+          await this.service.rollback(ownerId, match[1]!, body.deploymentId),
+        );
       }
       match = /^\/api\/dev\/sites\/([^/]+)\/unpublish$/.exec(path);
       if (method === "POST" && match)
-        return this.#json(res, 200, await this.service.unpublish(match[1]!));
+        return this.#json(res, 200, await this.service.unpublish(ownerId, match[1]!));
       match = /^\/api\/dev\/sites\/([^/]+)\/runtime$/.exec(path);
       if (method === "GET" && match)
-        return this.#json(res, 200, await this.service.runtimeInspector(match[1]!));
+        return this.#json(res, 200, await this.service.runtimeInspector(ownerId, match[1]!));
       match = /^\/api\/dev\/sites\/([^/]+)\/versions$/.exec(path);
       if (method === "GET" && match)
-        return this.#json(res, 200, { versions: await this.service.versions(match[1]!) });
+        return this.#json(res, 200, { versions: await this.service.versions(ownerId, match[1]!) });
       match = /^\/api\/dev\/sites\/([^/]+)$/.exec(path);
       if (method === "PATCH" && match) {
         const body = await readJson(req);
         if (typeof body.name !== "string")
           throw Object.assign(new Error("name is required"), { code: "INVALID_REQUEST" });
-        return this.#json(res, 200, await this.service.renameSite(match[1]!, body.name));
+        return this.#json(res, 200, await this.service.renameSite(ownerId, match[1]!, body.name));
       }
       if (method === "DELETE" && match)
-        return this.#json(res, 200, await this.service.deleteSite(match[1]!));
+        return this.#json(res, 200, await this.service.deleteSite(ownerId, match[1]!));
       if (method === "GET" && match)
-        return this.#json(res, 200, await this.service.siteDetail(match[1]!));
+        return this.#json(res, 200, await this.service.siteDetail(ownerId, match[1]!));
       this.#json(res, 404, {
         error: { code: "NOT_FOUND", message: "Development endpoint not found" },
       });
@@ -270,26 +344,48 @@ export class PlaygroundHttpServer {
           normalized.code === "SOURCE_NOT_FOUND" ||
           normalized.code === "SOURCE_FILE_NOT_FOUND"
           ? 404
-          : normalized.code === "DEV_JOB_BUSY"
-            ? 409
-            : normalized.code === "REQUEST_TOO_LARGE"
-              ? 413
-              : normalized.code === "DEV_REQUEST_FAILED"
-                ? 500
-                : 400,
+          : normalized.code === "SUBSCRIPTION_REQUIRED"
+            ? 402
+            : normalized.code === "DEV_JOB_BUSY"
+              ? 409
+              : normalized.code === "REQUEST_TOO_LARGE"
+                ? 413
+                : normalized.code === "DEV_REQUEST_FAILED"
+                  ? 500
+                  : 400,
         { error: normalized },
       );
     }
+  }
+  /** Runs GetChatly authUser; resolves the owner only when it called next(). */
+  async #authenticate(req: AuthenticatedRequest, res: ServerResponse): Promise<string | null> {
+    const result: { ownerId: string | null } = { ownerId: null };
+    await this.#authUser(req, res, () => {
+      result.ownerId = ownerIdOf(req);
+    });
+    if (res.writableEnded || res.headersSent) return null;
+    if (!result.ownerId) {
+      sendResponse(res, 401, "Authentication Failed!", false);
+      return null;
+    }
+    return result.ownerId;
   }
   #prompt(value: unknown) {
     return normalizePlaygroundPrompt(value);
   }
   #attachmentIds(value: unknown): readonly string[] | undefined {
     if (value === undefined) return undefined;
-    if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !/^user-[a-f0-9-]{36}$/.test(id)))
-      throw Object.assign(new Error("attachments must be managed image IDs"), { code: "INVALID_REQUEST" });
+    if (
+      !Array.isArray(value) ||
+      value.some((id) => typeof id !== "string" || !/^user-[a-f0-9-]{36}$/.test(id))
+    )
+      throw Object.assign(new Error("attachments must be managed image IDs"), {
+        code: "INVALID_REQUEST",
+      });
     if (new Set(value).size !== value.length)
-      throw Object.assign(new Error("attachments must not contain duplicates"), { code: "INVALID_REQUEST" });
+      throw Object.assign(new Error("attachments must not contain duplicates"), {
+        code: "INVALID_REQUEST",
+      });
     return value;
   }
   #headers(req: IncomingMessage, res: ServerResponse) {
@@ -299,16 +395,19 @@ export class PlaygroundHttpServer {
     if (origin && this.config.webOrigins.includes(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Vary", "Origin");
-      res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "content-type, x-sites-file-name");
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS");
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "authorization, content-type, x-sites-file-name",
+      );
     }
   }
   #json(res: ServerResponse, status: number, value: unknown) {
     res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
     res.end(JSON.stringify(value));
   }
-  #sse(res: ServerResponse, id: string) {
-    const job = this.service.jobs.get(id);
+  #sse(res: ServerResponse, ownerId: string, id: string) {
+    const job = this.service.getJob(ownerId, id);
     if (!job) {
       this.#json(res, 404, { error: { code: "NOT_FOUND", message: "Job not found" } });
       return;

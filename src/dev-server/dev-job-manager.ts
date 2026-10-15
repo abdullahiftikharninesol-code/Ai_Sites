@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { SiteProgressEvent, InMemoryProgressBus } from "../sites/application/progress.js";
 import type { AgentTaskTelemetry } from "../agents/intelligence/intelligence-types.js";
+import type { UserCreditQuotaPayload } from "../billing/getchatly-quota-notification.js";
+import type { SiteJobBillingStatus } from "../sites/domain/entities.js";
 
 export type DevJobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
 export interface DevJobEvent {
@@ -21,6 +23,9 @@ export interface DevJobRecord {
   projectId?: string;
   versionId?: string;
   preview?: { sessionId: string; url: string };
+  billingStatus?: SiteJobBillingStatus;
+  creditsCharged?: number;
+  subscriberQuota?: UserCreditQuotaPayload;
   error?: {
     code: string;
     message: string;
@@ -38,6 +43,8 @@ export interface DevJobRecord {
 }
 export class DevJobManager {
   readonly #jobs = new Map<string, DevJobRecord>();
+  // Kept beside the record so job responses and socket payloads are unchanged.
+  readonly #owners = new Map<string, string>();
   readonly #listeners = new Map<string, Set<(event: DevJobEvent) => void>>();
   #mutationRunning = false;
   constructor(private readonly progress: InMemoryProgressBus) {}
@@ -48,7 +55,11 @@ export class DevJobManager {
       versionId: string;
       preview?: { sessionId: string; url: string };
       intelligence?: readonly AgentTaskTelemetry[];
+      billingStatus?: SiteJobBillingStatus;
+      creditsCharged?: number;
+      subscriberQuota?: UserCreditQuotaPayload;
     }>,
+    ownerId?: string,
   ): DevJobRecord {
     if (this.#mutationRunning)
       throw Object.assign(new Error("Another generation or edit is already running"), {
@@ -58,6 +69,7 @@ export class DevJobManager {
       if (job.status === "SUCCEEDED" || job.status === "FAILED") {
         if (this.#jobs.size >= 100 || Date.now() - Date.parse(job.updatedAt) > 86_400_000) {
           this.#jobs.delete(id);
+          this.#owners.delete(id);
           this.#listeners.delete(id);
         }
       }
@@ -73,6 +85,7 @@ export class DevJobManager {
       events: [],
     };
     this.#jobs.set(job.id, job);
+    if (ownerId) this.#owners.set(job.id, ownerId);
     console.info(`[sites] job=${job.id} operation=${operation} status=QUEUED`);
     this.#emit(job, {
       type: "JOB_STARTED",
@@ -121,11 +134,14 @@ export class DevJobManager {
         job.status = "RUNNING";
         return execute(onIntelligence);
       })
-      .then(({ projectId, versionId, preview, intelligence }) => {
+      .then(({ projectId, versionId, preview, intelligence, billingStatus, creditsCharged, subscriberQuota }) => {
         job.projectId = projectId;
         job.versionId = versionId;
         if (preview) job.preview = preview;
         if (intelligence) job.intelligence = intelligence;
+        if (billingStatus) job.billingStatus = billingStatus;
+        if (creditsCharged !== undefined) job.creditsCharged = creditsCharged;
+        if (subscriberQuota) job.subscriberQuota = subscriberQuota;
         job.status = "SUCCEEDED";
         job.currentStage = "COMPLETED";
         job.updatedAt = new Date().toISOString();
@@ -203,6 +219,10 @@ export class DevJobManager {
   }
   get(id: string) {
     return this.#jobs.get(id);
+  }
+  /** User-facing lookup: a job only resolves for the owner that started it. */
+  getOwned(id: string, ownerId: string) {
+    return this.#owners.get(id) === ownerId ? this.#jobs.get(id) : undefined;
   }
   hasActiveProject(projectId: string) {
     return [...this.#jobs.values()].some(

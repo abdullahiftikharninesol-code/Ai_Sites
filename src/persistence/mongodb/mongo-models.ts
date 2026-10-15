@@ -29,6 +29,14 @@ export interface MongoSiteJobRecord {
   outputTokens?: number;
   reasoningTokens?: number;
   totalTokens?: number;
+  billableInputTokens?: number;
+  billableOutputTokens?: number;
+  billableTokens?: number;
+  creditsPer500Tokens?: number;
+  creditsCharged?: number;
+  billingStatus: "NOT_CHARGED" | "CHARGED" | "FAILED";
+  billingErrorCode?: string;
+  chargedAt?: Date;
   logicalCalls: number;
   physicalRequests: number;
   retries: number;
@@ -80,6 +88,19 @@ const jobSchema = new Schema<MongoSiteJobRecord>(
     outputTokens: Number,
     reasoningTokens: Number,
     totalTokens: Number,
+    billableInputTokens: Number,
+    billableOutputTokens: Number,
+    billableTokens: Number,
+    creditsPer500Tokens: Number,
+    creditsCharged: Number,
+    billingStatus: {
+      type: String,
+      required: true,
+      enum: ["NOT_CHARGED", "CHARGED", "FAILED"],
+      default: "NOT_CHARGED",
+    },
+    billingErrorCode: String,
+    chargedAt: Date,
     logicalCalls: { type: Number, required: true, min: 0 },
     physicalRequests: { type: Number, required: true, min: 0 },
     retries: { type: Number, required: true, min: 0 },

@@ -34,6 +34,7 @@ import type { SiteRuntimeProvider } from "../../site-runtime/site-runtime-provid
 import { AgentPlanningPipeline } from "../../agents/intelligence/agent-intelligence.js";
 import { ArtifactMediaStore } from "../assets/media-store.js";
 import { AdapterBackedAssetResolver, PlaceholderAssetSourceAdapter } from "../assets/source-adapters.js";
+import type { SiteCreditBillingService } from "../../billing/credit-billing.js";
 export interface LocalSitesProductOptions {
   readonly executionRoot: string;
   readonly artifactRoot: string;
@@ -49,6 +50,7 @@ export interface LocalSitesProductOptions {
   readonly jobs?: SiteJobRepository;
   readonly versionCommitter?: SiteVersionCommitter;
   readonly runtimeProvider?: SiteRuntimeProvider;
+  readonly billing?: SiteCreditBillingService;
 }
 export function createLocalSitesProduct(options: LocalSitesProductOptions) {
   const execution = new LocalExecutionProvider({
@@ -112,6 +114,9 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
     browserQA,
     ...(options.versionCommitter ? { versionCommitter: options.versionCommitter } : {}),
     ...(options.runtimeProvider ? { runtimeProvider: options.runtimeProvider } : {}),
+    ...(options.billing ? { billing: options.billing } : {}),
+    resolveAgentModel: (provider) =>
+      registry.get(provider === "mock" ? "mock-agent" : provider).getCapabilities().models[0],
   });
   const orchestrator = new SitesOrchestrator(
     orchestrationAgent,

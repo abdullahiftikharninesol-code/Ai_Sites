@@ -18,6 +18,11 @@ export class InMemorySiteProjectRepository implements SiteProjectRepository {
   async getById(id: SiteId) {
     return this.#items.get(id);
   }
+  /** User-facing lookup: the project only resolves for its owner. */
+  async getOwnedById(id: SiteId, ownerId: string) {
+    const project = this.#items.get(id);
+    return project?.ownerId === ownerId ? project : undefined;
+  }
   async getBySlug(slug: string) {
     return [...this.#items.values()].find((item) => item.slug === slug);
   }
@@ -41,8 +46,11 @@ export class InMemorySiteProjectRepository implements SiteProjectRepository {
         updatedAt: new Date(),
       });
     else {
-      const { publishedVersionId: _version, publishedDeploymentId: _deployment, ...current } =
-        project;
+      const {
+        publishedVersionId: _version,
+        publishedDeploymentId: _deployment,
+        ...current
+      } = project;
       this.#items.set(siteId, { ...current, updatedAt: new Date() });
     }
   }
@@ -71,6 +79,17 @@ export class InMemorySiteJobRepository implements SiteJobRepository {
   }
   async save(job: SiteJob) {
     this.#items.set(job.id, structuredClone(job));
+  }
+  async claimBilling(id: JobId) {
+    const job = this.#items.get(id);
+    if (!job || job.billingStatus !== "NOT_CHARGED") return false;
+    this.#items.set(id, {
+      ...job,
+      billingStatus: "FAILED",
+      billingErrorCode: "BILLING_FINALIZATION_IN_PROGRESS",
+      updatedAt: new Date(),
+    });
+    return true;
   }
   async listBySite(siteId: SiteId) {
     return page([...this.#items.values()].filter((item) => item.siteId === siteId));

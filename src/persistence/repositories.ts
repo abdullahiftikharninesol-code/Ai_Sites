@@ -28,6 +28,8 @@ export interface SiteVersionRepository {
 export interface SiteJobRepository {
   getById(id: JobId): Promise<SiteJob | undefined>;
   save(job: SiteJob): Promise<void>;
+  /** Atomically moves a NOT_CHARGED job into a non-retryable billing claim. */
+  claimBilling(id: JobId): Promise<boolean>;
   listBySite(siteId: SiteId, cursor?: string): Promise<Page<SiteJob>>;
 }
 export interface SiteDeploymentRepository {

@@ -13,11 +13,7 @@ import type {
   SiteVersionRepository,
 } from "../repositories.js";
 import type { SiteVersionCommitter, UnnumberedSiteVersion } from "../version-committer.js";
-import type {
-  MongoModels,
-  MongoSiteJobRecord,
-  MongoSiteProjectRecord,
-} from "./mongo-models.js";
+import type { MongoModels, MongoSiteJobRecord, MongoSiteProjectRecord } from "./mongo-models.js";
 
 interface LegacyMongoCurrentFile {
   readonly path: string;
@@ -84,6 +80,12 @@ export class MongoSiteProjectRepository implements SiteProjectRepository {
 
   async getById(id: SiteId) {
     const record = await this.models.projects.findById(id).lean().exec();
+    return record ? projectFrom(record, this.state) : undefined;
+  }
+
+  /** User-facing lookup: the project only resolves for its owner. */
+  async getOwnedById(id: SiteId, ownerId: string) {
+    const record = await this.models.projects.findOne({ _id: id, ownerId }).lean().exec();
     return record ? projectFrom(record, this.state) : undefined;
   }
 
@@ -254,7 +256,7 @@ export class MongoSiteVersionCommitter implements SiteVersionCommitter {
       }
       const updated = await this.models.projects
         .findOneAndUpdate({ _id: project.id, versionNumber: current.versionNumber }, update, {
-          new: true,
+          returnDocument: "after",
         })
         .lean()
         .exec();
@@ -304,6 +306,7 @@ export class MongoSiteJobRepository implements SiteJobRepository {
         retries: job.retries,
         modelOutputReceived: job.modelOutputReceived,
         websiteGenerated: job.websiteGenerated,
+        billingStatus: job.billingStatus,
         updatedAt: job.updatedAt,
       };
       const unset: Record<string, 1> = {};
@@ -314,6 +317,13 @@ export class MongoSiteJobRepository implements SiteJobRepository {
         "outputTokens",
         "reasoningTokens",
         "totalTokens",
+        "billableInputTokens",
+        "billableOutputTokens",
+        "billableTokens",
+        "creditsPer500Tokens",
+        "creditsCharged",
+        "billingErrorCode",
+        "chargedAt",
         "errorCode",
         "errorMessage",
         "retryable",
@@ -338,6 +348,26 @@ export class MongoSiteJobRepository implements SiteJobRepository {
     }
   }
 
+  async claimBilling(id: JobId) {
+    try {
+      const result = await this.models.jobs
+        .updateOne(
+          { jobId: id, billingStatus: "NOT_CHARGED" },
+          {
+            $set: {
+              billingStatus: "FAILED",
+              billingErrorCode: "BILLING_FINALIZATION_IN_PROGRESS",
+              updatedAt: new Date(),
+            },
+          },
+        )
+        .exec();
+      return result.modifiedCount === 1;
+    } catch (cause) {
+      return writeError("Unable to claim site job billing", cause);
+    }
+  }
+
   async listBySite(siteId: SiteId) {
     const records = await this.models.jobs
       .find({ projectId: siteId })
@@ -348,10 +378,14 @@ export class MongoSiteJobRepository implements SiteJobRepository {
   }
 }
 
-export async function deleteMongoSite(models: MongoModels, siteId: SiteId): Promise<void> {
+export async function deleteMongoSite(
+  models: MongoModels,
+  siteId: SiteId,
+  ownerId: string,
+): Promise<void> {
   await Promise.all([
-    models.jobs.deleteMany({ projectId: siteId }).exec(),
-    models.projects.deleteOne({ _id: siteId }).exec(),
+    models.jobs.deleteMany({ projectId: siteId, ownerId }).exec(),
+    models.projects.deleteOne({ _id: siteId, ownerId }).exec(),
   ]);
 }
 
@@ -359,19 +393,16 @@ export async function migrateMongoProjectFilesToLocalArtifacts(
   models: MongoModels,
   artifacts: ArtifactStore,
 ): Promise<number> {
-  const cursor = models.projects.collection.find(
-    { currentFiles: { $exists: true } } as never,
-    {
-      projection: {
-        _id: 1,
-        currentFiles: 1,
-        sourceArtifactRef: 1,
-        sourceManifestRef: 1,
-        versionNumber: 1,
-        updatedAt: 1,
-      },
+  const cursor = models.projects.collection.find({ currentFiles: { $exists: true } } as never, {
+    projection: {
+      _id: 1,
+      currentFiles: 1,
+      sourceArtifactRef: 1,
+      sourceManifestRef: 1,
+      versionNumber: 1,
+      updatedAt: 1,
     },
-  );
+  });
   let migrated = 0;
   for await (const value of cursor) {
     const record = value as unknown as LegacyMongoSiteProjectRecord;
@@ -388,11 +419,10 @@ export async function migrateMongoProjectFilesToLocalArtifacts(
           kind: "SOURCE_ARCHIVE",
           contentType: "application/json",
         });
-        await artifacts.put(
-          sourceManifestRef,
-          Buffer.from(JSON.stringify(snapshot.manifest)),
-          { kind: "SOURCE_MANIFEST", contentType: "application/json" },
-        );
+        await artifacts.put(sourceManifestRef, Buffer.from(JSON.stringify(snapshot.manifest)), {
+          kind: "SOURCE_MANIFEST",
+          contentType: "application/json",
+        });
       }
       set.sourceArtifactRef = sourceArtifactRef;
       set.sourceManifestRef = sourceManifestRef;
@@ -418,9 +448,7 @@ const parseVersionId = (
   id: string,
 ): { readonly siteId: SiteId; readonly versionNumber: number } | undefined => {
   const match = /^(.*):v([1-9]\d*)$/.exec(id);
-  return match
-    ? { siteId: match[1] as SiteId, versionNumber: Number(match[2]) }
-    : undefined;
+  return match ? { siteId: match[1] as SiteId, versionNumber: Number(match[2]) } : undefined;
 };
 
 const jobFrom = (record: MongoSiteJobRecord): SiteJob => ({
@@ -437,10 +465,22 @@ const jobFrom = (record: MongoSiteJobRecord): SiteJob => ({
     ? { cachedInputTokens: record.cachedInputTokens }
     : {}),
   ...(record.outputTokens !== undefined ? { outputTokens: record.outputTokens } : {}),
-  ...(record.reasoningTokens !== undefined
-    ? { reasoningTokens: record.reasoningTokens }
-    : {}),
+  ...(record.reasoningTokens !== undefined ? { reasoningTokens: record.reasoningTokens } : {}),
   ...(record.totalTokens !== undefined ? { totalTokens: record.totalTokens } : {}),
+  ...(record.billableInputTokens !== undefined
+    ? { billableInputTokens: record.billableInputTokens }
+    : {}),
+  ...(record.billableOutputTokens !== undefined
+    ? { billableOutputTokens: record.billableOutputTokens }
+    : {}),
+  ...(record.billableTokens !== undefined ? { billableTokens: record.billableTokens } : {}),
+  ...(record.creditsPer500Tokens !== undefined
+    ? { creditsPer500Tokens: record.creditsPer500Tokens }
+    : {}),
+  ...(record.creditsCharged !== undefined ? { creditsCharged: record.creditsCharged } : {}),
+  billingStatus: record.billingStatus ?? "NOT_CHARGED",
+  ...(record.billingErrorCode !== undefined ? { billingErrorCode: record.billingErrorCode } : {}),
+  ...(record.chargedAt !== undefined ? { chargedAt: new Date(record.chargedAt) } : {}),
   logicalCalls: record.logicalCalls,
   physicalRequests: record.physicalRequests,
   retries: record.retries,
@@ -459,7 +499,10 @@ const readSnapshot = async (
 ): Promise<SiteSourceSnapshot> => {
   const data = await artifacts.get(artifactRef);
   if (!data)
-    throw new ApplicationError("ARTIFACT_NOT_FOUND", `Source artifact was not found: ${artifactRef}`);
+    throw new ApplicationError(
+      "ARTIFACT_NOT_FOUND",
+      `Source artifact was not found: ${artifactRef}`,
+    );
   try {
     const snapshot = JSON.parse(Buffer.from(data).toString("utf8")) as SiteSourceSnapshot;
     if (!snapshot?.manifest?.files || !snapshot.files)

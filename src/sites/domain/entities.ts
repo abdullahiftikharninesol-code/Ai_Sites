@@ -57,9 +57,9 @@ export interface SiteVersion {
   readonly runtimeSchemaVersion?: number;
   readonly createdAt: Date;
 }
-
 export type SiteJobOperation = "GENERATE" | "EDIT";
 export type SiteJobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
+export type SiteJobBillingStatus = "NOT_CHARGED" | "CHARGED" | "FAILED";
 
 export interface SiteJob {
   readonly id: JobId;
@@ -75,6 +75,14 @@ export interface SiteJob {
   readonly outputTokens?: number;
   readonly reasoningTokens?: number;
   readonly totalTokens?: number;
+  readonly billableInputTokens?: number;
+  readonly billableOutputTokens?: number;
+  readonly billableTokens?: number;
+  readonly creditsPer500Tokens?: number;
+  readonly creditsCharged?: number;
+  readonly billingStatus: SiteJobBillingStatus;
+  readonly billingErrorCode?: string;
+  readonly chargedAt?: Date;
   readonly logicalCalls: number;
   readonly physicalRequests: number;
   readonly retries: number;

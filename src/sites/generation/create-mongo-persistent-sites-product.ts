@@ -18,6 +18,19 @@ import {
   type MongoConnectionManager,
 } from "../../persistence/mongodb/mongo-connection.js";
 import { createMongoModels } from "../../persistence/mongodb/mongo-models.js";
+import { createMongoBillingModels } from "../../persistence/mongodb/mongo-billing-models.js";
+import {
+  MongoModelCreditRateRepository,
+  MongoSubscriberQuotaRepository,
+} from "../../persistence/mongodb/mongo-billing-repositories.js";
+import { SiteCreditBillingService } from "../../billing/credit-billing.js";
+import {
+  GetChatlyQuotaNotificationService,
+  readUserCreditQuotaPayload,
+} from "../../billing/getchatly-quota-notification.js";
+import { MongoGetChatlyQuotaUserRepository } from "../../auth/identity-repository.js";
+import { loadConfig } from "../../app/config/environment.js";
+import { SharedRedisConnection } from "../../redis/shared-redis.js";
 import {
   deleteMongoSite,
   migrateMongoProjectFilesToLocalArtifacts,
@@ -53,6 +66,25 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
   const projects = new MongoSiteProjectRepository(models, state);
   const versions = new MongoSiteVersionRepository(models, artifacts, state);
   const jobs = new MongoSiteJobRepository(models);
+  const billingModels = createMongoBillingModels(mongo.connection);
+  const quotas = new MongoSubscriberQuotaRepository(billingModels);
+  const appConfig = loadConfig();
+  const sharedRedis = new SharedRedisConnection({
+    ...(appConfig.redisUrl ? { url: appConfig.redisUrl } : {}),
+  });
+  const quotaUsers = new MongoGetChatlyQuotaUserRepository(mongo.connection);
+  const quotaNotifications = new GetChatlyQuotaNotificationService(
+    quotas,
+    quotaUsers,
+    sharedRedis,
+    appConfig.redisCacheEnvironment ?? "development",
+  );
+  const billing = new SiteCreditBillingService(
+    new MongoModelCreditRateRepository(billingModels),
+    quotas,
+    jobs,
+    quotaNotifications,
+  );
   const deployments = new InMemorySiteDeploymentRepository();
   const customDomains = new InMemoryCustomDomainRepository();
   const versionCommitter = new MongoSiteVersionCommitter(models, artifacts, state);
@@ -72,6 +104,7 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
     projects,
     versions,
     jobs,
+    billing,
     versionCommitter,
     runtimeProvider: siteRuntime,
   });
@@ -88,6 +121,8 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
 
   return {
     ...product,
+    // Concrete type so user-facing callers can use the owner-scoped lookup.
+    projects,
     database: mongo,
     deployments,
     deploymentService,
@@ -107,14 +142,16 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
     localDns,
     queries,
     artifacts,
+    readCanonicalQuota: (userId: string) =>
+      readUserCreditQuotaPayload(quotas, quotaUsers, userId),
     connectPersistence: async () => {
       await connectMongo(mongo);
       if (Number(mongo.connection.readyState) === 1)
         await migrateMongoProjectFilesToLocalArtifacts(models, artifacts);
     },
     databaseStatus: () => getMongoStatus(mongo),
-    deleteSite: async (siteId: SiteId) => {
-      await deleteMongoSite(models, siteId);
+    deleteSite: async (siteId: SiteId, ownerId: string) => {
+      await deleteMongoSite(models, siteId, ownerId);
       await artifacts.deletePrefix(`sites/${siteId}`);
     },
     close: async () => {
@@ -122,6 +159,7 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
       if (product.execution.getActiveEnvironmentCount() !== 0)
         throw new Error("Cannot close persistent Sites product with active resources");
       siteRuntime.close();
+      await sharedRedis.close();
       await disconnectMongo(mongo);
       closed = true;
     },

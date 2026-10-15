@@ -1,5 +1,7 @@
 export interface AppConfig {
   readonly nodeEnv: "development" | "test" | "production";
+  readonly redisUrl?: string;
+  readonly redisCacheEnvironment?: string;
   readonly defaultAgentProvider?: string;
   readonly defaultExecutionProvider?: string;
   readonly defaultHostingProvider?: string;
@@ -30,8 +32,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const maxAgentCalls = parseNum(env.SITES_MAX_AGENT_CALLS_PER_RUN);
   const maxRepairs = parseNum(env.SITES_MAX_REPAIR_ATTEMPTS);
   const maxTools = parseNum(env.SITES_MAX_TOOL_ITERATIONS);
+  const redisUrl = env.REDIS_URL?.trim();
   return {
     nodeEnv: nodeEnv as AppConfig["nodeEnv"],
+    ...(redisUrl ? { redisUrl } : {}),
+    redisCacheEnvironment: env.REDIS_CACHE_ENV || env.NODE_ENV || "development",
     ...(env.DEFAULT_AGENT_PROVIDER ? { defaultAgentProvider: env.DEFAULT_AGENT_PROVIDER } : {}),
     ...(executionProvider ? { defaultExecutionProvider: executionProvider } : {}),
     ...(env.DEFAULT_HOSTING_PROVIDER
@@ -47,7 +52,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ...(env.SITES_PLANNER_MODEL ? { plannerModel: env.SITES_PLANNER_MODEL.trim() } : {}),
     ...(env.SITES_PLANNER_PROVIDER ? { plannerProvider: env.SITES_PLANNER_PROVIDER.trim() } : {}),
     ...(env.SITES_GENERATOR_MODEL ? { generatorModel: env.SITES_GENERATOR_MODEL.trim() } : {}),
-    ...(env.SITES_GENERATOR_PROVIDER ? { generatorProvider: env.SITES_GENERATOR_PROVIDER.trim() } : {}),
+    ...(env.SITES_GENERATOR_PROVIDER
+      ? { generatorProvider: env.SITES_GENERATOR_PROVIDER.trim() }
+      : {}),
     ...(env.SITES_REPAIR_MODEL ? { repairModel: env.SITES_REPAIR_MODEL.trim() } : {}),
     ...(env.SITES_REPAIR_PROVIDER ? { repairProvider: env.SITES_REPAIR_PROVIDER.trim() } : {}),
   };

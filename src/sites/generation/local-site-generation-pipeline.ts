@@ -74,6 +74,10 @@ import { persistBrowserQAReport } from "../../browser-qa/browser-qa-persistence.
 import type { VisualQAReport } from "../../visual-qa/visual-qa-types.js";
 import type { VisualRepairAttempt, VisualReview } from "../../visual-review/visual-review-domain.js";
 import { deriveSiteName, resolveGeneratedSiteName } from "./site-name.js";
+import type {
+  BillingAuthorization,
+  SiteCreditBillingService,
+} from "../../billing/credit-billing.js";
 export interface GenerateWebsiteRequest {
   readonly userId: UserId;
   readonly prompt: string;
@@ -160,6 +164,8 @@ export interface LocalSiteGenerationPipelineDependencies {
   runtimeProvider?: SiteRuntimeProvider;
   assetResolver?: AdapterBackedAssetResolver;
   assetMediaStore?: MediaStore;
+  billing?: SiteCreditBillingService;
+  resolveAgentModel(provider: string): string | undefined;
 }
 export class LocalSiteGenerationPipeline {
   readonly #snapshots: SiteSourceSnapshotService;
@@ -195,6 +201,8 @@ export class LocalSiteGenerationPipeline {
       status: "QUEUED",
       stage: "QUEUED",
       provider: request.agentProvider,
+      billingStatus: "NOT_CHARGED",
+      creditsCharged: 0,
       logicalCalls: 0,
       physicalRequests: 0,
       retries: 0,
@@ -207,6 +215,10 @@ export class LocalSiteGenerationPipeline {
     try {
     await this.deps.jobs.save(job);
     this.#scope.validate(request.prompt);
+    const billingAuthorization = await this.#authorizeBilling(
+      request.userId,
+      request.agentProvider,
+    );
     const technicalProfile = this.deps.templates.resolveProfile(this.deps.template);
     if (request.technicalProfile && request.technicalProfile !== technicalProfile.id)
       throw new ApplicationError(
@@ -411,6 +423,12 @@ export class LocalSiteGenerationPipeline {
       job = this.#finalJob(job, runContext.getSummary(), true);
       await this.deps.jobs.save(job);
       jobFinalized = true;
+      if (billingAuthorization && this.deps.billing)
+        job = await this.deps.billing.finalizeSuccessfulJob(
+          job,
+          runContext.getSummary(),
+          billingAuthorization,
+        );
       this.#emit(job, "COMPLETED", 100, "Website Version 1 saved");
       return {
         siteId,
@@ -472,6 +490,8 @@ export class LocalSiteGenerationPipeline {
       status: "QUEUED",
       stage: "QUEUED",
       provider: request.agentProvider,
+      billingStatus: "NOT_CHARGED",
+      creditsCharged: 0,
       logicalCalls: 0,
       physicalRequests: 0,
       retries: 0,
@@ -493,6 +513,10 @@ export class LocalSiteGenerationPipeline {
       throw new ApplicationError("VERSION_NOT_FOUND", "Site version was not found");
     const parent = await this.deps.versions.getById(fromVersionId);
     if (!parent) throw new ApplicationError("VERSION_NOT_FOUND", "Site version was not found");
+    const billingAuthorization = await this.#authorizeBilling(
+      request.userId,
+      request.agentProvider,
+    );
     const parentAssets = parent.assetManifestArtifactRef
       ? await loadAssetManifest(this.deps.artifacts, parent.assetManifestArtifactRef)
       : undefined;
@@ -631,6 +655,12 @@ export class LocalSiteGenerationPipeline {
       job = this.#finalJob(job, runContext.getSummary(), true);
       await this.deps.jobs.save(job);
       jobFinalized = true;
+      if (billingAuthorization && this.deps.billing)
+        job = await this.deps.billing.finalizeSuccessfulJob(
+          job,
+          runContext.getSummary(),
+          billingAuthorization,
+        );
       retainEnvironment = request.retainPreview === true;
       return {
         siteId: request.siteId,
@@ -910,6 +940,20 @@ export class LocalSiteGenerationPipeline {
       previewMode: "PROVIDER_URL",
       createdAt: new Date(),
     };
+  }
+  async #authorizeBilling(
+    userId: UserId,
+    provider: string,
+  ): Promise<BillingAuthorization | undefined> {
+    if (!this.deps.billing || provider === "mock" || provider === "mock-agent") return undefined;
+    const model = this.deps.resolveAgentModel(provider);
+    if (!model)
+      throw new ApplicationError(
+        "MODEL_CREDIT_RATE_NOT_FOUND",
+        `The selected Sites provider '${provider}' did not expose a model`,
+        { metadata: { provider, model: null } },
+      );
+    return this.deps.billing.preflight({ userId, provider, model });
   }
   #finalJob(
     job: SiteJob,

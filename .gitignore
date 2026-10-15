@@ -16,4 +16,9 @@ artifacts/prompt-evals/
 .DS_Store
 tests/*
 !tests/sites-premerge-hardening.test.ts
+!tests/sites-authentication.test.ts
+!tests/sites-credit-billing.test.ts
+!tests/sites-generation-reliability.test.ts
+!tests/sites-redis-quota-sync.test.ts
+!tests/sites-job-credit-sync.test.ts
 docs/
