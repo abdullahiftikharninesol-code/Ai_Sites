@@ -1,0 +1,15 @@
+{
+  "templateKey": "publisher-fixture",
+  "version": 1,
+  "name": "Publisher Fixture",
+  "description": "Tiny React and Vite fixture for template publisher verification.",
+  "categoryKey": "saas",
+  "tags": ["saas", "fixture"],
+  "status": "draft",
+  "routes": [
+    {
+      "path": "/",
+      "label": "Home"
+    }
+  ]
+}

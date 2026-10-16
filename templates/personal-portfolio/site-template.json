@@ -1,0 +1,15 @@
+{
+  "templateKey": "personal-portfolio",
+  "version": 1,
+  "name": "Personal Portfolio",
+  "description": "A refined personal portfolio template for designers, developers, creatives and independent professionals.",
+  "categoryKey": "portfolio",
+  "tags": ["portfolio", "personal", "designer", "creative", "case-studies", "professional", "multi-page"],
+  "status": "draft",
+  "routes": [
+    { "path": "/", "label": "Home" },
+    { "path": "/work", "label": "Work" },
+    { "path": "/about", "label": "About" },
+    { "path": "/contact", "label": "Contact" }
+  ]
+}

@@ -2,6 +2,7 @@ export interface AppConfig {
   readonly nodeEnv: "development" | "test" | "production";
   readonly redisUrl?: string;
   readonly redisCacheEnvironment?: string;
+  readonly templateGcsBucket?: string;
   readonly defaultAgentProvider?: string;
   readonly defaultExecutionProvider?: string;
   readonly defaultHostingProvider?: string;
@@ -37,6 +38,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     nodeEnv: nodeEnv as AppConfig["nodeEnv"],
     ...(redisUrl ? { redisUrl } : {}),
     redisCacheEnvironment: env.REDIS_CACHE_ENV || env.NODE_ENV || "development",
+    ...(env.SITES_TEMPLATE_GCS_BUCKET?.trim()
+      ? { templateGcsBucket: env.SITES_TEMPLATE_GCS_BUCKET.trim() }
+      : {}),
     ...(env.DEFAULT_AGENT_PROVIDER ? { defaultAgentProvider: env.DEFAULT_AGENT_PROVIDER } : {}),
     ...(executionProvider ? { defaultExecutionProvider: executionProvider } : {}),
     ...(env.DEFAULT_HOSTING_PROVIDER

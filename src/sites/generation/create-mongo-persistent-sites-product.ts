@@ -31,6 +31,16 @@ import {
 import { MongoGetChatlyQuotaUserRepository } from "../../auth/identity-repository.js";
 import { loadConfig } from "../../app/config/environment.js";
 import { SharedRedisConnection } from "../../redis/shared-redis.js";
+import { TemplateCatalogService } from "../../templates/application/template-catalog-service.js";
+import { TemplateInstantiationService } from "../../templates/application/template-instantiation-service.js";
+import { TemplateCatalogCache } from "../../templates/cache/template-catalog-cache.js";
+import { createMongoTemplateModels } from "../../templates/persistence/mongo-template-models.js";
+import {
+  MongoSiteCategoryRepository,
+  MongoSiteTemplateRepository,
+} from "../../templates/persistence/mongo-template-repositories.js";
+import { GoogleCloudTemplateArtifactStorage } from "../../templates/publishing/google-cloud-template-artifact-storage.js";
+import { ApplicationError } from "../../app/errors/application-error.js";
 import {
   deleteMongoSite,
   migrateMongoProjectFilesToLocalArtifacts,
@@ -72,6 +82,31 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
   const sharedRedis = new SharedRedisConnection({
     ...(appConfig.redisUrl ? { url: appConfig.redisUrl } : {}),
   });
+  const templateModels = createMongoTemplateModels(mongo.connection);
+  const templateRepositories = {
+    templates: new MongoSiteTemplateRepository(templateModels),
+    categories: new MongoSiteCategoryRepository(templateModels),
+  };
+  const templateCatalogCache = new TemplateCatalogCache(
+    sharedRedis,
+    appConfig.redisCacheEnvironment ?? "development",
+  );
+  const templateCatalog = new TemplateCatalogService(
+    templateRepositories.templates,
+    templateRepositories.categories,
+    templateCatalogCache,
+    appConfig.templateGcsBucket ?? "",
+  );
+  const templateSource = appConfig.templateGcsBucket
+    ? new GoogleCloudTemplateArtifactStorage(appConfig.templateGcsBucket)
+    : {
+        readObject: async () => {
+          throw new ApplicationError(
+            "PROVIDER_CONFIGURATION_ERROR",
+            "SITES_TEMPLATE_GCS_BUCKET is required to instantiate templates",
+          );
+        },
+      };
   const quotaUsers = new MongoGetChatlyQuotaUserRepository(mongo.connection);
   const quotaNotifications = new GetChatlyQuotaNotificationService(
     quotas,
@@ -108,6 +143,19 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
     versionCommitter,
     runtimeProvider: siteRuntime,
   });
+  const templateInstantiation = new TemplateInstantiationService({
+    templates: templateRepositories.templates,
+    source: templateSource,
+    execution: product.execution,
+    artifacts,
+    projects,
+    versions: versionCommitter,
+    browserQA: product.browserQA,
+    cleanupSite: async (siteId, ownerId) => {
+      await deleteMongoSite(models, siteId, ownerId);
+      await artifacts.deletePrefix(`sites/${siteId}`);
+    },
+  });
   const queries = new SiteQueries(projects, versions);
   const deploymentService = new DeploymentService(
     product.pipeline,
@@ -142,8 +190,11 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
     localDns,
     queries,
     artifacts,
-    readCanonicalQuota: (userId: string) =>
-      readUserCreditQuotaPayload(quotas, quotaUsers, userId),
+    templateCatalog,
+    templateCatalogCache,
+    templateRepositories,
+    templateInstantiation,
+    readCanonicalQuota: (userId: string) => readUserCreditQuotaPayload(quotas, quotaUsers, userId),
     connectPersistence: async () => {
       await connectMongo(mongo);
       if (Number(mongo.connection.readyState) === 1)

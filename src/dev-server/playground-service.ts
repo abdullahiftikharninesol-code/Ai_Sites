@@ -14,6 +14,7 @@ import { ArtifactMediaStore } from "../sites/assets/media-store.js";
 import { ingestUserImage, userAssetsManifest, type UserProvidedAsset } from "../sites/assets/user-asset-ingestion.js";
 import { MongoIdentityRepository, type IdentityRepository } from "../auth/identity-repository.js";
 import { resolveTerminalJobBillingFields } from "./job-billing-result.js";
+import type { TemplateCatalogQuery } from "../templates/http/template-catalog-query.js";
 
 export interface PlaygroundConfig {
   host: string;
@@ -153,6 +154,48 @@ export class PlaygroundService {
   }
   databaseStatus() {
     return this.product.databaseStatus();
+  }
+  listActiveTemplates(query: TemplateCatalogQuery) {
+    return this.product.templateCatalog.listActiveTemplates(query);
+  }
+  getActiveTemplate(templateKey: string, version?: number) {
+    return this.product.templateCatalog.getActiveTemplate(templateKey, version);
+  }
+  async instantiateTemplate(
+    ownerId: string,
+    templateKey: string,
+    version?: number,
+    projectName?: string,
+  ) {
+    const owner = this.#owner(ownerId) as UserId;
+    const result = await this.product.templateInstantiation.instantiate({
+      ownerId: owner,
+      templateKey,
+      ...(version === undefined ? {} : { version }),
+      ...(projectName === undefined ? {} : { projectName }),
+    });
+    try {
+      const preview = await this.previews.adopt(
+        result.projectId,
+        result.versionId,
+        result.environmentId,
+        result.preview,
+      );
+      return {
+        projectId: result.projectId,
+        versionId: result.versionId,
+        preview: { sessionId: preview.id, url: preview.url },
+      };
+    } catch (cause) {
+      await Promise.allSettled([
+        this.product.execution.destroyEnvironment(result.environmentId),
+        this.product.deleteSite(result.projectId, owner),
+      ]);
+      throw cause;
+    }
+  }
+  listActiveTemplateCategories() {
+    return this.product.templateCatalog.listActiveCategories();
   }
   async ingestImage(
     ownerId: string,

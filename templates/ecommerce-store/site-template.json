@@ -1,0 +1,16 @@
+{
+  "templateKey": "ecommerce-store",
+  "version": 1,
+  "name": "Ecommerce Store",
+  "description": "A modern ecommerce storefront template for lifestyle and direct-to-consumer brands.",
+  "categoryKey": "ecommerce",
+  "tags": ["ecommerce", "store", "retail", "shop", "product", "lifestyle", "multi-page"],
+  "status": "draft",
+  "routes": [
+    { "path": "/", "label": "Home" },
+    { "path": "/shop", "label": "Shop" },
+    { "path": "/product", "label": "Product" },
+    { "path": "/about", "label": "About" },
+    { "path": "/contact", "label": "Contact" }
+  ]
+}

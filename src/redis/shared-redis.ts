@@ -28,6 +28,9 @@ export interface RedisCommandClient {
   readonly isOpen: boolean;
   connect(): Promise<unknown>;
   del(keys: string[]): Promise<number>;
+  get?(key: string): Promise<string | null>;
+  set?(key: string, value: string, options: { EX: number }): Promise<unknown>;
+  incr?(key: string): Promise<number>;
   publish(channel: string, message: string | Buffer): Promise<number>;
   close(): Promise<void>;
   on(event: "error", listener: () => void): unknown;
@@ -73,6 +76,28 @@ export class SharedRedisConnection implements GetChatlyRedisGateway {
     const client = await this.#connectedClient();
     if (!client) return { attempted: false, deletedKeys: 0 };
     return { attempted: true, deletedKeys: await client.del([...keys]) };
+  }
+
+  async getString(key: string): Promise<string | undefined> {
+    const client = await this.#connectedClient();
+    if (!client) return undefined;
+    if (!client.get) throw new Error("The shared Redis client does not support GET");
+    return (await client.get(key)) ?? undefined;
+  }
+
+  async setString(key: string, value: string, ttlSeconds: number): Promise<boolean> {
+    const client = await this.#connectedClient();
+    if (!client) return false;
+    if (!client.set) throw new Error("The shared Redis client does not support SET");
+    await client.set(key, value, { EX: ttlSeconds });
+    return true;
+  }
+
+  async increment(key: string): Promise<number | undefined> {
+    const client = await this.#connectedClient();
+    if (!client) return undefined;
+    if (!client.incr) throw new Error("The shared Redis client does not support INCR");
+    return client.incr(key);
   }
 
   async emit(

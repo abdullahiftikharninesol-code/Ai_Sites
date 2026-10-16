@@ -1,0 +1,16 @@
+{
+  "templateKey": "modern-saas",
+  "version": 1,
+  "name": "Modern SaaS",
+  "description": "A polished multi-page SaaS website template for software and AI products.",
+  "categoryKey": "saas",
+  "tags": ["saas", "software", "ai", "modern", "professional", "multi-page"],
+  "status": "draft",
+  "routes": [
+    { "path": "/", "label": "Home" },
+    { "path": "/features", "label": "Features" },
+    { "path": "/pricing", "label": "Pricing" },
+    { "path": "/about", "label": "About" },
+    { "path": "/contact", "label": "Contact" }
+  ]
+}

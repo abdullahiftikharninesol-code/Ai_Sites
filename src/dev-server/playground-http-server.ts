@@ -15,6 +15,11 @@ import {
 import { ownerIdOf } from "../auth/owner-id.js";
 import { sendResponse } from "../auth/send-response.js";
 import { requireSitesSubscription } from "../auth/sites-subscription.js";
+import {
+  parseTemplateCatalogQuery,
+  parseTemplateVersion,
+  validateTemplateKey,
+} from "../templates/http/template-catalog-query.js";
 
 export function normalizePlaygroundPrompt(value: unknown): string {
   if (typeof value !== "string" || value.trim().length < 3 || value.length > 20_000)
@@ -75,6 +80,12 @@ const safeError = (error: unknown) => {
     "USER_ASSET_NOT_FOUND",
     "USER_ASSET_NOT_REFERENCED",
     "SUBSCRIPTION_REQUIRED",
+    "TEMPLATE_NOT_FOUND",
+    "TEMPLATE_SOURCE_INTEGRITY_FAILED",
+    "TEMPLATE_INSTANTIATION_BUILD_FAILED",
+    "TEMPLATE_INSTANTIATION_QA_FAILED",
+    "UNSAFE_TEMPLATE_SOURCE",
+    "MANIFEST_INVALID",
   ]);
   const code =
     typeof value.code === "string" && allowed.has(value.code) ? value.code : "DEV_REQUEST_FAILED";
@@ -193,6 +204,56 @@ export class PlaygroundHttpServer {
       // fields in the body, query or headers are never read.
       const ownerId = await this.#authenticate(req, res);
       if (!ownerId) return;
+      if (method === "GET" && path === "/api/site-templates")
+        return this.#json(
+          res,
+          200,
+          await this.service.listActiveTemplates(parseTemplateCatalogQuery(url.searchParams)),
+        );
+      if (method === "GET" && path === "/api/site-categories")
+        return this.#json(res, 200, await this.service.listActiveTemplateCategories());
+      const templateMatch = /^\/api\/site-templates\/([^/]+)$/.exec(path);
+      if (method === "GET" && templateMatch)
+        return this.#json(
+          res,
+          200,
+          await this.service.getActiveTemplate(
+            validateTemplateKey(decodeRouteParam(templateMatch[1]!)),
+            parseTemplateVersion(url.searchParams),
+          ),
+        );
+      const templateInstantiationMatch =
+        /^\/api\/site-templates\/([^/]+)\/instantiate$/.exec(path);
+      if (method === "POST" && templateInstantiationMatch) {
+        const body = await readJson(req);
+        const version = body.version;
+        if (
+          version !== undefined &&
+          (!Number.isSafeInteger(version) || Number(version) < 1)
+        )
+          throw Object.assign(new Error("version must be a positive integer"), {
+            code: "INVALID_REQUEST",
+          });
+        if (
+          body.projectName !== undefined &&
+          (typeof body.projectName !== "string" ||
+            !body.projectName.trim() ||
+            body.projectName.length > 60)
+        )
+          throw Object.assign(new Error("projectName must contain 1 to 60 characters"), {
+            code: "INVALID_REQUEST",
+          });
+        return this.#json(
+          res,
+          201,
+          await this.service.instantiateTemplate(
+            ownerId,
+            validateTemplateKey(decodeRouteParam(templateInstantiationMatch[1]!)),
+            version as number | undefined,
+            body.projectName as string | undefined,
+          ),
+        );
+      }
       if (method === "POST" && path === "/api/dev/persistence/sites") {
         const body = await readJson(req);
         if (typeof body.name !== "string")
@@ -342,7 +403,8 @@ export class PlaygroundHttpServer {
           normalized.code === "VERSION_NOT_FOUND" ||
           normalized.code === "DEPLOYMENT_NOT_FOUND" ||
           normalized.code === "SOURCE_NOT_FOUND" ||
-          normalized.code === "SOURCE_FILE_NOT_FOUND"
+          normalized.code === "SOURCE_FILE_NOT_FOUND" ||
+          normalized.code === "TEMPLATE_NOT_FOUND"
           ? 404
           : normalized.code === "SUBSCRIPTION_REQUIRED"
             ? 402

@@ -1,0 +1,16 @@
+{
+  "templateKey": "creative-agency",
+  "version": 1,
+  "name": "Creative Agency",
+  "description": "A premium multi-page website template for creative, branding and digital agencies.",
+  "categoryKey": "agency",
+  "tags": ["agency", "creative", "branding", "design", "portfolio", "professional", "multi-page"],
+  "status": "draft",
+  "routes": [
+    { "path": "/", "label": "Home" },
+    { "path": "/work", "label": "Work" },
+    { "path": "/services", "label": "Services" },
+    { "path": "/about", "label": "About" },
+    { "path": "/contact", "label": "Contact" }
+  ]
+}
