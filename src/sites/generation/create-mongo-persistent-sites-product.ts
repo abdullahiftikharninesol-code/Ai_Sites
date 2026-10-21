@@ -100,12 +100,11 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
   const templateSource = appConfig.templateGcsBucket
     ? new GoogleCloudTemplateArtifactStorage(appConfig.templateGcsBucket)
     : {
-        readObject: async () => {
-          throw new ApplicationError(
+        readObject: () =>
+          Promise.reject(new ApplicationError(
             "PROVIDER_CONFIGURATION_ERROR",
             "SITES_TEMPLATE_GCS_BUCKET is required to instantiate templates",
-          );
-        },
+          )),
       };
   const quotaUsers = new MongoGetChatlyQuotaUserRepository(mongo.connection);
   const quotaNotifications = new GetChatlyQuotaNotificationService(

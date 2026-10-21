@@ -250,7 +250,7 @@ export class PlaygroundHttpServer {
             ownerId,
             validateTemplateKey(decodeRouteParam(templateInstantiationMatch[1]!)),
             version as number | undefined,
-            body.projectName as string | undefined,
+            body.projectName,
           ),
         );
       }
@@ -359,26 +359,12 @@ export class PlaygroundHttpServer {
             decodeRouteParam(match[2]!),
           ),
         );
-      match = /^\/api\/dev\/sites\/([^/]+)\/rollback$/.exec(path);
-      if (method === "POST" && match) {
-        const body = await readJson(req);
-        if (typeof body.deploymentId !== "string")
-          throw Object.assign(new Error("deploymentId is required"), { code: "INVALID_REQUEST" });
-        return this.#json(
-          res,
-          200,
-          await this.service.rollback(ownerId, match[1]!, body.deploymentId),
-        );
-      }
       match = /^\/api\/dev\/sites\/([^/]+)\/unpublish$/.exec(path);
       if (method === "POST" && match)
         return this.#json(res, 200, await this.service.unpublish(ownerId, match[1]!));
       match = /^\/api\/dev\/sites\/([^/]+)\/runtime$/.exec(path);
       if (method === "GET" && match)
         return this.#json(res, 200, await this.service.runtimeInspector(ownerId, match[1]!));
-      match = /^\/api\/dev\/sites\/([^/]+)\/versions$/.exec(path);
-      if (method === "GET" && match)
-        return this.#json(res, 200, { versions: await this.service.versions(ownerId, match[1]!) });
       match = /^\/api\/dev\/sites\/([^/]+)$/.exec(path);
       if (method === "PATCH" && match) {
         const body = await readJson(req);
@@ -448,7 +434,7 @@ export class PlaygroundHttpServer {
       throw Object.assign(new Error("attachments must not contain duplicates"), {
         code: "INVALID_REQUEST",
       });
-    return value;
+    return value.map(String);
   }
   #headers(req: IncomingMessage, res: ServerResponse) {
     res.setHeader("X-Content-Type-Options", "nosniff");

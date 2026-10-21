@@ -7,6 +7,7 @@ import type {
 } from "../agent-types.js";
 import { isApprovedAgentTool } from "../tool-catalog.js";
 import { projectOpenAISchema } from "../../sites/domain/site-plan-schema.js";
+import { openAIPromptCacheKey } from "./prompt-cache-key.js";
 
 export interface OpenAIFunctionTool {
   readonly type: "function";
@@ -141,7 +142,9 @@ export function mapAgentRequest(
     tools: (request.tools ?? []).map(mapToolDefinition),
     store: false,
     parallel_tool_calls: true,
-    ...(request.promptCacheKey ? { prompt_cache_key: request.promptCacheKey } : {}),
+    ...(request.promptCacheKey
+      ? { prompt_cache_key: openAIPromptCacheKey(request.promptCacheKey) }
+      : {}),
     ...(request.maxOutputTokens ? { max_output_tokens: request.maxOutputTokens } : {}),
     ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
     ...(request.responseContract?.type === "JSON_SCHEMA"

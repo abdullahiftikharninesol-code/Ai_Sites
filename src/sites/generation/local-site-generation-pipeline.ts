@@ -66,7 +66,7 @@ import { analyzeRequestProfile, type RequestProfile } from "./request-profile.js
 import { logSiteTokenUsage } from "./site-token-usage-log.js";
 import { createAssetIntent } from "../assets/asset-domain.js";
 import type { BrowserQAReport } from "../../browser-qa/browser-qa-domain.js";
-import { BrowserQARunner } from "../../browser-qa/browser-qa-runner.js";
+import type { BrowserQARunner } from "../../browser-qa/browser-qa-runner.js";
 import { browserQACoreCheckExecutors } from "../../browser-qa/browser-qa-core-checks.js";
 import { browserQAResponsiveAndInteractionChecks } from "../../browser-qa/browser-qa-interaction-checks.js";
 import { browserQARuntimeChecks } from "../../browser-qa/browser-qa-runtime-checks.js";
@@ -330,7 +330,7 @@ export class LocalSiteGenerationPipeline {
       );
       codeGenerationSession = session;
       await validateRequiredUserAssetReferences(this.deps.execution, environment.id, assetManifest);
-      let intelligenceTelemetry = [
+      const intelligenceTelemetry = [
         ...(sitePlanResult ? sitePlanResult.telemetry : []),
         this.#sessionTelemetry("CODE_GENERATION", session, "PASS"),
         ...(session.buildRepairInvoked ? [this.#sessionTelemetry("BUILD_REPAIR", session, "PASS")] : []),
@@ -338,7 +338,7 @@ export class LocalSiteGenerationPipeline {
       request.onIntelligence?.(intelligenceTelemetry);
       codeGenerationReported = true;
       await this.#projectValidator.validate(this.deps.execution, environment.id);
-      let previewResult = this.deps.execution.getLatestPreview(environment.id);
+      const previewResult = this.deps.execution.getLatestPreview(environment.id);
       if (!previewResult?.url)
         throw new ApplicationError("PREVIEW_FAILED", "Generation produced no ready preview");
       await this.#functional.validate(
@@ -346,7 +346,7 @@ export class LocalSiteGenerationPipeline {
         request.agentProvider === "mock" ? "AI Sites Generated Hero" : undefined,
       );
       const versionId = randomUUID() as VersionId;
-      let browserQARun = await this.#runBrowserQA(
+      const browserQARun = await this.#runBrowserQA(
         request.browserQAEnabled,
         siteId,
         versionId,
@@ -503,8 +503,9 @@ export class LocalSiteGenerationPipeline {
     let jobFinalized = false;
     try {
     await this.deps.jobs.save(job);
-    // Normal edits have one authoritative Targeted Edit request. Intent and
-    // edit-planning agents are historical compatibility surfaces only.
+    // Normal edits have one authoritative Targeted Edit request. A single
+    // second invocation of that same role is permitted only for deterministic
+    // mandatory-requirement repair; intent/planning agents stay retired.
     const project = await this.deps.projects.getById(request.siteId);
     if (!project || project.ownerId !== request.userId)
       throw new ApplicationError("VERSION_NOT_FOUND", "Site project was not found");
@@ -562,15 +563,18 @@ export class LocalSiteGenerationPipeline {
         },
         request.signal,
         runContext,
+        async () => {
+          await this.#authorizeBilling(request.userId, request.agentProvider);
+        },
       );
       await validateRequiredUserAssetReferences(this.deps.execution, environment.id, request.assetManifest);
-      let intelligenceTelemetry = [
+      const intelligenceTelemetry = [
         this.#sessionTelemetry("TARGETED_EDIT", session, "PASS"),
         ...(session.buildRepairInvoked ? [this.#sessionTelemetry("BUILD_REPAIR", session, "PASS")] : []),
       ];
       request.onIntelligence?.(intelligenceTelemetry);
       await this.#projectValidator.validate(this.deps.execution, environment.id);
-      let previewResult = this.deps.execution.getLatestPreview(environment.id);
+      const previewResult = this.deps.execution.getLatestPreview(environment.id);
       if (!previewResult?.url)
         throw new ApplicationError("PREVIEW_FAILED", "Edit produced no ready preview");
       await this.#functional.validate(
@@ -579,7 +583,7 @@ export class LocalSiteGenerationPipeline {
       );
       const versionNumber = parent.versionNumber + 1;
       const newVersionId = randomUUID() as VersionId;
-      let browserQARun = await this.#runBrowserQA(
+      const browserQARun = await this.#runBrowserQA(
         request.browserQAEnabled,
         request.siteId,
         newVersionId,

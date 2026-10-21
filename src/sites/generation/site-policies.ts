@@ -119,9 +119,15 @@ export class SitePackageValidator {
 }
 export class GeneratedProjectValidator {
   async validate(execution: LocalExecutionProvider, environmentId: string): Promise<void> {
-    for (const path of ["package.json", "index.html", "src/main.tsx"])
+    for (const path of ["package.json", "index.html"])
       if (!(await execution.fileExists(environmentId, path)))
         throw new ApplicationError("VALIDATION_FAILED", `Generated project is missing ${path}`);
+    const entrypoints = ["src/main.tsx", "src/main.ts", "src/main.jsx", "src/main.js"];
+    if (!(await Promise.all(entrypoints.map((path) => execution.fileExists(environmentId, path)))).some(Boolean))
+      throw new ApplicationError(
+        "VALIDATION_FAILED",
+        "Generated project is missing a supported src/main entrypoint",
+      );
     const files = await execution.listFiles(environmentId, "src");
     if (
       !files.some(

@@ -62,8 +62,7 @@ export function validateSiteEditPatchBundle(value: unknown): SiteEditPatchBundle
     if (!item || typeof item !== "object") throw new ApplicationError("VALIDATION_FAILED", "Invalid site edit patch");
     const patch = item as { path?: unknown; find?: unknown; replace?: unknown; mode?: unknown };
     if (typeof patch.path !== "string" || typeof patch.find !== "string" || !patch.find ||
-      typeof patch.replace !== "string" || !safePath(patch.path) || !editableSourcePath(patch.path) ||
-      isManagedSitePath(patch.path))
+      typeof patch.replace !== "string" || !isEditableSiteEditPath(patch.path))
       throw new ApplicationError("MANAGED_FILE_MODIFICATION", `Site edit patch contains a disallowed path: ${String(patch.path)}`);
     if (patch.mode !== undefined && patch.mode !== "unique" && patch.mode !== "all")
       throw new ApplicationError("VALIDATION_FAILED", `Site edit patch mode must be "unique" or "all": ${String(patch.mode)}`);
@@ -79,14 +78,36 @@ export async function applySiteEditPatchBundle(
   bundle: SiteEditPatchBundle,
 ): Promise<readonly string[]> {
   const changed: string[] = [];
+  // Every find is written against the source the model was shown, but patches
+  // apply in order. A later find overlapping text an earlier patch to the same
+  // file already rewrote (a brand rename inside the hero being rewritten) is
+  // rebased by applying those earlier patches to the find text itself, then
+  // matched exactly again under the same uniqueness rules.
+  const shown = new Map<string, string>();
+  const applied: SiteEditPatch[] = [];
   for (const patch of bundle.patches) {
     const source = await execution.readFile(environmentId, patch.path);
-    const matches = countOccurrences(source, patch.find);
+    if (!shown.has(patch.path)) shown.set(patch.path, source);
+    let find = patch.find;
+    let matches = countOccurrences(source, find);
+    const shownMatches = countOccurrences(shown.get(patch.path)!, patch.find);
+    if (matches === 0 && (patch.mode === "all" ? shownMatches > 0 : shownMatches === 1)) {
+      find = applied
+        .filter((earlier) => earlier.path === patch.path)
+        .reduce((text, earlier) => rewriteFindText(text, earlier), patch.find);
+      matches = find === patch.find ? 0 : countOccurrences(source, find);
+    }
     if (matches === 0)
       throw new ApplicationError(
         "VALIDATION_FAILED",
         `Edit find text was not found in ${patch.path}. It must match the file byte-for-byte.`,
-        { metadata: { path: patch.path, mode: patch.mode, matches: 0 } },
+        { metadata: {
+          path: patch.path,
+          mode: patch.mode,
+          matches: 0,
+          matchesInShownSource: shownMatches,
+          diagnostics: `Rejected find text: ${JSON.stringify(patch.find.slice(0, 1_500))}`,
+        } },
       );
     // Ambiguity stays an error rather than a guess: picking an occurrence would
     // silently edit the wrong place.
@@ -96,15 +117,22 @@ export async function applySiteEditPatchBundle(
         `Edit find text matched ${matches} times in ${patch.path}; a unique patch needs more surrounding source context as an anchor, or mode "all" when every occurrence is meant.`,
         { metadata: { path: patch.path, mode: patch.mode, matches } },
       );
-    const first = source.indexOf(patch.find);
+    const first = source.indexOf(find);
     const next =
       patch.mode === "all"
-        ? source.split(patch.find).join(patch.replace)
-        : source.slice(0, first) + patch.replace + source.slice(first + patch.find.length);
+        ? source.split(find).join(patch.replace)
+        : source.slice(0, first) + patch.replace + source.slice(first + find.length);
     await execution.writeFile(environmentId, patch.path, next);
     changed.push(patch.path);
+    applied.push(patch);
   }
   return Object.freeze(changed);
+}
+
+/** Applies one earlier patch to a later find text with the same exact-match semantics. */
+function rewriteFindText(text: string, earlier: SiteEditPatch): string {
+  if (earlier.mode === "all") return text.split(earlier.find).join(earlier.replace);
+  return countOccurrences(text, earlier.find) === 1 ? text.replace(earlier.find, () => earlier.replace) : text;
 }
 
 export const BUILD_REPAIR_PATCH_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unknown>> = Object.freeze({
@@ -219,6 +247,12 @@ export function isManagedSitePath(path: string): boolean {
 
 function editableSourcePath(path: string): boolean {
   return /^src\/.+\.(?:tsx?|jsx?|css|svg|json)$/i.test(path) || /^public\/.+\.(?:png|jpe?g|gif|webp|avif|svg)$/i.test(path);
+}
+
+/** Only targeted patches may edit root HTML; generation/repair keep their managed boundary. */
+export function isEditableSiteEditPath(path: string): boolean {
+  return path === "index.html" ||
+    (safePath(path) && editableSourcePath(path) && !isManagedSitePath(path));
 }
 
 export function validateSiteCoderFileBundle(value: unknown, requirements?: GenerationCompletionRequirements): SiteCoderFileBundle {

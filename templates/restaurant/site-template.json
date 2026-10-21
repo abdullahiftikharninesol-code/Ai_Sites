@@ -1,11 +1,11 @@
 {
   "templateKey": "restaurant",
-  "version": 1,
+  "version": 2,
   "name": "Restaurant",
   "description": "An elegant restaurant website template with menu, story and reservation presentation.",
   "categoryKey": "restaurant",
   "tags": ["restaurant", "hospitality", "dining", "menu", "reservations", "local", "multi-page"],
-  "status": "draft",
+  "status": "active",
   "routes": [
     { "path": "/", "label": "Home" },
     { "path": "/menu", "label": "Menu" },

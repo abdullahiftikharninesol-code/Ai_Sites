@@ -32,8 +32,8 @@ interface PublicationState {
 
 /** Runtime-only state that deliberately does not expand the MongoDB schema. */
 export class MongoRuntimeState {
-  readonly versions = new Map<SiteId, SiteVersion>();
   readonly publications = new Map<SiteId, PublicationState>();
+  readonly versions = new Map<SiteId, SiteVersion>();
 }
 
 const writeError = (message: string, cause: unknown): never => {
@@ -148,6 +148,7 @@ export class MongoSiteProjectRepository implements SiteProjectRepository {
   }
 }
 
+/** Adapts version-shaped internal contracts to the one current project snapshot. */
 export class MongoSiteVersionRepository implements SiteVersionRepository {
   constructor(
     private readonly models: MongoModels,
@@ -156,66 +157,38 @@ export class MongoSiteVersionRepository implements SiteVersionRepository {
   ) {}
 
   async getById(id: VersionId) {
-    for (const version of this.state.versions.values())
-      if (version.id === id) return cloneVersion(version);
     const parsed = parseVersionId(id);
     if (!parsed) return undefined;
     const record = await this.models.projects.findById(parsed.siteId).lean().exec();
-    if (!record || record.versionNumber !== parsed.versionNumber || record.versionNumber < 1)
+    if (!record || record.versionNumber < 1 || record.versionNumber !== parsed.versionNumber)
       return undefined;
-    await this.#assertSnapshotExists(record);
-    return versionFrom(record);
+    return this.#current(record);
   }
 
   async save(version: SiteVersion) {
-    const record = await this.models.projects.findById(version.siteId).lean().exec();
-    if (!record) throw new ApplicationError("SITE_NOT_FOUND", "Site project was not found");
-    const snapshot = await readSnapshot(this.artifacts, version.sourceArtifactRef);
-    const sourceManifestRef = await ensureLocalManifest(
-      this.artifacts,
-      version.sourceArtifactRef,
-      version.sourceManifestRef,
-      snapshot,
+    const project = await new MongoSiteProjectRepository(this.models).getById(version.siteId);
+    if (!project) throw new ApplicationError("SITE_NOT_FOUND", "Site project was not found");
+    await new MongoSiteVersionCommitter(this.models, this.artifacts, this.state).commit(
+      project, version, version.versionNumber,
     );
-    const now = new Date();
-    const result = await this.models.projects
-      .updateOne(
-        { _id: version.siteId, versionNumber: record.versionNumber },
-        {
-          $set: {
-            sourceArtifactRef: version.sourceArtifactRef,
-            sourceManifestRef,
-            status: "ACTIVE",
-            versionNumber: version.versionNumber,
-            lastOperation: record.versionNumber === 0 ? "GENERATE" : "EDIT",
-            updatedAt: now,
-          },
-        },
-      )
-      .exec();
-    if (!result.matchedCount)
-      throw new ApplicationError(
-        "PERSISTENCE_TRANSACTION_FAILED",
-        "Current site changed while saving the generated result",
-      );
-    this.state.versions.set(version.siteId, {
-      ...cloneVersion(version),
-      id: versionIdFor(version.siteId, version.versionNumber),
-      sourceManifestRef,
-    });
   }
 
   async listBySite(siteId: SiteId) {
-    const cached = this.state.versions.get(siteId);
-    if (cached) return { items: [cloneVersion(cached)] };
     const record = await this.models.projects.findById(siteId).lean().exec();
     if (!record || record.versionNumber < 1) return { items: [] };
-    await this.#assertSnapshotExists(record);
-    return { items: [versionFrom(record)] };
+    return { items: [await this.#current(record)] };
   }
 
-  async #assertSnapshotExists(record: MongoSiteProjectRecord): Promise<void> {
-    await readSnapshot(this.artifacts, sourceArtifactRefFrom(record));
+  async #current(record: MongoSiteProjectRecord): Promise<SiteVersion> {
+    const snapshot = await readSnapshot(this.artifacts, sourceArtifactRefFrom(record));
+    const cached = this.state.versions.get(record._id as SiteId);
+    if (cached?.id === versionIdFor(record._id, record.versionNumber)) return cloneVersion(cached);
+    return {
+      ...versionFrom(record),
+      technicalProfileId: snapshot.manifest.technicalProfileId,
+      templateId: snapshot.manifest.templateId,
+      templateVersion: snapshot.manifest.templateVersion,
+    };
   }
 }
 
@@ -226,27 +199,42 @@ export class MongoSiteVersionCommitter implements SiteVersionCommitter {
     private readonly state = new MongoRuntimeState(),
   ) {}
 
-  async commit(project: SiteProject, draft: UnnumberedSiteVersion): Promise<SiteVersion> {
+  async commit(
+    project: SiteProject,
+    draft: UnnumberedSiteVersion,
+    expectedNumber?: number,
+  ): Promise<SiteVersion> {
     try {
-      const current = await this.models.projects.findById(project.id).lean().exec();
-      if (!current) throw new ApplicationError("SITE_NOT_FOUND", "Site project was not found");
+      if (draft.siteId !== project.id)
+        throw new ApplicationError("VERSION_NOT_FOUND", "Version does not belong to this project");
+      if (draft.buildStatus !== "SUCCEEDED" || draft.browserQAStatus === "FAILED")
+        throw new ApplicationError("VALIDATION_FAILED", "Only successful candidates can be committed");
       const snapshot = await readSnapshot(this.artifacts, draft.sourceArtifactRef);
       const sourceManifestRef = await ensureLocalManifest(
-        this.artifacts,
-        draft.sourceArtifactRef,
-        draft.sourceManifestRef,
-        snapshot,
+        this.artifacts, draft.sourceArtifactRef, draft.sourceManifestRef, snapshot,
       );
+      const current = await this.models.projects.findById(project.id).lean().exec();
+      if (!current || current.ownerId !== project.ownerId)
+        throw new ApplicationError("SITE_NOT_FOUND", "Site project was not found");
       const versionNumber = current.versionNumber + 1;
+      if (
+        (expectedNumber !== undefined && expectedNumber !== versionNumber) ||
+        project.latestVersionId !== (
+          current.versionNumber > 0 ? versionIdFor(project.id, current.versionNumber) : undefined
+        )
+      )
+        throw new ApplicationError(
+          "PERSISTENCE_TRANSACTION_FAILED",
+          "Current site changed while saving the generated result",
+        );
       const operation = current.versionNumber === 0 ? "GENERATE" : "EDIT";
-      const now = new Date();
       const set: Record<string, unknown> = {
         sourceArtifactRef: draft.sourceArtifactRef,
         sourceManifestRef,
         status: "ACTIVE",
         versionNumber,
         lastOperation: operation,
-        updatedAt: now,
+        updatedAt: new Date(),
       };
       const update: Record<string, unknown> = { $set: set };
       if (operation === "EDIT") set.lastEditPrompt = project.lastEditPrompt ?? "";
@@ -254,31 +242,27 @@ export class MongoSiteVersionCommitter implements SiteVersionCommitter {
         set.name = project.name;
         update.$unset = { lastEditPrompt: 1 };
       }
-      const updated = await this.models.projects
-        .findOneAndUpdate({ _id: project.id, versionNumber: current.versionNumber }, update, {
-          returnDocument: "after",
-        })
-        .lean()
-        .exec();
+      // Publish the validated candidate with one document-level compare-and-swap.
+      // Never read/write/backfill historical records or initialize their indexes.
+      const updated = await this.models.projects.findOneAndUpdate(
+        { _id: project.id, ownerId: project.ownerId, versionNumber: current.versionNumber },
+        update,
+        { returnDocument: "after" },
+      ).lean().exec();
       if (!updated)
         throw new ApplicationError(
           "PERSISTENCE_TRANSACTION_FAILED",
           "Current site changed while saving the generated result",
         );
       const version: SiteVersion = {
-        ...draft,
-        id: versionIdFor(project.id, versionNumber),
-        versionNumber,
-        sourceManifestRef,
+        ...draft, id: versionIdFor(project.id, versionNumber), versionNumber, sourceManifestRef,
       };
       this.state.versions.set(project.id, cloneVersion(version));
       return version;
     } catch (cause) {
       if (cause instanceof ApplicationError) throw cause;
       throw new ApplicationError(
-        "PERSISTENCE_TRANSACTION_FAILED",
-        "Unable to atomically replace current site state",
-        { cause },
+        "PERSISTENCE_TRANSACTION_FAILED", "Unable to atomically replace current site state", { cause },
       );
     }
   }
@@ -443,6 +427,7 @@ const cloneVersion = (version: SiteVersion): SiteVersion => ({
   ...structuredClone(version),
   createdAt: new Date(version.createdAt),
 });
+
 
 const parseVersionId = (
   id: string,

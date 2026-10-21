@@ -20,6 +20,9 @@ import {
   isBroadFunctionalEdit,
   broadFunctionalEditChangesStyle,
   BASELINE_STYLESHEET,
+  designTokenExcerpt,
+  patchableStyleExcerpt,
+  selectEditRepairContext,
   type EditContextFile,
 } from "./edit-context-selection.js";
 
@@ -72,7 +75,9 @@ import {
   applySiteEditPatchBundle,
   validateSiteEditPatchBundle,
   type SiteCoderFileBundle,
+  type SiteEditPatchBundle,
 } from "./site-coder-file-bundle.js";
+import type { AssetManifest } from "../../sites/assets/asset-domain.js";
 import {
   assertStructuredResponseComplete,
   parseStructuredResponse,
@@ -80,6 +85,21 @@ import {
 import { SITES_UI_REGISTRY } from "../../sites/generation/sites-ui-registry.js";
 import { buildCapabilityAwareGenerationContext } from "./capability-aware-generation-context.js";
 import { validateReferenceInteractions } from "./reference-interaction-validator.js";
+import {
+  parseEditRequirements,
+  containsRenameLiteral,
+  readEditRequirementFiles,
+  validateEditRequirements,
+  suppliedEditRequirementContext,
+  mandatoryEditRequirements,
+  editPlanCoverageDiagnostics,
+  editRequirementDiagnostics,
+  type EditRequirementContext,
+  type EditRequirementDiagnostic,
+  type EditRequirementName,
+  type EditRequirements,
+} from "./edit-requirements.js";
+import { isEditableSiteEditPath } from "./site-coder-file-bundle.js";
 import {
   getDefaultProfile,
   getProfile,
@@ -110,6 +130,8 @@ export type CliAgentProgressListener = (
   message: string,
 ) => void;
 
+export type TargetedEditRepairPreflight = () => Promise<void>;
+
 const generatedDocumentTitle = (bundle: SiteCoderFileBundle): string | undefined => {
   for (const file of bundle.files) {
     const assignment = /document\.title\s*=\s*["'`]([^"'`\r\n]{1,60})["'`]/u.exec(file.content);
@@ -119,6 +141,98 @@ const generatedDocumentTitle = (bundle: SiteCoderFileBundle): string | undefined
   }
   return undefined;
 };
+
+function mergeRequirementDiagnostics(
+  ...groups: readonly (readonly EditRequirementDiagnostic[])[]
+): readonly EditRequirementDiagnostic[] {
+  const merged = new Map<EditRequirementName, EditRequirementDiagnostic>();
+  for (const group of groups)
+    for (const diagnostic of group) merged.set(diagnostic.requirement, diagnostic);
+  return Object.freeze([...merged.values()]);
+}
+
+function requirementsForRepair(
+  requirements: EditRequirements,
+  missing: readonly EditRequirementName[],
+): EditRequirements {
+  return {
+    ...(missing.includes("rename") && requirements.rename ? { rename: requirements.rename } : {}),
+    style: missing.includes("style"),
+  };
+}
+
+function relevantRepairInstruction(
+  instruction: string,
+  requirements: EditRequirements,
+  missing: readonly EditRequirementName[],
+): string {
+  const lines: string[] = [];
+  if (missing.includes("rename") && requirements.rename)
+    lines.push(`Rename ${JSON.stringify(requirements.rename.oldLiteral)} to ${JSON.stringify(requirements.rename.newLiteral)}.`);
+  if (missing.includes("style")) {
+    const fragments = instruction
+      .split(/[.!?;\n]+|\s+\band\b\s+/i)
+      .map((part) => part.trim())
+      .filter((part) => /\b(colou?rs?|accent|palette|theme|visual\s+styl(?:e|ing)|styl(?:e|es|ing))\b/i.test(part));
+    lines.push(fragments.length ? `${fragments.join(". ")}.` : "Apply the requested style change.");
+  }
+  return lines.join("\n");
+}
+
+function finalRequirementFailure(
+  diagnostics: readonly EditRequirementDiagnostic[],
+  attempts: number,
+  lastFailureStage: "PLAN" | "COMPLETION" | "REPAIR_CONTEXT" | "REPAIR_RESPONSE",
+  repairPaths: readonly string[] = [],
+): ApplicationError {
+  const first = diagnostics[0];
+  const remainingFiles = [...new Set([
+    ...diagnostics.flatMap((diagnostic) => {
+      const value = diagnostic.metadata.remainingFiles;
+      return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+    }),
+    ...repairPaths,
+  ])].sort();
+  return new ApplicationError(
+    "EDIT_REQUIREMENT_INCOMPLETE",
+    first?.message ?? "The targeted edit did not satisfy all mandatory requirements",
+    {
+      metadata: {
+        ...(first?.metadata ?? {}),
+        attempts,
+        missingRequirements: diagnostics.map(({ requirement }) => requirement),
+        ...(remainingFiles.length ? { remainingFiles } : {}),
+        lastFailureStage,
+      },
+    },
+  );
+}
+
+function finalRepairAttemptError(
+  cause: ApplicationError,
+  diagnostics: readonly EditRequirementDiagnostic[],
+  repairPaths: readonly string[],
+): ApplicationError {
+  if (cause.metadata?.attempts === 2) return cause;
+  const remainingFiles = [...new Set([
+    ...diagnostics.flatMap((diagnostic) => {
+      const value = diagnostic.metadata.remainingFiles;
+      return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+    }),
+    ...repairPaths,
+  ])].sort();
+  return new ApplicationError(cause.code, cause.message, {
+    retryable: false,
+    cause,
+    metadata: {
+      ...(cause.metadata ?? {}),
+      attempts: 2,
+      missingRequirements: diagnostics.map(({ requirement }) => requirement),
+      ...(remainingFiles.length ? { remainingFiles } : {}),
+      lastFailureStage: "REPAIR_RESPONSE",
+    },
+  });
+}
 
 export class LocalCliAgentRuntime {
   constructor(
@@ -132,6 +246,7 @@ export class LocalCliAgentRuntime {
     task: CliTask,
     externalSignal?: AbortSignal,
     runContext?: InferenceRunContext,
+    repairPreflight?: TargetedEditRepairPreflight,
   ): Promise<CliAgentSessionReport> {
     const deadline = AbortSignal.timeout(task.limits?.timeoutMs ?? 600_000);
     const signal = externalSignal ? AbortSignal.any([externalSignal, deadline]) : deadline;
@@ -147,6 +262,10 @@ export class LocalCliAgentRuntime {
     const registryId = providerId === "mock" ? "mock-agent" : providerId;
     const capabilities = this.providers.get(registryId).getCapabilities();
     const operation = task.operation === "EDIT_SITE" ? "EDIT_SITE" : "GENERATE_SITE";
+    const editRequirements = parseEditRequirements(task.userRequest);
+    const requirementSource = operation === "EDIT_SITE" && (editRequirements.rename || editRequirements.style)
+      ? await readEditRequirementFiles(this.execution, environmentId)
+      : undefined;
     const broadFunctionalEdit = operation === "EDIT_SITE" && isBroadFunctionalEdit(task.userRequest);
     const generationStage: InferenceStage =
       task.stage ?? (operation === "EDIT_SITE" ? "TARGETED_EDIT" : "GENERATE_SITE");
@@ -333,6 +452,7 @@ export class LocalCliAgentRuntime {
     let rejectedGenerationAttempts = 0;
     let directUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
     let directModel = capabilities.models[0] ?? "unknown";
+    let requirementRepairRequestSize: ReturnType<typeof measureRequestSize> | undefined;
     this.progress?.("GENERATING", operation === "EDIT_SITE" ? "Applying bounded edit patch" : "Generating bounded source file bundle");
     if (boundedStructuredOperation) {
       const responseContract = operation === "EDIT_SITE" && !broadFunctionalEdit ? {
@@ -360,7 +480,7 @@ export class LocalCliAgentRuntime {
           ? "Make the existing visible navigation and controls genuinely interactive using React state and local browser storage where appropriate. Provide working view changes, search/filtering, menus, dialogs and form actions that fit the existing UI; do not claim a remote backend exists. Keep the original JSX shell, className values, sections, and visual treatment. For functionality-only edits, never rewrite an existing stylesheet; add and import a new CSS file only if new controls need styles. Do not modify Sites-managed files or dependency manifests."
           : operation === "EDIT_SITE"
           ? [
-              "Only patch the requested editable source file; never modify package manifests, configuration, lockfiles, or Sites-managed files.",
+              "Patch requested editable source files and root index.html branding only; never modify package manifests, configuration, lockfiles, or other Sites-managed files.",
               "Every 'find' must match the file byte-for-byte, including whitespace and JSX entities such as &amp;.",
               'With mode "unique" the find text must occur exactly once in that file, so anchor it: include the surrounding attribute, tag or line rather than a bare word. `Menu` alone will match many times; `<a href="#menu">Menu</a>` identifies one place.',
               'Use mode "all" only when the change genuinely applies to every exact occurrence in that file, such as renaming a brand that appears several times.',
@@ -399,6 +519,8 @@ export class LocalCliAgentRuntime {
         content: [
           stableLead,
           context.slice(discovered.stableChars),
+          operation === "EDIT_SITE" && discovered.editRequirementContext
+            ? mandatoryEditRequirements(editRequirements, discovered.editRequirementContext) : "",
           operation === "GENERATE_SITE" && completionRequirements ? `Required pages/views: ${completionRequirements.requiredPages.join(", ")}\nRequired sections/features: ${completionRequirements.requiredSections.join(", ")}. Implement these semantically using appropriate React routes, state, tabs, views, or components. Legacy data-sites-page and data-sites-section attributes are optional and are not required.` : "",
           // A targeted edit works from current source, not from the original brief.
           projectedSiteSpec && operation === "GENERATE_SITE"
@@ -427,7 +549,7 @@ export class LocalCliAgentRuntime {
         response,
         operation === "EDIT_SITE" ? "Targeted edit" : "Site coder",
       );
-      let parsed = parseStructuredResponse<SiteCoderFileBundle | import("./site-coder-file-bundle.js").SiteEditPatchBundle>({
+      let parsed = parseStructuredResponse<SiteCoderFileBundle | SiteEditPatchBundle>({
         content: response.message.content,
         contract: responseContract,
         capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
@@ -476,8 +598,15 @@ export class LocalCliAgentRuntime {
           validateReferenceInteractions(parsed);
         }
       }
+      const initialPlanDiagnostics = operation === "EDIT_SITE" && discovered.editRequirementContext
+        ? editPlanCoverageDiagnostics(
+            editRequirements,
+            discovered.editRequirementContext,
+            "patches" in parsed ? parsed.patches : parsed.files,
+          )
+        : [];
       if (operation === "EDIT_SITE" && !broadFunctionalEdit) {
-        await applySiteEditPatchBundle(this.execution, environmentId, parsed as import("./site-coder-file-bundle.js").SiteEditPatchBundle);
+        await applySiteEditPatchBundle(this.execution, environmentId, parsed as SiteEditPatchBundle);
       } else {
         const submittedBundle = parsed as SiteCoderFileBundle;
         const generatedBundle = broadFunctionalEdit && !broadFunctionalEditChangesStyle(task.userRequest)
@@ -488,6 +617,156 @@ export class LocalCliAgentRuntime {
         bundle = generatedBundle;
         await materializeSiteCoderFileBundle(this.execution, environmentId, generatedBundle);
       }
+      if (operation === "EDIT_SITE" && requirementSource) {
+        const candidate = await readEditRequirementFiles(this.execution, environmentId);
+        const missingDiagnostics = mergeRequirementDiagnostics(
+          initialPlanDiagnostics,
+          editRequirementDiagnostics(editRequirements, requirementSource, candidate),
+        );
+        if (missingDiagnostics.length) {
+          const missingRequirements = missingDiagnostics.map(({ requirement }) => requirement);
+          const repairSelection = selectEditRepairContext(
+            editRequirements,
+            missingRequirements,
+            candidate,
+            discovered.editRequirementContext ?? { renamePaths: [], stylePaths: [] },
+            task.limits?.maxFileBytes !== undefined
+              ? { maxFileBytes: task.limits.maxFileBytes }
+              : {},
+          );
+          if (!repairSelection.files.length)
+            throw finalRequirementFailure(missingDiagnostics, 1, "REPAIR_CONTEXT");
+
+          // The edit-level billing/quota guard is checked again immediately
+          // before the sole automatic repair. The scoped provider then reserves
+          // the second logical/physical request from the same inference budget.
+          await repairPreflight?.();
+          const repairRequirements = requirementsForRepair(editRequirements, missingRequirements);
+          const repairInstruction = relevantRepairInstruction(
+            task.userRequest,
+            editRequirements,
+            missingRequirements,
+          );
+          const repairMessage = [
+            "TARGETED EDIT REQUIREMENT REPAIR: attempt 2 of 2. No further repair call is allowed.",
+            "Return exactly one JSON object matching the SiteEditPatchBundle schema. Do not call tools.",
+            `MISSING MANDATORY REQUIREMENTS:\n${missingRequirements.map((item) => item.toUpperCase()).join("\n")}`,
+            repairInstruction ? `Relevant user instruction:\n${repairInstruction}` : "",
+            mandatoryEditRequirements(repairRequirements, repairSelection.requirementContext),
+            "Operate against the current uncommitted candidate source below. Return only additional exact edit operations needed for the missing requirements. Do not repeat completed edits unless technically necessary. Every find must match byte-for-byte; do not use fuzzy matching or regenerate whole files.",
+            `Current candidate source for repair:\n${repairSelection.text}`,
+          ].filter(Boolean).join("\n\n");
+          const repairOutputAllowance = Math.min(requestedOutputAllowance, 4_096);
+          const repairEstimatedInput = estimateTokensConservative([
+            runtimePrompt.prompt.systemPrompt,
+            JSON.stringify(stagePolicy.tools),
+            repairMessage,
+          ].join("\n"));
+          const repairRemainingBudget =
+            effectiveContext.budget.limits.maxTotalTokens - effectiveContext.budget.usage.totalTokens;
+          const repairBudget = evaluatePreflightBudget({
+            stage: "TARGETED_EDIT",
+            conservativeEstimatedInputTokens: repairEstimatedInput,
+            requestedOutputAllowance: repairOutputAllowance,
+            minSafeOutputTokens: minSafeOutput,
+            reasoningAllowanceTokens: reasoningAllowance,
+            safetyMarginTokens: safetyMargin,
+            remainingBudgetTokens: repairRemainingBudget,
+          });
+          if (!repairBudget.ok) {
+            effectiveContext.budget.markExhausted("TOTAL_TOKEN_LIMIT");
+            throw new ApplicationError(
+              "AGENT_RUN_BUDGET_EXCEEDED",
+              `Inference preflight budget check failed for TARGETED_EDIT repair: ${repairBudget.reason}`,
+              { metadata: {
+                stage: "TARGETED_EDIT",
+                attempt: 2,
+                remainingTokens: repairRemainingBudget,
+                requiredTokens: repairBudget.requiredTokens,
+                minSafeOutput,
+                reason: repairBudget.reason,
+              } },
+            );
+          }
+          requirementRepairRequestSize = measureRequestSize({
+            stage: "TARGETED_EDIT",
+            systemInstructions: runtimePrompt.prompt.systemPrompt,
+            toolSchemas: JSON.stringify(stagePolicy.tools),
+            workspaceContext: repairSelection.text,
+            messages: [{ role: "user", content: repairMessage }],
+            requestedMaxOutputTokens: repairOutputAllowance,
+            reasoningPolicy: stagePolicy.reasoningPolicy,
+            remainingRunBudgetTokens: repairRemainingBudget,
+          });
+          this.progress?.("GENERATING", "Repairing incomplete mandatory edit requirements (2/2)");
+          try {
+            generationAttempts = 2;
+            const repairResponse = await gatewayProvider.createResponse({
+              model: capabilities.models[0] ?? "unknown",
+              systemInstructions: runtimePrompt.prompt.systemPrompt,
+              promptCacheKey: `sites:${task.siteId}:${operation}:requirement-repair`,
+              messages: [{ role: "user", content: repairMessage }],
+              maxOutputTokens: repairOutputAllowance,
+              reasoningPolicy: stagePolicy.reasoningPolicy,
+              responseContract: {
+                type: "JSON_SCHEMA" as const,
+                name: "SiteEditPatchBundle",
+                schema: SITE_EDIT_PATCH_BUNDLE_JSON_SCHEMA,
+                strict: true,
+              },
+              ...(signal ? { signal } : {}),
+            });
+            responses.push(repairResponse);
+            assertStructuredResponseComplete(repairResponse, "Targeted edit requirement repair");
+            const repairBundle = parseStructuredResponse({
+              content: repairResponse.message.content,
+              contract: {
+                type: "JSON_SCHEMA" as const,
+                name: "SiteEditPatchBundle",
+                schema: SITE_EDIT_PATCH_BUNDLE_JSON_SCHEMA,
+                strict: true,
+              },
+              capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
+              validate: validateSiteEditPatchBundle,
+              errorContext: "Targeted edit requirement repair",
+            }).value;
+            const repairPlanDiagnostics = editPlanCoverageDiagnostics(
+              repairRequirements,
+              repairSelection.requirementContext,
+              repairBundle.patches,
+            );
+            if (repairPlanDiagnostics.length)
+              throw finalRequirementFailure(
+                mergeRequirementDiagnostics(repairPlanDiagnostics, missingDiagnostics),
+                2,
+                "PLAN",
+                repairSelection.files.map(({ path }) => path),
+              );
+            await applySiteEditPatchBundle(this.execution, environmentId, repairBundle);
+            const finalCandidate = await readEditRequirementFiles(this.execution, environmentId);
+            const finalDiagnostics = editRequirementDiagnostics(
+              editRequirements,
+              requirementSource,
+              finalCandidate,
+            );
+            if (finalDiagnostics.length)
+              throw finalRequirementFailure(
+                finalDiagnostics,
+                2,
+                "COMPLETION",
+                repairSelection.files.map(({ path }) => path),
+              );
+          } catch (cause) {
+            if (cause instanceof ApplicationError)
+              throw finalRepairAttemptError(
+                cause,
+                missingDiagnostics,
+                repairSelection.files.map(({ path }) => path),
+              );
+            throw cause;
+          }
+        }
+      }
       directUsage = responses.reduce((usage, item) => ({
         inputTokens: usage.inputTokens + item.usage.inputTokens,
         cachedInputTokens: usage.cachedInputTokens + (item.usage.cachedInputTokens ?? 0),
@@ -495,6 +774,8 @@ export class LocalCliAgentRuntime {
       }), { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
       directModel = response.model;
     }
+    if (requirementSource)
+      validateEditRequirements(editRequirements, requirementSource, await readEditRequirementFiles(this.execution, environmentId));
     let autofixResult = await applyDeterministicAutofix(this.execution, environmentId);
     if (completionRequirements && operation === "GENERATE_SITE") {
       const completion = await validateSiteCoderBundleCompletion(
@@ -681,6 +962,8 @@ export class LocalCliAgentRuntime {
       )
         files.push(entry.path);
     }
+    if (requirementSource)
+      validateEditRequirements(editRequirements, requirementSource, await readEditRequirementFiles(this.execution, environmentId));
     const metrics = this.execution.getUsageMetrics(environmentId);
     const preview = this.execution.getLatestPreview(environmentId);
     const commandDelta = metrics.commandsExecuted - startingMetrics.commandsExecuted;
@@ -724,6 +1007,9 @@ export class LocalCliAgentRuntime {
         tokensUsed: effectiveContext.budget.usage.totalTokens,
         tokenBudget: effectiveContext.budget.limits.maxTotalTokens,
         requestSize: requestSizeTelemetry,
+        ...(requirementRepairRequestSize
+          ? { requirementRepair: { attempts: 2, requestSize: requirementRepairRequestSize } }
+          : {}),
       },
       ...(generationCompletion ? { generationCompletion } : {}),
       generationMode: operation === "EDIT_SITE" ? "TARGETED_EDIT" : "FAST_GENERATION",
@@ -746,8 +1032,8 @@ export class LocalCliAgentRuntime {
     profile: GeneratedAppProfile = getDefaultProfile(),
     resolvedCapabilities?: ResolvedCapabilities,
     dependencyManifest?: ResolvedDependencyManifest,
-    assetManifest?: import("../../sites/assets/asset-domain.js").AssetManifest,
-  ): Promise<{ readonly text: string; readonly stableChars: number }> {
+    assetManifest?: AssetManifest,
+  ): Promise<{ readonly text: string; readonly stableChars: number; readonly editRequirementContext?: EditRequirementContext }> {
     if (operation === "GENERATE_SITE") {
       const contractLines = [
         buildCapabilityAwareGenerationContext({
@@ -818,20 +1104,36 @@ export class LocalCliAgentRuntime {
     const maxFiles = task.limits?.maxContextFiles ?? 8;
     const maxBytes = task.limits?.maxContextBytes ?? 64_000;
     const maxFile = task.limits?.maxFileBytes ?? 16_000;
+    const rename = parseEditRequirements(task.userRequest).rename;
     // A targeted edit may only patch editable application source, so managed
     // scaffold files are cost without capability. Of what remains, only the files
     // the instruction actually implicates are worth sending; the rest are named in
     // a manifest so the model still knows the shape of the project.
-    const editableEntries = (await this.execution.listFiles(environmentId))
+    const contextEntries = (await this.execution.listFiles(environmentId))
       .filter((item) => item.type === "FILE")
-      .filter((item) => isEditableContextPath(item.path.replaceAll("\\", "/"), profile))
-      .filter((item) => (item.sizeBytes ?? 0) <= maxFile);
+      .filter((item) => {
+        const path = item.path.replaceAll("\\", "/");
+        return isEditableContextPath(path, profile) ||
+          (rename && /^public\/.+\.svg$/i.test(path) && isEditableSiteEditPath(path));
+      });
+    const editableEntries = contextEntries.filter((item) => (item.sizeBytes ?? 0) <= maxFile);
+    // A stylesheet too large to send whole still owns the tokens a colour or
+    // theme edit must change; on style intent only its :root blocks are sent.
+    const oversizedStylesheets = contextEntries.filter(
+      (item) => (item.sizeBytes ?? 0) > maxFile && item.path.endsWith(".css"),
+    );
     const editableFiles: EditContextFile[] = [];
     for (const entry of editableEntries)
       editableFiles.push({
         path: entry.path.replaceAll("\\", "/"),
         content: await this.execution.readFile(environmentId, entry.path),
       });
+    // A rename must expose every exact match, even in a file above the usual per-file budget.
+    if (rename) for (const entry of contextEntries.filter((item) => (item.sizeBytes ?? 0) > maxFile)) {
+      const content = await this.execution.readFile(environmentId, entry.path);
+      if (containsRenameLiteral(content, rename.oldLiteral))
+        editableFiles.push({ path: entry.path.replaceAll("\\", "/"), content });
+    }
 
     // Sorted so the prefix is byte-stable between edits, and so a file changed by
     // one edit only invalidates the cache from its own position onward.
@@ -851,7 +1153,7 @@ export class LocalCliAgentRuntime {
     const variableFiles = cacheable
       ? selection.styleIntent && baseline
         ? [baseline]
-        : []
+        : rename && baseline && containsRenameLiteral(baseline.content, rename.oldLiteral) ? [baseline] : []
       : selection.selected;
 
     const chunk = (file: EditContextFile) => `--- ${file.path}\n${file.content}`;
@@ -859,32 +1161,53 @@ export class LocalCliAgentRuntime {
     const withinBudget = (files: readonly EditContextFile[]) =>
       files.filter((file) => {
         const size = Buffer.byteLength(file.content);
-        if (bytes + size > maxBytes) return false;
+        if (bytes + size > maxBytes && !(rename && containsRenameLiteral(file.content, rename.oldLiteral))) return false;
         bytes += size;
         return true;
       });
     const stableSent = withinBudget(stableFiles);
     const variableSent = withinBudget(variableFiles);
+    const tokenExcerpts: EditContextFile[] = [];
+    if (selection.styleIntent)
+      for (const entry of oversizedStylesheets) {
+        if ([...stableSent, ...variableSent].some((file) => file.path === entry.path.replaceAll("\\", "/"))) continue;
+        const excerpt = designTokenExcerpt(await this.execution.readFile(environmentId, entry.path));
+        if (excerpt) tokenExcerpts.push({ path: entry.path.replaceAll("\\", "/"), content: excerpt });
+      }
+    const excerptSent = withinBudget(tokenExcerpts);
 
     const stable = [
-      `Sites-managed and off-limits (not shown): ${profile.files.managed.join(", ")}`,
+      `Sites-managed and off-limits (not shown): ${profile.files.managed.filter((path) => path !== "index.html").join(", ")}`,
       `Editable project files: ${sorted.map((file) => file.path).join(", ")}`,
       // Without the stylesheet itself, the model still needs to know the tokens exist.
       ...(baseline ? [summarizeDesignSystem(baseline.content)] : []),
       broadFunctionalEdit
         ? "Full source follows. Return complete contents only for editable files shown below that need functional changes; preserve their visual design."
-        : "Full source follows. Patch only files shown in full below.",
+        : "Patch only supplied source, including exact patchable excerpts; do not invent files.",
       ...stableSent.map(chunk),
     ].join("\n\n");
-    const variable = variableSent.map(chunk).join("\n\n");
+    const variable = [...variableSent.map(chunk), ...excerptSent.map(patchableStyleExcerpt)].join("\n\n");
 
     // The separator is always part of the prefix, present or not: a boundary that
     // moves by two characters when the tail is empty makes the prefix differ
     // between edits and defeats the cache entirely.
     const context = `${stable}\n\n${variable}`;
     const included = [...stableSent, ...variableSent].map((file) => file.path);
-    this.#logEditContext(task, context, included, sorted.length - included.length, cacheable);
-    return { text: context, stableChars: stable.length + 2 };
+    this.#logEditContext(
+      task,
+      context,
+      [...included, ...excerptSent.map((file) => `${file.path} (design tokens)`)],
+      sorted.length - included.length,
+      cacheable,
+    );
+    return {
+      text: context,
+      stableChars: stable.length + 2,
+      editRequirementContext: suppliedEditRequirementContext(
+        parseEditRequirements(task.userRequest),
+        [...stableSent, ...variableSent, ...excerptSent],
+      ),
+    };
   }
   /**
    * Development visibility into what a targeted edit actually costs. Composition
@@ -955,7 +1278,8 @@ export class LocalCliAgentRuntime {
 
 /** Editable application source: under src/ and not claimed by the profile's managed set. */
 export function isEditableContextPath(path: string, profile: GeneratedAppProfile): boolean {
-  if (!path.startsWith("src/")) return false;
+  if (path === "index.html") return true;
+  if (!path.startsWith("src/") || !isEditableSiteEditPath(path)) return false;
   return !profile.files.managed.some((pattern) =>
     pattern.endsWith("/**") ? path.startsWith(pattern.slice(0, -2)) : path === pattern,
   );

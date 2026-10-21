@@ -281,12 +281,6 @@ export class PlaygroundApiClient {
       { method: "POST" },
     );
   }
-  rollback(siteId: string, deploymentId: string) {
-    return this.#request<SiteDetail>(`/api/dev/sites/${encodeURIComponent(siteId)}/rollback`, {
-      method: "POST",
-      body: JSON.stringify({ deploymentId }),
-    });
-  }
   unpublish(siteId: string) {
     return this.#request<{ unpublished: boolean }>(`/api/dev/sites/${encodeURIComponent(siteId)}/unpublish`, {
       method: "POST",

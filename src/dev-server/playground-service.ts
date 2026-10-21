@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { createMongoPersistentSitesProduct } from "../sites/generation/create-mongo-persistent-sites-product.js";
-import type { DeploymentId, JobId, SiteId, UserId, VersionId } from "../shared/types.js";
+import type { SiteId, UserId, VersionId } from "../shared/types.js";
 import { DevJobManager } from "./dev-job-manager.js";
 import { DevelopmentPreviewManager } from "./development-preview-manager.js";
 import { createAgentProviderRegistry } from "../agents/registry/create-agent-provider-registry.js";
@@ -240,7 +240,7 @@ export class PlaygroundService {
         port: result.preview.port,
       });
       const billing = await resolveTerminalJobBillingFields({
-        jobId: result.jobId as JobId,
+        jobId: result.jobId,
         ownerId: owner,
         jobs: this.product.jobs,
         readCanonicalQuota: this.product.readCanonicalQuota,
@@ -259,6 +259,8 @@ export class PlaygroundService {
     const project = await this.#project(owner, siteId);
     const versionId = (baseVersionId ?? project.latestVersionId) as VersionId | undefined;
     if (!versionId) throw this.#error("VERSION_NOT_FOUND", "No base version exists");
+    if (versionId !== project.latestVersionId)
+      throw this.#error("VERSION_NOT_FOUND", "Version not found");
     // A client-chosen base version must belong to this project, otherwise an
     // edit could restore another owner's source into this site.
     if (baseVersionId !== undefined) {
@@ -285,7 +287,7 @@ export class PlaygroundService {
         port: result.preview.port,
       });
       const billing = await resolveTerminalJobBillingFields({
-        jobId: result.jobId as JobId,
+        jobId: result.jobId,
         ownerId: owner,
         jobs: this.product.jobs,
         readCanonicalQuota: this.product.readCanonicalQuota,
@@ -321,7 +323,10 @@ export class PlaygroundService {
   }
   async siteDetail(ownerId: string, siteId: string) {
     const project = await this.#project(ownerId, siteId);
-    const versions = (await this.product.versions.listBySite(project.id)).items;
+    const current = project.latestVersionId
+      ? await this.product.versions.getById(project.latestVersionId)
+      : undefined;
+    const versions = current ? [current] : [];
     const deployments = (await this.product.deployments.listBySite(project.id)).items;
     const domains = await this.product.customDomains.listForSite(project.id);
     const runtime = await this.product.siteRuntime.getRuntime(project.id);
@@ -384,11 +389,10 @@ export class PlaygroundService {
       hostedUrl: project.publishedDeploymentId ? this.hosting.url(project.slug) : undefined,
     };
   }
-  async versions(ownerId: string, siteId: string) {
-    return (await this.siteDetail(ownerId, siteId)).versions;
-  }
   async sourceFiles(ownerId: string, siteId: string, versionId: string, requestedPath?: string) {
-    await this.#project(ownerId, siteId);
+    const project = await this.#project(ownerId, siteId);
+    if (versionId !== project.latestVersionId)
+      throw this.#error("VERSION_NOT_FOUND", "Version not found");
     const version = await this.product.versions.getById(versionId as VersionId);
     if (!version || version.siteId !== siteId)
       throw this.#error("VERSION_NOT_FOUND", "Version not found");
@@ -463,6 +467,8 @@ export class PlaygroundService {
   }
   async startPreview(ownerId: string, siteId: string, versionId: string) {
     const project = await this.#project(ownerId, siteId);
+    if (versionId !== project.latestVersionId)
+      throw this.#error("VERSION_NOT_FOUND", "Version not found");
     const version = await this.product.versions.getById(versionId as VersionId);
     if (!version || version.siteId !== project.id)
       throw this.#error("VERSION_NOT_FOUND", "Version not found");
@@ -498,6 +504,8 @@ export class PlaygroundService {
   }
   async publish(ownerId: string, siteId: string, versionId: string) {
     const project = await this.#project(ownerId, siteId);
+    if (versionId !== project.latestVersionId)
+      throw this.#error("VERSION_NOT_FOUND", "Version not found");
     const deployment = await this.product.deploymentService.deploy({
       siteId: project.id,
       versionId: versionId as VersionId,
@@ -508,11 +516,6 @@ export class PlaygroundService {
       versionId: deployment.versionId,
       hostedUrl: this.hosting.url(project.slug),
     };
-  }
-  async rollback(ownerId: string, siteId: string, deploymentId: string) {
-    const project = await this.#project(ownerId, siteId);
-    await this.product.deploymentService.rollback(project.id, deploymentId as DeploymentId);
-    return this.siteDetail(ownerId, siteId);
   }
   async unpublish(ownerId: string, siteId: string) {
     const project = await this.#project(ownerId, siteId);
@@ -594,7 +597,6 @@ export class PlaygroundService {
     return {
       versionId: version.id,
       versionNumber: version.versionNumber,
-      parentVersionId: version.parentVersionId,
       createdAt: version.createdAt.toISOString(),
       buildStatus: version.buildStatus,
       browserQAStatus: version.browserQAStatus,

@@ -261,7 +261,7 @@ describe("Sites generation reliability recovery", () => {
     ).toThrowError(/disallowed path/);
   });
 
-  it("sends only editable application source to a targeted edit", () => {
+  it("sends editable application source and root HTML branding to a targeted edit", () => {
     const editable = (path: string) => isEditableContextPath(path, SITE_V1_TECHNICAL_PROFILE);
     // Worth paying for: the edit can actually patch these.
     expect(editable("src/App.tsx")).toBe(true);
@@ -273,7 +273,7 @@ describe("Sites generation reliability recovery", () => {
     expect(editable("src/sites-ui/primitives/Button.tsx")).toBe(false);
     expect(editable("package.json")).toBe(false);
     expect(editable("tsconfig.json")).toBe(false);
-    expect(editable("index.html")).toBe(false);
+    expect(editable("index.html")).toBe(true);
     expect(editable("vite.config.ts")).toBe(false);
   });
 

@@ -152,6 +152,7 @@ export const browserQACoreCheckExecutors: readonly BrowserQACheckExecutor[] = [
       const findings = await context.page.evaluate(() => {
         const links = [...document.querySelectorAll<HTMLAnchorElement>("a[href]")];
         const unsafe: string[] = [];
+        const missingFragments: string[] = [];
         const advisory: string[] = [];
         for (const link of links) {
           const href = link.getAttribute("href")?.trim() ?? "";
@@ -161,20 +162,20 @@ export const browserQACoreCheckExecutors: readonly BrowserQACheckExecutor[] = [
           }
           if (/^(?:javascript|data):/i.test(href)) unsafe.push(`unsafe scheme: ${href.slice(0, 120)}`);
           if (href.startsWith("#") && href.length > 1 && !document.getElementById(href.slice(1)))
-            advisory.push(`missing fragment target: ${href.slice(0, 120)}`);
+            missingFragments.push(`missing fragment target: ${href.slice(0, 120)}`);
           if (href.startsWith("/") && href.startsWith("//")) advisory.push(`protocol-relative link: ${href.slice(0, 120)}`);
         }
-        return { unsafe: unsafe.slice(0, 50), advisory: advisory.slice(0, 50) };
+        return { unsafe: unsafe.slice(0, 50), missingFragments: missingFragments.slice(0, 50), advisory: advisory.slice(0, 50) };
       });
-      // An unsafe scheme is a security defect and blocks. A dangling anchor or
-      // empty href is a polish defect: report it, do not discard the site.
-      const linkIssues = [...findings.unsafe, ...findings.advisory];
+      // Missing fragment destinations break navigation and block just like
+      // unsafe schemes. Unrelated advisory link findings keep their severity.
+      const linkIssues = [...findings.unsafe, ...findings.missingFragments, ...findings.advisory];
       return result(context, linkIssues.length
         ? {
             checkId: "internal-links",
             category: "ROUTING",
             status: "FAIL",
-            severity: findings.unsafe.length ? "ERROR" : "WARNING",
+            severity: findings.unsafe.length || findings.missingFragments.length ? "ERROR" : "WARNING",
             message: `${linkIssues.length} invalid internal link finding${linkIssues.length === 1 ? "" : "s"}`,
             evidence: linkIssues.map((message): BrowserQAEvidence => ({ type: "element", locatorDescription: "a[href]", accessibleName: message })),
           }

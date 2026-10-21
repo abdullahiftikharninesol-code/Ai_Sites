@@ -465,6 +465,41 @@ async function harness() {
   };
 }
 
+describe("cancelled history routes and current-only project access", () => {
+  it.each(["/api/sites", "/api/dev/sites"])("does not mount history or restore under %s", async (prefix) => {
+    const h = await harness(); const project = await h.site(h.userA.id, "Current project");
+    expect((await h.request(`${prefix}/${project.id}/versions`, { as: h.userA })).status).toBe(404);
+    expect((await h.request(`${prefix}/${project.id}/versions/old/restore`, {
+      method: "POST", as: h.userA,
+    })).status).toBe(404);
+    expect((await h.request(`${prefix}/${project.id}/rollback`, {
+      method: "POST", as: h.userA, body: { deploymentId: "old" },
+    })).status).toBe(404);
+    expect(h.editWebsite).not.toHaveBeenCalled();
+    expect(h.generateWebsite).not.toHaveBeenCalled();
+  });
+
+  it("normal project fetch returns only current and historical source/preview/edit are inaccessible", async () => {
+    const h = await harness();
+    const project = await h.site(h.userA.id, "Current", "current:v2" as VersionId);
+    h.versions.set("current:v1", { id: "current:v1" as VersionId, siteId: project.id, versionNumber: 1, createdAt: new Date(0) });
+    h.versions.set("current:v2", { id: "current:v2" as VersionId, siteId: project.id, versionNumber: 2, createdAt: new Date(1) });
+    const response = await h.request(`/api/dev/sites/${project.id}`, { as: h.userA });
+    expect(response.status).toBe(200);
+    expect(response.body?.versions).toEqual([expect.objectContaining({ versionNumber: 2 })]);
+    for (const action of ["files", "preview", "publish"]) {
+      expect((await h.request(`/api/dev/sites/${project.id}/versions/current%3Av1/${action}`, {
+        as: h.userA, method: action === "files" ? "GET" : "POST",
+      })).status).toBe(404);
+    }
+    expect((await h.request(`/api/dev/sites/${project.id}/edit`, {
+      as: h.userA, method: "POST", body: { prompt: "Change the title", baseVersionId: "current:v1" },
+    })).status).toBe(404);
+    expect(h.editWebsite).not.toHaveBeenCalled();
+    expect((await h.request(`/api/dev/sites/${project.id}`, { as: h.userB })).status).toBe(404);
+  });
+});
+
 describe("Sites API CORS", () => {
   it("uses safe development defaults and requires explicit production origins", () => {
     expect(loadPlaygroundConfig({}).webOrigins).toEqual([
@@ -560,6 +595,7 @@ describe("HTTP route protection", () => {
       ["GET", "/api/dev/sites/p1/runtime"],
       ["GET", "/api/dev/previews/s1"],
       ["DELETE", "/api/dev/previews/s1"],
+      ["POST", "/api/site-templates/modern-saas/instantiate"],
     ];
     for (const [method, path] of routes) {
       const response = await h.request(path, { method });
@@ -574,6 +610,37 @@ describe("HTTP route protection", () => {
       status: false,
     });
     expect(h.generateWebsite).not.toHaveBeenCalled();
+  });
+});
+
+describe("template instantiation HTTP trust boundary", () => {
+  it("derives the owner from JWT and forwards only validated identifiers", async () => {
+    const h = await harness();
+    const instantiate = vi.spyOn(h.service, "instantiateTemplate").mockResolvedValue({
+      projectId: "site-template" as SiteId,
+      versionId: "site-template:v1" as VersionId,
+      preview: { sessionId: "preview-template", url: "http://127.0.0.1:4173" },
+    });
+    const response = await h.request("/api/site-templates/modern-saas/instantiate", {
+      method: "POST",
+      as: h.userA,
+      body: {
+        version: 1,
+        projectName: "Modern SaaS Site",
+        ownerId: h.userB.id,
+        sourceObject: "attacker/object.zip",
+        sourceSha256: "attacker-hash",
+      },
+    });
+
+    expect(response.status).toBe(201);
+    expect(instantiate).toHaveBeenCalledWith(
+      h.userA.id,
+      "modern-saas",
+      1,
+      "Modern SaaS Site",
+    );
+    expect(JSON.stringify(response.body)).not.toMatch(/sourceObject|sourceSha256|template\.zip/);
   });
 });
 
@@ -780,21 +847,18 @@ describe("SiteProject ownership", () => {
     expect(h.editWebsite.mock.calls[0]![0]).toMatchObject({ userId: h.userA.id, siteId: siteA.id });
   });
 
-  it("scopes version files, preview, publish, rollback, unpublish and runtime to the owner", async () => {
+  it("scopes current files, preview, publish, unpublish and runtime to the owner", async () => {
     const h = await harness();
     const siteB = await h.site(h.userB.id, "Site B", "site-b:v1" as VersionId);
     const deployment = h.service.product.deploymentService;
     const deploy = vi.spyOn(deployment, "deploy");
-    const rollback = vi.spyOn(deployment, "rollback");
     const unpublish = vi.spyOn(deployment, "unpublish");
     const previewStart = vi.spyOn(h.service.previews, "start");
     const checks: Array<[string, string, unknown?]> = [
-      ["GET", `/api/dev/sites/${siteB.id}/versions`],
       ["GET", `/api/dev/sites/${siteB.id}/versions/site-b%3Av1/files`],
       ["GET", `/api/dev/sites/${siteB.id}/versions/site-b%3Av1/files?path=src/App.tsx`],
       ["POST", `/api/dev/sites/${siteB.id}/versions/site-b%3Av1/preview`],
       ["POST", `/api/dev/sites/${siteB.id}/versions/site-b%3Av1/publish`],
-      ["POST", `/api/dev/sites/${siteB.id}/rollback`, { deploymentId: "deployment-b" }],
       ["POST", `/api/dev/sites/${siteB.id}/unpublish`],
       ["GET", `/api/dev/sites/${siteB.id}/runtime`],
     ];
@@ -806,7 +870,6 @@ describe("SiteProject ownership", () => {
       });
     }
     expect(deploy).not.toHaveBeenCalled();
-    expect(rollback).not.toHaveBeenCalled();
     expect(unpublish).not.toHaveBeenCalled();
     expect(previewStart).not.toHaveBeenCalled();
   });

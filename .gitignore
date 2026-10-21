@@ -21,6 +21,14 @@ tests/*
 !tests/site-templates-t2b.test.ts
 !tests/site-templates-phase-4a.test.ts
 !tests/site-templates-phase-4b.test.ts
+!tests/site-templates-phase-6.test.ts
+!tests/site-templates-phase-7.test.ts
+!tests/targeted-edit-completeness.test.ts
+!tests/targeted-edit-reliability.test.ts
+!tests/openai-prompt-cache-key.test.ts
+!tests/browser-qa-fragment-navigation.test.ts
+!tests/site-templates-phase-7l.test.ts
+!tests/mongodb-persistence.test.ts
 !tests/fixtures/
 tests/fixtures/*
 !tests/fixtures/template-publisher-valid/
@@ -33,3 +41,4 @@ tests/fixtures/*
 !tests/sites-job-credit-sync.test.ts
 docs/*
 !docs/template-publishing.md
+!docs/site-version-api.md

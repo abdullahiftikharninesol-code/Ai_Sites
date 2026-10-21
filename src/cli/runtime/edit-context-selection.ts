@@ -1,3 +1,13 @@
+import {
+  containsRenameLiteral,
+  isEditableRequirementPath,
+  parseEditRequirements,
+  suppliedEditRequirementContext,
+  type EditRequirementContext,
+  type EditRequirementName,
+  type EditRequirements,
+} from "./edit-requirements.js";
+
 export interface EditContextFile {
   readonly path: string;
   readonly content: string;
@@ -11,6 +21,12 @@ export interface EditContextSelection {
   readonly styleIntent: boolean;
 }
 
+export interface EditRepairContextSelection {
+  readonly files: readonly EditContextFile[];
+  readonly text: string;
+  readonly requirementContext: EditRequirementContext;
+}
+
 /** The Sites-owned baseline stylesheet: large, and only worth sending for style work. */
 export const BASELINE_STYLESHEET = "src/styles.css";
 
@@ -22,11 +38,84 @@ export function isBroadFunctionalEdit(instruction: string): boolean {
 
 /** "Preserve the styling" is not permission to rewrite a stylesheet. */
 export function broadFunctionalEditChangesStyle(instruction: string): boolean {
-  return /\b(redesign|restyle|retheme|change (?:the )?(?:style|styling|theme|colors?|colours?|palette)|update (?:the )?(?:style|styling|theme|colors?|colours?|palette))\b/i.test(instruction);
+  return parseEditRequirements(instruction).style || /\b(redesign|restyle|retheme|change (?:the )?(?:style|styling|theme|colors?|colours?|palette)|update (?:the )?(?:style|styling|theme|colors?|colours?|palette))\b/i.test(instruction);
 }
 
 const STYLE_INTENT =
-  /\b(colou?rs?|theme|dark|light|palette|font|fonts|typograph\w*|spacing|style|styles|styling|css|background|accent|uppercase|lowercase|capitali[sz]\w*|bold|italic|round\w*|shadow|border|margin|padding|size|sizes|larger|smaller|contrast)\b/i;
+  /\b(colou?rs?|theme|dark|light|palette|visual|visuals|font|fonts|typograph\w*|spacing|style|styles|styling|css|background|accent|uppercase|lowercase|capitali[sz]\w*|bold|italic|round\w*|shadow|border|margin|padding|size|sizes|larger|smaller|contrast)\b/i;
+
+/**
+ * The verbatim `:root` rule blocks of a stylesheet too large to send whole: they
+ * hold the design tokens a colour or theme edit must change, and every byte is
+ * copied from the file so a patch written against them still matches exactly.
+ */
+export function designTokenExcerpt(css: string, maxChars = 4_000): string | undefined {
+  const blocks = [...css.matchAll(/:root\s*\{[^{}]*\}/g)].map((match) => match[0]);
+  const excerpt = blocks.reduce(
+    (text, block) => (text.length + block.length + 2 <= maxChars ? (text ? `${text}\n\n${block}` : block) : text),
+    "",
+  );
+  return excerpt || undefined;
+}
+
+export function patchableStyleExcerpt(file: EditContextFile): string {
+  return `--- ${file.path}\nEXACT PATCHABLE EXCERPT (verbatim source below; patch this real file; labels/line numbers are not source; no full-file rewrite):\n${file.content}`;
+}
+
+/**
+ * Selects only the candidate source needed to repair deterministic requirement
+ * failures. This deliberately bypasses normal relevance ranking: style gets
+ * current style tokens/source, while rename gets only files that still contain
+ * the old literal (case-insensitively).
+ */
+export function selectEditRepairContext(
+  requirements: EditRequirements,
+  missingRequirements: readonly EditRequirementName[],
+  candidate: ReadonlyMap<string, string>,
+  initialContext: EditRequirementContext,
+  options: { readonly maxFileBytes?: number } = {},
+): EditRepairContextSelection {
+  const maxFileBytes = options.maxFileBytes ?? 16_000;
+  const selected = new Map<string, EditContextFile>();
+  const add = (path: string, content: string) => {
+    if (isEditableRequirementPath(path) && !selected.has(path)) selected.set(path, { path, content });
+  };
+
+  if (missingRequirements.includes("rename") && requirements.rename) {
+    for (const [path, content] of candidate)
+      if (isEditableRequirementPath(path) && containsRenameLiteral(content, requirements.rename.oldLiteral))
+        add(path, content);
+  }
+
+  if (missingRequirements.includes("style")) {
+    const supplied = initialContext.stylePaths.filter((path) => candidate.has(path));
+    const fallback = [...candidate.keys()].filter((path) => path.endsWith(".css"));
+    const paths = supplied.some((path) => path.endsWith(".css"))
+      ? supplied.filter((path) => path.endsWith(".css"))
+      : supplied.length ? supplied : fallback;
+    for (const path of paths.slice(0, 3)) {
+      const content = candidate.get(path)!;
+      const excerpt = Buffer.byteLength(content) > maxFileBytes && path.endsWith(".css")
+        ? designTokenExcerpt(content)
+        : undefined;
+      add(path, excerpt ?? content);
+    }
+  }
+
+  const files = Object.freeze([...selected.values()].sort((left, right) => left.path.localeCompare(right.path)));
+  const missing = new Set(missingRequirements);
+  const repairRequirements: EditRequirements = {
+    ...(missing.has("rename") && requirements.rename ? { rename: requirements.rename } : {}),
+    style: missing.has("style"),
+  };
+  const requirementContext = suppliedEditRequirementContext(repairRequirements, files);
+  const text = files.map((file) =>
+    missing.has("style") && requirementContext.stylePaths.includes(file.path)
+      ? patchableStyleExcerpt(file)
+      : `--- ${file.path}\n${file.content}`,
+  ).join("\n\n");
+  return { files, text, requirementContext };
+}
 
 const STOPWORDS = new Set([
   "the", "and", "for", "with", "that", "this", "from", "into", "make", "change", "update",
@@ -104,7 +193,7 @@ export function selectEditContextFiles(
   const isStylesheet = (path: string) => path.endsWith(".css");
   const keep = new Map<string, EditContextFile>();
   const add = (file?: EditContextFile) => {
-    if (file && !keep.has(file.path)) keep.set(file.path, file);
+    if (file && isEditableRequirementPath(file.path) && !keep.has(file.path)) keep.set(file.path, file);
   };
 
   const reason: EditContextSelection["reason"] =
@@ -125,6 +214,11 @@ export function selectEditContextFiles(
 
   // Style work needs the stylesheets, including the Sites baseline that holds the tokens.
   if (styleIntent) for (const file of files) if (isStylesheet(file.path)) add(file);
+
+  // Explicit literal rename coverage (including casing variants) may exceed the ranked-file limit.
+  const rename = parseEditRequirements(instruction).rename;
+  if (rename) for (const file of files)
+    if (isEditableRequirementPath(file.path) && containsRenameLiteral(file.content, rename.oldLiteral)) add(file);
 
   const selected = files.filter((file) => keep.has(file.path));
   return {

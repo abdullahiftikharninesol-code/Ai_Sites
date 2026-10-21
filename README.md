@@ -2,7 +2,9 @@
 
 **Current phase: Phase 17 — Complete Agent Intelligence Layer**
 
-Sites supports AI-driven site generation, real build and preview, Playwright Visual QA, automatic repair, durable immutable versions, restart-safe restore/edit, static deployment, stable local hosting, managed generated-site data, contact/submission forms, public-read collections, controlled CRUD, persistent runtime records, and additive runtime schema evolution.
+Sites supports AI-driven site generation, real build and preview, Playwright Visual QA, automatic repair, durable current project source, restart-safe current-project loading/editing, static deployment, stable local hosting, managed generated-site data, contact/submission forms, public-read collections, controlled CRUD, persistent runtime records, and additive runtime schema evolution.
+
+The GetChatly product persists only the latest successful working state. Edits use disposable candidates and replace the current source pointer only after validation, build, and Browser QA succeed. Revision numbers may advance, but historical versions, user restore/rollback, and history-list APIs are not available. Legacy history collections and artifacts are not migrated or purged by this change.
 
 All 21 lifecycle areas are implemented and validated locally. Ten representative product scenarios completed with **PASS_WITH_WARNINGS**: pipeline/runtime/deployment behavior passed, while scenario-specific generated UI quality remains intentionally unproven by the generic MockAgent fixture. Production-ready: **NO**.
 

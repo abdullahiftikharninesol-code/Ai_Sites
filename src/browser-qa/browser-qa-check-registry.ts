@@ -71,7 +71,7 @@ export const BROWSER_QA_CHECK_DEFINITIONS: readonly BrowserQACheckDefinition[] =
   { checkId: "route.load", version: 1, category: "ROUTING", defaultSeverity: "ERROR", scope: "ROUTE", timeoutMs: 5_000, applicability: ({ hasRoutes }) => hasRoutes },
   // ERROR blocks the version; WARNING is reported on the version instead.
   // Only "the site does not work" and safety boundaries block.
-  { checkId: "internal-links", version: 1, category: "ROUTING", defaultSeverity: "WARNING", scope: "PAGE", timeoutMs: 3_000 },
+  { checkId: "internal-links", version: 1, category: "ROUTING", defaultSeverity: "ERROR", scope: "PAGE", timeoutMs: 3_000 },
   { checkId: "broken-images", version: 1, category: "ASSET", defaultSeverity: "WARNING", scope: "VIEWPORT", timeoutMs: 3_000, applicability: ({ hasAssets }) => hasAssets },
   { checkId: "responsive-overflow", version: 1, category: "RESPONSIVE", defaultSeverity: "WARNING", scope: "VIEWPORT", timeoutMs: 2_000 },
   { checkId: "interaction-smoke", version: 1, category: "INTERACTION", defaultSeverity: "WARNING", scope: "INTERACTION", timeoutMs: 3_000 },
