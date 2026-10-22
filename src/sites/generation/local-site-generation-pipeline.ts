@@ -614,7 +614,11 @@ export class LocalSiteGenerationPipeline {
         this.deps.execution,
         environment.id,
         sourceArtifactRef,
-        this.#metadata(),
+        {
+          ...this.#metadata(),
+          ...(parent.templateId ? { templateId: parent.templateId } : {}),
+          ...(parent.templateVersion !== undefined ? { templateVersion: parent.templateVersion } : {}),
+        },
       );
       const changedFiles = summarizeChanges(before, after);
       const build = this.#build(environment.id);

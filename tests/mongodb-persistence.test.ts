@@ -590,6 +590,22 @@ describe("current-only Mongo persistence and validated candidate replacement", (
     expect((await h.api.jobs.listBySite(instantiated.projectId)).items).toHaveLength(0);
     expect(source.readObject).toHaveBeenCalledOnce();
     expect(h.provider.callCount).toBe(0);
+    const edited = await h.api.pipeline.edit({
+      userId: ownerId, siteId: instantiated.projectId,
+      instruction: "Rename FlowPilot to NovaPay. Keep the existing layout.",
+      agentProvider: "mock-agent", browserQAEnabled: true,
+    });
+    expect(h.provider.callCount).toBe(2);
+    const afterRestart = new MongoSiteVersionRepository(h.memory.asModels(), h.artifacts);
+    const latest = (await afterRestart.getById(edited.newVersionId))!;
+    expect(latest).toMatchObject({ templateId: "restaurant", templateVersion: 2, versionNumber: 2 });
+    expect(await afterRestart.getById(first.id)).toBeUndefined();
+    expect((await afterRestart.listBySite(instantiated.projectId)).items).toHaveLength(1);
+    const currentSnapshot = JSON.parse(Buffer.from((await h.artifacts.get(latest.sourceArtifactRef))!).toString()) as SiteSourceSnapshot;
+    expect(currentSnapshot.manifest).toMatchObject({ templateId: "restaurant", templateVersion: 2 });
+    expect(currentSnapshot.files["src/main.jsx"]).toBe(snapshot.files["src/main.jsx"]);
+    expect(source.readObject).toHaveBeenCalledOnce();
+    expect(h.memory.versionRecords.size).toBe(0);
   });
 
   it("generation and edit persist only the latest working project across reload", async () => {

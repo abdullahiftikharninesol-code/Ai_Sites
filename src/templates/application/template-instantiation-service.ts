@@ -22,6 +22,7 @@ import type { SiteTemplateRepository } from "../repositories.js";
 import type { TemplateArtifactReader } from "../publishing/template-artifact-storage.js";
 import { validateTemplateSource } from "../publishing/template-source.js";
 import { extractTemplateZip } from "./safe-template-zip.js";
+import { markTemplateInstantiationStage, withTemplateInstantiationDiagnostics } from "./template-instantiation-diagnostics.js";
 
 export interface InstantiateTemplateRequest {
   readonly ownerId: UserId;
@@ -57,6 +58,10 @@ export class TemplateInstantiationService {
   }
 
   async instantiate(request: InstantiateTemplateRequest): Promise<TemplateInstantiationResult> {
+    return withTemplateInstantiationDiagnostics(request.templateKey, () => this.#instantiate(request));
+  }
+
+  async #instantiate(request: InstantiateTemplateRequest): Promise<TemplateInstantiationResult> {
     const template = request.version === undefined
       ? await this.deps.templates.findLatestActiveTemplate(request.templateKey)
       : await this.deps.templates.findTemplateVersion(request.templateKey, request.version);
@@ -68,9 +73,11 @@ export class TemplateInstantiationService {
     )
       throw new ApplicationError("TEMPLATE_NOT_FOUND", "Active template was not found");
 
+    markTemplateInstantiationStage("GCS_DOWNLOAD");
     const archive = await this.deps.source.readObject(template.sourceObject);
     if (!archive)
       throw new ApplicationError("TEMPLATE_NOT_FOUND", "Template source artifact was not found");
+    markTemplateInstantiationStage("SHA_VALIDATION");
     const actualSha256 = createHash("sha256").update(archive).digest("hex");
     if (actualSha256 !== template.sourceSha256)
       throw new ApplicationError(
@@ -78,6 +85,7 @@ export class TemplateInstantiationService {
         "Template source integrity verification failed",
       );
 
+    markTemplateInstantiationStage("EXTRACTION");
     const temporaryRoot = await mkdtemp(join(tmpdir(), "sites-template-instantiation-"));
     const extractedRoot = join(temporaryRoot, "source");
     const siteId = randomUUID() as SiteId;
@@ -87,6 +95,7 @@ export class TemplateInstantiationService {
     try {
       await mkdir(extractedRoot, { recursive: true });
       await extractTemplateZip(archive, extractedRoot);
+      markTemplateInstantiationStage("SOURCE_VALIDATION");
       const source = await validateTemplateSource(extractedRoot);
       const environment = await this.deps.execution.createEnvironment({});
       environmentId = environment.id;
@@ -98,26 +107,32 @@ export class TemplateInstantiationService {
         );
 
       this.#packages.validate(await this.deps.execution.readFile(environment.id, "package.json"));
+      markTemplateInstantiationStage("BUILD");
       const install = await this.deps.execution.executeCommand(environment.id, {
         executable: "npm",
         args: ["ci", "--prefer-offline", "--no-audit", "--no-fund"],
         timeoutMs: 300_000,
       });
-      if (install.exitCode !== 0 || install.timedOut)
+      if (install.exitCode !== 0 || install.timedOut) {
+        markTemplateInstantiationStage("BUILD", { command: "npm ci", exitCode: install.exitCode, timedOut: install.timedOut });
         throw new ApplicationError(
           "TEMPLATE_INSTANTIATION_BUILD_FAILED",
           "Template dependency installation failed",
         );
+      }
       const buildCommand = await this.deps.execution.executeCommand(environment.id, {
         executable: "npm",
         args: ["run", "build"],
         timeoutMs: 180_000,
       });
-      if (buildCommand.exitCode !== 0 || buildCommand.timedOut)
+      if (buildCommand.exitCode !== 0 || buildCommand.timedOut) {
+        markTemplateInstantiationStage("BUILD", { command: "npm run build", exitCode: buildCommand.exitCode, timedOut: buildCommand.timedOut });
         throw new ApplicationError(
           "TEMPLATE_INSTANTIATION_BUILD_FAILED",
           "Template build validation failed",
         );
+      }
+      markTemplateInstantiationStage("PREVIEW_INITIALIZATION");
       const preview = await this.deps.execution.startPreview(environment.id, { port: 0 });
       if (!preview.url)
         throw new ApplicationError(
@@ -125,6 +140,7 @@ export class TemplateInstantiationService {
           "Template preview did not become ready",
         );
 
+      markTemplateInstantiationStage("BROWSER_QA");
       const browserQA = await this.deps.browserQA.run({
         runId: `${siteId}-${draftVersionId}`,
         target: {
@@ -140,12 +156,15 @@ export class TemplateInstantiationService {
         ],
         artifactPrefix: `sites/${siteId}/versions/${draftVersionId}/qa/screenshots/browser`,
       });
-      if (browserQA.status === "FAIL")
+      if (browserQA.status === "FAIL") {
+        markTemplateInstantiationStage("BROWSER_QA", { failures: browserQA.checks.filter((check) => check.status === "FAIL").map((check) => ({ checkId: check.checkId, route: check.route, viewport: check.viewport?.id, severity: check.severity })) });
         throw new ApplicationError(
           "TEMPLATE_INSTANTIATION_QA_FAILED",
           "Template Browser QA failed",
         );
+      }
 
+      markTemplateInstantiationStage("PERSISTENCE");
       const sourceArtifactRef = ArtifactNamespace.version(
         siteId,
         draftVersionId,

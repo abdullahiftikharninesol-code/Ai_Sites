@@ -28,6 +28,9 @@ tests/*
 !tests/openai-prompt-cache-key.test.ts
 !tests/browser-qa-fragment-navigation.test.ts
 !tests/site-templates-phase-7l.test.ts
+!tests/template-instantiation-diagnostics.test.ts
+!tests/corporate-business-browser-qa.test.ts
+!tests/corporate-business-v2-publication.test.ts
 !tests/mongodb-persistence.test.ts
 !tests/fixtures/
 tests/fixtures/*

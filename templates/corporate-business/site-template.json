@@ -1,11 +1,11 @@
 {
   "templateKey": "corporate-business",
-  "version": 1,
+  "version": 2,
   "name": "Corporate Business",
   "description": "A professional multi-page corporate website for consulting, services and established businesses.",
   "categoryKey": "business",
   "tags": ["business", "corporate", "consulting", "professional-services", "enterprise", "multi-page"],
-  "status": "draft",
+  "status": "active",
   "routes": [
     { "path": "/", "label": "Home" },
     { "path": "/services", "label": "Services" },

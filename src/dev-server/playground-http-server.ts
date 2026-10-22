@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { ApplicationError } from "../app/errors/application-error.js";
+import { reportTemplateAuthenticationFailure } from "../templates/application/template-instantiation-diagnostics.js";
 import {
   PlaygroundService,
   loadPlaygroundConfig,
@@ -172,6 +173,10 @@ export class PlaygroundHttpServer {
   }
   async #handle(req: AuthenticatedRequest, res: ServerResponse) {
     this.#headers(req, res);
+    if (req.method === "POST" && /^\/api\/site-templates\/[a-z0-9-]+\/instantiate(?:\?|$)/.test(req.url ?? ""))
+      res.once("finish", () => {
+        if (res.statusCode === 401 || res.statusCode === 403) reportTemplateAuthenticationFailure(res.statusCode);
+      });
     if (
       !["GET", "HEAD", "OPTIONS"].includes(req.method ?? "GET") &&
       req.headers.origin &&

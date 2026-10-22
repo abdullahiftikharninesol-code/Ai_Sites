@@ -25,6 +25,10 @@ export default tseslint.config(
     rules: { "@typescript-eslint/require-await": "off" },
   },
   {
+    ...tseslint.configs.disableTypeChecked,
+    files: ["scripts/corporate-business-v2-publication.mjs"],
+  },
+  {
     files: [
       "src/agents/mock-agent-provider.ts",
       "src/execution/mock-execution-provider.ts",

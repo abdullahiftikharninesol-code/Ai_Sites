@@ -15,6 +15,7 @@ import { ingestUserImage, userAssetsManifest, type UserProvidedAsset } from "../
 import { MongoIdentityRepository, type IdentityRepository } from "../auth/identity-repository.js";
 import { resolveTerminalJobBillingFields } from "./job-billing-result.js";
 import type { TemplateCatalogQuery } from "../templates/http/template-catalog-query.js";
+import { reportTemplatePreviewFailure } from "../templates/application/template-instantiation-diagnostics.js";
 
 export interface PlaygroundConfig {
   host: string;
@@ -187,6 +188,7 @@ export class PlaygroundService {
         preview: { sessionId: preview.id, url: preview.url },
       };
     } catch (cause) {
+      reportTemplatePreviewFailure(templateKey, cause);
       await Promise.allSettled([
         this.product.execution.destroyEnvironment(result.environmentId),
         this.product.deleteSite(result.projectId, owner),
