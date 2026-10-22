@@ -84,9 +84,11 @@ export class AgentPlanningPipeline {
     prompt: string,
     signal?: AbortSignal,
     runContext?: InferenceRunContext,
+    designReferenceContext?: string,
   ): Promise<IntelligenceRunResult<SitePlan>> {
+    const planningInput = designReferenceContext ? `${designReferenceContext}\n\nUser requirements (take priority):\n${prompt}` : prompt;
     const cacheKey = SitePlanCache.createKey(
-      prompt,
+      planningInput,
       this.options.model ? { model: this.options.model } : {},
     );
     const cached = defaultSitePlanCache.get(cacheKey);
@@ -124,7 +126,7 @@ export class AgentPlanningPipeline {
         scopedAgent,
         this.options.model,
         "SITE_PLANNING",
-        prompt,
+        planningInput,
         signal,
         this.options.timeoutMs,
         contract,

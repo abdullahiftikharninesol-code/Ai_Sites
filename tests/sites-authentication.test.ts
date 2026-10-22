@@ -613,6 +613,32 @@ describe("HTTP route protection", () => {
   });
 });
 
+describe("reference-guided generation HTTP trust boundary (offline identities only)", () => {
+  it("forwards the authenticated owner and exact selected key/version into normal generation, not instantiation or editing", async () => {
+    const h = await harness();
+    const instantiate = vi.spyOn(h.service, "instantiateTemplate");
+    const selection = { templateKey: "ecommerce-store", version: 1 };
+    const response = await h.request("/api/dev/sites", { method: "POST", as: h.userA, body: {
+      prompt: "Build a premium store for North & Loom", templateReference: selection,
+      generationRequestId: "offline-reference-http-1", ownerId: h.userB.id, sourceObject: "ignored-private.zip",
+    } });
+    expect(response.status).toBe(202);
+    await h.settle(response.body!.jobId as string);
+    expect(h.generateWebsite).toHaveBeenCalledOnce();
+    expect(h.generateWebsite.mock.calls[0]?.[0]).toMatchObject({ userId: h.userA.id, templateReference: selection });
+    expect(JSON.stringify(h.generateWebsite.mock.calls[0]?.[0])).not.toContain("ignored-private.zip");
+    expect(instantiate).not.toHaveBeenCalled(); expect(h.editWebsite).not.toHaveBeenCalled();
+  });
+
+  it("rejects source paths nested in template identity before creating a job or invoking generation", async () => {
+    const h = await harness();
+    const response = await h.request("/api/dev/sites", { method: "POST", as: h.userA, body: {
+      prompt: "Build a reference site", templateReference: { templateKey: "ecommerce-store", version: 1, sourceObject: "evil.zip" }, generationRequestId: "offline-reference-http-2",
+    } });
+    expect(response.status).toBe(400); expect(h.generateWebsite).not.toHaveBeenCalled(); expect(h.jobStart).not.toHaveBeenCalled();
+  });
+});
+
 describe("template instantiation HTTP trust boundary", () => {
   it("derives the owner from JWT and forwards only validated identifiers", async () => {
     const h = await harness();

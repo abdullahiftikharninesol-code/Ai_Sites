@@ -16,6 +16,7 @@ import {
 import { ownerIdOf } from "../auth/owner-id.js";
 import { sendResponse } from "../auth/send-response.js";
 import { requireSitesSubscription } from "../auth/sites-subscription.js";
+import { parseTemplateReference } from "../templates/application/template-design-context.js";
 import {
   parseTemplateCatalogQuery,
   parseTemplateVersion,
@@ -295,6 +296,8 @@ export class PlaygroundHttpServer {
           prompt,
           this.#attachmentIds(body.attachments),
           this.#attachmentIds(body.referenceAttachments) ?? [],
+          parseTemplateReference(body.templateReference),
+          typeof body.generationRequestId === "string" ? body.generationRequestId : undefined,
         );
         return this.#json(res, 202, { jobId: job.id });
       }

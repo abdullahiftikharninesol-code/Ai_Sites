@@ -149,7 +149,7 @@ export function Cta() {
 
 describe("Sites generation reliability recovery", () => {
   it("does not enforce noUnusedLocals/noUnusedParameters in the generated project's tsconfig", () => {
-    const compilerOptions = JSON.parse(DEFAULT_TSCONFIG).compilerOptions;
+    const compilerOptions = (JSON.parse(DEFAULT_TSCONFIG) as { compilerOptions: Record<string, unknown> }).compilerOptions;
     expect(compilerOptions.noUnusedLocals).toBeUndefined();
     expect(compilerOptions.noUnusedParameters).toBeUndefined();
     expect(compilerOptions.strict).toBe(true);
@@ -281,8 +281,9 @@ describe("Sites generation reliability recovery", () => {
     const blocking = BROWSER_QA_CHECK_DEFINITIONS.filter(
       ({ defaultSeverity }) => defaultSeverity === "ERROR",
     ).map(({ checkId }) => checkId);
-    // A built, rendering site must not be discarded over polish findings.
+    // Missing destinations are real navigation breakage, not polish findings.
     expect(blocking.sort()).toEqual([
+      "internal-links",
       "network.failed-request",
       "page-readiness",
       "route.load",

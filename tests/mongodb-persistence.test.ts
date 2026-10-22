@@ -30,6 +30,7 @@ import type { SiteJob, SiteProject, SiteVersion } from "../src/sites/domain/enti
 import type { SiteSourceSnapshot } from "../src/sites/generation/source-snapshot.js";
 import type { JobId, SiteId, UserId, VersionId } from "../src/shared/types.js";
 import { createLocalSitesProduct } from "../src/sites/generation/create-local-sites-product.js";
+import { deriveTemplateDesignReference, type TemplateDesignReferenceResolver } from "../src/templates/application/template-design-context.js";
 import { SiteSourceSnapshotService } from "../src/sites/generation/source-snapshot.js";
 import {
   GeneratedProjectValidator,
@@ -261,7 +262,7 @@ const passingQA = (): BrowserQAReport => ({
   durationMs: 1,
 });
 
-async function currentHarness() {
+async function currentHarness(templateDesignReferences?: TemplateDesignReferenceResolver) {
   const root = await mkdtemp(join(tmpdir(), "sites-current-offline-"));
   roots.push(root);
   const memory = new MemoryMongoModels();
@@ -275,7 +276,9 @@ async function currentHarness() {
       model: request.model,
       message: {
         role: "assistant",
-        content: JSON.stringify({
+        content: JSON.stringify(templateDesignReferences && request.responseContract?.type === "JSON_SCHEMA" && request.responseContract.name === "SiteCoderFileBundle" ? {
+          siteName: "North & Loom", files: [{ path: "src/App.tsx", content: 'export function App(){return <main><h1>North &amp; Loom</h1><p>A newly generated clothing website.</p></main>}' }],
+        } : {
           patches: [
             {
               path: provider.callCount === 1 ? "src/App.jsx" : "index.html",
@@ -303,6 +306,7 @@ async function currentHarness() {
     versionCommitter: committer,
     agentRegistry: registry,
     orchestrationAgent: provider,
+    ...(templateDesignReferences ? { templateDesignReferences } : {}),
   });
   const result = {
     exitCode: 0,
@@ -606,6 +610,29 @@ describe("current-only Mongo persistence and validated candidate replacement", (
     expect(currentSnapshot.files["src/main.jsx"]).toBe(snapshot.files["src/main.jsx"]);
     expect(source.readObject).toHaveBeenCalledOnce();
     expect(h.memory.versionRecords.size).toBe(0);
+  });
+
+  it("reference-guided generation reloads current source and template provenance from a fresh Mongo repository", async () => {
+    const reference = deriveTemplateDesignReference({ templateKey: "ecommerce-store", version: 1 }, "fixture-sha", {
+      "src/App.jsx": 'export function Old(){return <header className="wordmark">Original Shop</header>}',
+      "src/styles.css": ':root{--cream:#f6f0e5}.hero{display:grid;gap:24px}',
+    }, ["/", "/shop", "/about"]);
+    const resolver = { resolve: vi.fn(async () => reference) };
+    const h = await currentHarness(resolver);
+    const result = await h.api.pipeline.generate({ userId: ownerId, prompt: "Build a website for North & Loom, a clothing brand.",
+      templateReference: { templateKey: "ecommerce-store", version: 1 }, planningMode: "deterministic", agentProvider: h.provider.id, browserQAEnabled: true });
+    const freshProjects = new MongoSiteProjectRepository(h.memory.asModels());
+    const freshVersions = new MongoSiteVersionRepository(h.memory.asModels(), h.artifacts);
+    const project = (await freshProjects.getById(result.siteId))!;
+    const current = (await freshVersions.getById(project.latestVersionId!))!;
+    expect(project).toMatchObject({ name: "North & Loom", versionNumber: 1 });
+    expect(current).toMatchObject({ templateId: "ecommerce-store", templateVersion: 1, buildStatus: "SUCCEEDED" });
+    const snapshot = JSON.parse(Buffer.from((await h.artifacts.get(current.sourceArtifactRef))!).toString()) as SiteSourceSnapshot;
+    expect(snapshot.files["src/App.tsx"]).toContain("North &amp; Loom");
+    expect(snapshot.files["src/App.tsx"]).not.toContain("Original Shop");
+    expect((await freshVersions.listBySite(result.siteId)).items).toHaveLength(1);
+    expect(h.memory.projectRecords.size).toBe(1); expect(h.memory.versionRecords.size).toBe(0);
+    expect(resolver.resolve).toHaveBeenCalledOnce(); expect(h.provider.callCount).toBe(1);
   });
 
   it("generation and edit persist only the latest working project across reload", async () => {

@@ -31,6 +31,7 @@ tests/*
 !tests/template-instantiation-diagnostics.test.ts
 !tests/corporate-business-browser-qa.test.ts
 !tests/corporate-business-v2-publication.test.ts
+!tests/template-reference-generation.test.ts
 !tests/mongodb-persistence.test.ts
 !tests/fixtures/
 tests/fixtures/*
@@ -45,3 +46,4 @@ tests/fixtures/*
 docs/*
 !docs/template-publishing.md
 !docs/site-version-api.md
+!docs/template-reference-generation.md

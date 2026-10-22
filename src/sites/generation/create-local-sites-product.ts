@@ -35,6 +35,7 @@ import { AgentPlanningPipeline } from "../../agents/intelligence/agent-intellige
 import { ArtifactMediaStore } from "../assets/media-store.js";
 import { AdapterBackedAssetResolver, PlaceholderAssetSourceAdapter } from "../assets/source-adapters.js";
 import type { SiteCreditBillingService } from "../../billing/credit-billing.js";
+import type { TemplateDesignReferenceResolver } from "../../templates/application/template-design-context.js";
 export interface LocalSitesProductOptions {
   readonly executionRoot: string;
   readonly artifactRoot: string;
@@ -51,6 +52,7 @@ export interface LocalSitesProductOptions {
   readonly versionCommitter?: SiteVersionCommitter;
   readonly runtimeProvider?: SiteRuntimeProvider;
   readonly billing?: SiteCreditBillingService;
+  readonly templateDesignReferences?: TemplateDesignReferenceResolver;
 }
 export function createLocalSitesProduct(options: LocalSitesProductOptions) {
   const execution = new LocalExecutionProvider({
@@ -115,6 +117,7 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
     ...(options.versionCommitter ? { versionCommitter: options.versionCommitter } : {}),
     ...(options.runtimeProvider ? { runtimeProvider: options.runtimeProvider } : {}),
     ...(options.billing ? { billing: options.billing } : {}),
+    ...(options.templateDesignReferences ? { templateDesignReferences: options.templateDesignReferences } : {}),
     resolveAgentModel: (provider) =>
       registry.get(provider === "mock" ? "mock-agent" : provider).getCapabilities().models[0],
   });

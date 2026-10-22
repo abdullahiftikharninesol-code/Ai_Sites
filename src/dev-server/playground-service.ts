@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { createMongoPersistentSitesProduct } from "../sites/generation/create-mongo-persistent-sites-product.js";
@@ -16,6 +16,8 @@ import { MongoIdentityRepository, type IdentityRepository } from "../auth/identi
 import { resolveTerminalJobBillingFields } from "./job-billing-result.js";
 import type { TemplateCatalogQuery } from "../templates/http/template-catalog-query.js";
 import { reportTemplatePreviewFailure } from "../templates/application/template-instantiation-diagnostics.js";
+import { parseTemplateReference, type TemplateReferenceSelection } from "../templates/application/template-design-context.js";
+import type { SiteGenerationResult } from "../sites/generation/local-site-generation-pipeline.js";
 
 export interface PlaygroundConfig {
   host: string;
@@ -100,6 +102,7 @@ export class PlaygroundService {
   readonly identities: IdentityRepository;
   readonly #mediaStore: ArtifactMediaStore;
   readonly #uploadedAssets = new Map<string, { readonly ownerId: string; readonly asset: UserProvidedAsset }>();
+  readonly #referenceGenerations = new Map<string, { signature: string; siteId: SiteId; jobId?: string; result?: SiteGenerationResult }>();
   #started = false;
   constructor(
     readonly config: PlaygroundConfig = loadPlaygroundConfig(),
@@ -221,11 +224,32 @@ export class PlaygroundService {
   getJob(ownerId: string, jobId: string) {
     return this.jobs.getOwned(jobId, this.#owner(ownerId));
   }
-  generate(ownerId: string, prompt: string, attachmentIds?: readonly string[], referenceIds: readonly string[] = []) {
+  generate(ownerId: string, prompt: string, attachmentIds?: readonly string[], referenceIds: readonly string[] = [], templateReference?: TemplateReferenceSelection, generationRequestId?: string) {
     const owner = this.#owner(ownerId);
     const assetManifest = this.#assets(owner, attachmentIds, referenceIds);
-    return this.jobs.start("GENERATE", async (onIntelligence) => {
-      const result = await this.product.orchestrator.generateWebsite({
+    const selection = parseTemplateReference(templateReference);
+    let attempt: { signature: string; siteId: SiteId; jobId?: string; result?: SiteGenerationResult } | undefined;
+    if (selection) {
+      if (!generationRequestId || !/^[a-zA-Z0-9_-]{16,80}$/.test(generationRequestId))
+        throw this.#error("INVALID_REQUEST", "A valid generationRequestId is required for template reference generation");
+      const key = `${owner}:${generationRequestId}`;
+      const signature = createHash("sha256").update(JSON.stringify([prompt, selection, attachmentIds, referenceIds])).digest("hex");
+      attempt = this.#referenceGenerations.get(key);
+      if (attempt && attempt.signature !== signature)
+        throw this.#error("INVALID_REQUEST", "This generation request identity belongs to a different brief or reference");
+      if (attempt?.jobId) {
+        const existing = this.jobs.getOwned(attempt.jobId, owner);
+        if (existing && existing.status !== "FAILED") return existing;
+      }
+      if (!attempt) {
+        if (this.#referenceGenerations.size >= 500)
+          throw this.#error("DEV_JOB_BUSY", "Reference generation session capacity reached");
+        attempt = { signature, siteId: randomUUID() as SiteId };
+        this.#referenceGenerations.set(key, attempt);
+      }
+    }
+    const job = this.jobs.start("GENERATE", async (onIntelligence) => {
+      const result = attempt?.result ?? await this.product.orchestrator.generateWebsite({
         userId: owner as UserId,
         prompt,
         // Planning is deterministic by default so one click spends provider
@@ -235,8 +259,11 @@ export class PlaygroundService {
         browserQAEnabled: true,
         retainPreview: true,
         ...(assetManifest ? { assetManifest } : {}),
+        ...(selection && attempt ? { templateReference: selection, referenceGenerationSiteId: attempt.siteId } : {}),
         onIntelligence,
       });
+      // Recover preview/workspace delivery without another generation or charge.
+      if (attempt) attempt.result = result;
       const preview = await this.previews.adopt(result.siteId, result.versionId, result.preview.environmentId, {
         url: result.preview.url!,
         port: result.preview.port,
@@ -255,6 +282,8 @@ export class PlaygroundService {
         ...(result.intelligence ? { intelligence: result.intelligence } : {}),
       };
     }, owner);
+    if (attempt) attempt.jobId = job.id;
+    return job;
   }
   async edit(ownerId: string, siteId: string, prompt: string, baseVersionId?: string, attachmentIds?: readonly string[], referenceIds: readonly string[] = []) {
     const owner = this.#owner(ownerId);

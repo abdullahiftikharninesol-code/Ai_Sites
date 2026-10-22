@@ -1,5 +1,9 @@
 import type { SiteSpec } from "../../sites/domain/site-spec.js";
 import type { AssetManifest } from "../../sites/assets/asset-domain.js";
+import type { AgentImagePart, ReasoningPolicy } from "../../agents/agent-types.js";
+import type { InferenceRunContext } from "../../agents/budget/inference-run-context.js";
+import type { InferenceStage } from "../../agents/budget/agent-run-budget.js";
+import type { ResolvedTemplateDesignReference } from "../../templates/application/template-design-context.js";
 export interface CliTask {
   readonly jobId: string;
   readonly siteId: string;
@@ -9,13 +13,14 @@ export interface CliTask {
   readonly userRequest: string;
   readonly siteSpec?: SiteSpec;
   readonly assetManifest?: AssetManifest;
+  readonly templateDesignReference?: ResolvedTemplateDesignReference;
   /** Transient images supplied to this coder request; never persisted in project/job records. */
-  readonly referenceImages?: readonly import("../../agents/agent-types.js").AgentImagePart[];
+  readonly referenceImages?: readonly AgentImagePart[];
   readonly target?: { readonly path: string; readonly find: string; readonly replace: string };
   readonly generationMode?: "FAST_GENERATION" | "ITERATIVE_FALLBACK";
-  readonly runContext?: import("../../agents/budget/inference-run-context.js").InferenceRunContext;
-  readonly stage?: import("../../agents/budget/agent-run-budget.js").InferenceStage;
-  readonly reasoningPolicy?: import("../../agents/agent-types.js").ReasoningPolicy;
+  readonly runContext?: InferenceRunContext;
+  readonly stage?: InferenceStage;
+  readonly reasoningPolicy?: ReasoningPolicy;
   readonly limits?: {
     readonly timeoutMs?: number;
     readonly maxFiles?: number;

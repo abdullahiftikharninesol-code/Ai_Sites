@@ -33,6 +33,7 @@ import { loadConfig } from "../../app/config/environment.js";
 import { SharedRedisConnection } from "../../redis/shared-redis.js";
 import { TemplateCatalogService } from "../../templates/application/template-catalog-service.js";
 import { TemplateInstantiationService } from "../../templates/application/template-instantiation-service.js";
+import { CatalogTemplateDesignReferenceResolver } from "../../templates/application/template-design-context.js";
 import { TemplateCatalogCache } from "../../templates/cache/template-catalog-cache.js";
 import { createMongoTemplateModels } from "../../templates/persistence/mongo-template-models.js";
 import {
@@ -141,6 +142,7 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
     billing,
     versionCommitter,
     runtimeProvider: siteRuntime,
+    templateDesignReferences: new CatalogTemplateDesignReferenceResolver(templateRepositories.templates, templateSource),
   });
   const templateInstantiation = new TemplateInstantiationService({
     templates: templateRepositories.templates,

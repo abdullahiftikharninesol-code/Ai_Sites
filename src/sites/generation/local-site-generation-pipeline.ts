@@ -66,7 +66,7 @@ import { analyzeRequestProfile, type RequestProfile } from "./request-profile.js
 import { logSiteTokenUsage } from "./site-token-usage-log.js";
 import { createAssetIntent } from "../assets/asset-domain.js";
 import type { BrowserQAReport } from "../../browser-qa/browser-qa-domain.js";
-import type { BrowserQARunner } from "../../browser-qa/browser-qa-runner.js";
+import type { BrowserQARunner, BrowserQACheckExecutor } from "../../browser-qa/browser-qa-runner.js";
 import { browserQACoreCheckExecutors } from "../../browser-qa/browser-qa-core-checks.js";
 import { browserQAResponsiveAndInteractionChecks } from "../../browser-qa/browser-qa-interaction-checks.js";
 import { browserQARuntimeChecks } from "../../browser-qa/browser-qa-runtime-checks.js";
@@ -74,6 +74,8 @@ import { persistBrowserQAReport } from "../../browser-qa/browser-qa-persistence.
 import type { VisualQAReport } from "../../visual-qa/visual-qa-types.js";
 import type { VisualRepairAttempt, VisualReview } from "../../visual-review/visual-review-domain.js";
 import { deriveSiteName, resolveGeneratedSiteName } from "./site-name.js";
+import { templateDesignPrompt, type TemplateDesignReferenceResolver, type TemplateReferenceSelection } from "../../templates/application/template-design-context.js";
+import { templateReferenceSiteSpec, templateReferenceBrowserCheck, requestedTemplateReferenceIdentity } from "../../templates/application/template-reference-generation-contract.js";
 import type {
   BillingAuthorization,
   SiteCreditBillingService,
@@ -90,6 +92,9 @@ export interface GenerateWebsiteRequest {
   readonly browserQAEnabled?: boolean;
   readonly assetManifest?: AssetManifest;
   readonly retainPreview?: boolean;
+  readonly templateReference?: TemplateReferenceSelection;
+  /** Server-owned candidate identity for safe retry of the same reference generation. */
+  readonly referenceGenerationSiteId?: SiteId;
 }
 export interface EditWebsiteRequest {
   readonly userId: UserId;
@@ -165,6 +170,7 @@ export interface LocalSiteGenerationPipelineDependencies {
   assetResolver?: AdapterBackedAssetResolver;
   assetMediaStore?: MediaStore;
   billing?: SiteCreditBillingService;
+  templateDesignReferences?: TemplateDesignReferenceResolver;
   resolveAgentModel(provider: string): string | undefined;
 }
 export class LocalSiteGenerationPipeline {
@@ -179,7 +185,7 @@ export class LocalSiteGenerationPipeline {
   async generate(request: GenerateWebsiteRequest): Promise<SiteGenerationResult> {
     const requestProfile = analyzeRequestProfile(request.prompt);
     const hasVisualReference = request.assetManifest?.assets.some(isVisualReferenceAsset) ?? false;
-    const siteId = randomUUID() as SiteId;
+    const siteId = request.templateReference && request.referenceGenerationSiteId ? request.referenceGenerationSiteId : randomUUID() as SiteId;
     const jobId = randomUUID() as JobId;
     const runContext = createInferenceRunContext({
       runId: jobId,
@@ -215,6 +221,15 @@ export class LocalSiteGenerationPipeline {
     try {
     await this.deps.jobs.save(job);
     this.#scope.validate(request.prompt);
+    if (request.templateReference && !this.deps.templateDesignReferences)
+      throw new ApplicationError("PROVIDER_CONFIGURATION_ERROR", "Template design references are not configured");
+    const templateReference = request.templateReference
+      ? await this.deps.templateDesignReferences!.resolve(request.templateReference) : undefined;
+    if (templateReference && request.referenceGenerationSiteId) {
+      const previous = await this.deps.projects.getById(siteId);
+      if (previous && (previous.ownerId !== request.userId || previous.latestVersionId))
+        throw new ApplicationError("VALIDATION_FAILED", "This reference generation candidate cannot be replaced");
+    }
     const billingAuthorization = await this.#authorizeBilling(
       request.userId,
       request.agentProvider,
@@ -229,7 +244,7 @@ export class LocalSiteGenerationPipeline {
       (request.planningMode === "agent" || request.planningMode === "agent-with-fallback") &&
       Boolean(this.deps.intelligencePlanning);
     const sitePlanResult = isAgentPlanning
-      ? await this.deps.intelligencePlanning!.planSite(request.prompt, request.signal, runContext)
+      ? await this.deps.intelligencePlanning!.planSite(request.prompt, request.signal, runContext, templateReference ? templateDesignPrompt(templateReference.design) : undefined)
       : undefined;
     const project: SiteProject = {
       id: siteId,
@@ -241,7 +256,9 @@ export class LocalSiteGenerationPipeline {
       createdAt: now,
       updatedAt: now,
     };
-    await this.deps.projects.save(project);
+    // Reference generation has no completed template baseline. Keep failed
+    // candidates out of the project gallery until all generation gates pass.
+    if (!templateReference) await this.deps.projects.save(project);
     this.#emit(job, "QUEUED", 0, "Website generation queued");
 
     let requirements: SiteRequirementSpec;
@@ -267,6 +284,7 @@ export class LocalSiteGenerationPipeline {
       siteSpec = assembleSiteSpec(project.name, request.prompt, requirements, design);
     }
 
+    if (templateReference) siteSpec = templateReferenceSiteSpec(siteSpec, request.prompt);
     let assetManifest = request.assetManifest;
     if (!assetManifest && this.deps.assetResolver) {
       const resolvedCapabilities = resolveCapabilities(siteSpec, {
@@ -311,6 +329,7 @@ export class LocalSiteGenerationPipeline {
           generationMode: "FAST_GENERATION" as const,
           userRequest: request.prompt,
           siteSpec,
+          ...(templateReference ? { templateDesignReference: templateReference } : {}),
           ...(assetManifest ? { assetManifest } : {}),
           referenceImages: await loadVisualReferences(assetManifest, this.deps.assetMediaStore),
           limits: {
@@ -347,12 +366,13 @@ export class LocalSiteGenerationPipeline {
       );
       const versionId = randomUUID() as VersionId;
       const browserQARun = await this.#runBrowserQA(
-        request.browserQAEnabled,
+        request.browserQAEnabled || Boolean(templateReference),
         siteId,
         versionId,
         previewResult.url,
         siteSpec,
         assetManifest,
+        templateReference ? [templateReferenceBrowserCheck(templateReference, request.prompt)] : [],
       );
       // Browser QA is the sole default runtime QA system. Legacy screenshot
       // review/repair flags remain readable on old request objects but have no
@@ -378,7 +398,7 @@ export class LocalSiteGenerationPipeline {
         this.deps.execution,
         environment.id,
         sourceArtifactRef,
-        this.#metadata(),
+        { ...this.#metadata(), ...(templateReference ? { templateId: templateReference.design.templateKey, templateVersion: templateReference.design.version } : {}) },
       );
       const changedFiles = summarizeChanges(undefined, snapshot);
       const build = this.#build(environment.id);
@@ -394,7 +414,7 @@ export class LocalSiteGenerationPipeline {
       });
       const resolvedName = resolveGeneratedSiteName({
         prompt: request.prompt,
-        requestedProjectName: request.projectName,
+        requestedProjectName: request.projectName ?? (templateReference ? requestedTemplateReferenceIdentity(request.prompt) : undefined),
         structuredSiteName: session.generatedSiteName,
         documentTitle: session.generatedDocumentTitle,
       });
@@ -410,14 +430,15 @@ export class LocalSiteGenerationPipeline {
         buildStatus: "SUCCEEDED",
         siteSpec,
         technicalProfileId: technicalProfile.id,
-        templateId: this.deps.template.templateId,
-        templateVersion: this.deps.template.templateVersion,
+        templateId: templateReference?.design.templateKey ?? this.deps.template.templateId,
+        templateVersion: templateReference?.design.version ?? this.deps.template.templateVersion,
         changeSummary: changedFiles.summary,
         ...(browserQARun ? this.#versionBrowserQAMetadata(browserQARun.report, browserQARun.artifactRef) : {}),
         usageSummary: { ...session.usage, promptTelemetry: runContext.getSummary().promptExecutions },
         ...(siteRuntime ? { runtimeSchemaVersion: siteRuntime.schemaVersion } : {}),
         createdAt: new Date(),
       };
+      if (templateReference) await this.deps.projects.save(resolvedProject);
       const committedVersion = await this.#commitVersion(resolvedProject, versionDraft, 1);
       retainEnvironment = request.retainPreview === true;
       job = this.#finalJob(job, runContext.getSummary(), true);
@@ -810,6 +831,7 @@ export class LocalSiteGenerationPipeline {
     previewUrl: string,
     siteSpec: SiteSpec | undefined,
     assetManifest?: AssetManifest,
+    additionalChecks: readonly BrowserQACheckExecutor[] = [],
   ): Promise<{ readonly report: BrowserQAReport; readonly artifactRef: string } | undefined> {
     if (!enabled) return undefined;
     if (!this.deps.browserQA)
@@ -820,6 +842,7 @@ export class LocalSiteGenerationPipeline {
       ...browserQARuntimeChecks.filter(({ definition }) =>
         definition.checkId !== "broken-images" || (assetManifest?.assets.length ?? 0) > 0,
       ),
+      ...additionalChecks,
     ];
     const report = await this.deps.browserQA.run({
       runId: `${siteId}-${versionId}`,

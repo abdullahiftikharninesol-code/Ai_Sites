@@ -85,6 +85,8 @@ import {
 import { SITES_UI_REGISTRY } from "../../sites/generation/sites-ui-registry.js";
 import { buildCapabilityAwareGenerationContext } from "./capability-aware-generation-context.js";
 import { validateReferenceInteractions } from "./reference-interaction-validator.js";
+import { templateDesignPrompt } from "../../templates/application/template-design-context.js";
+import { validateTemplateReferenceBundle } from "../../templates/application/template-reference-generation-contract.js";
 import {
   parseEditRequirements,
   containsRenameLiteral,
@@ -605,6 +607,8 @@ export class LocalCliAgentRuntime {
             "patches" in parsed ? parsed.patches : parsed.files,
           )
         : [];
+      if (operation === "GENERATE_SITE" && task.templateDesignReference)
+        validateTemplateReferenceBundle(parsed as SiteCoderFileBundle, task.templateDesignReference, task.userRequest);
       if (operation === "EDIT_SITE" && !broadFunctionalEdit) {
         await applySiteEditPatchBundle(this.execution, environmentId, parsed as SiteEditPatchBundle);
       } else {
@@ -947,6 +951,13 @@ export class LocalCliAgentRuntime {
         },
       );
     }
+    if (operation === "GENERATE_SITE" && task.templateDesignReference) {
+      const current = [];
+      for (const entry of await this.execution.listFiles(environmentId))
+        if (entry.type === "FILE" && isEditableSiteEditPath(entry.path) && /^src\/.+\.(tsx?|jsx?)$/.test(entry.path))
+          current.push({ path: entry.path, content: await this.execution.readFile(environmentId, entry.path) });
+      validateTemplateReferenceBundle({ files: current }, task.templateDesignReference, task.userRequest);
+    }
     if (!this.execution.getLatestPreview(environmentId)?.url) {
       this.progress?.("BUILDING", "Starting required local preview");
       await this.execution.startPreview(environmentId, { port: 4173 });
@@ -1060,7 +1071,7 @@ export class LocalCliAgentRuntime {
         "- Return a complete src/App.tsx. Override src/styles.css only when custom baseline styling is needed; otherwise keep the scaffold stylesheet.",
         "",
         "Art direction:",
-        ...(task.referenceImages?.length ? [
+        ...(task.templateDesignReference ? [templateDesignPrompt(task.templateDesignReference.design)] : task.referenceImages?.length ? [
           "A design reference image is attached. Match the ENTIRE page composition visible in it: page type, navbar, hero arrangement, typography, palette, spacing, and sections. If the image is a landing page with an app dashboard inside its hero, build the landing page AND that dashboard UI.",
           "Rebuild any dashboard or interface shown inside the reference with readable HTML, CSS, and React elements. Do not display or animate the screenshot itself.",
           "Implement the reference's visible navigation as working routes or React views, including the destinations beyond the screenshot. Wire its buttons, menus, tabs, search, and forms to meaningful local behavior. A visual clone with dead controls or alert-only handlers is incomplete. Use browser-local state/storage when no backend was approved; label integrations or server-only actions honestly.",
@@ -1088,7 +1099,7 @@ export class LocalCliAgentRuntime {
           // Its token/utility contract is a fraction of the bytes.
           chunks.push(
             filePath === "src/styles.css"
-              ? summarizeDesignSystem(content, Boolean(task.referenceImages?.length))
+              ? summarizeDesignSystem(content, Boolean(task.referenceImages?.length || task.templateDesignReference))
               : `--- ${filePath}\n${content}`,
           );
         } catch {
