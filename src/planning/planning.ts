@@ -59,6 +59,7 @@ export class DeterministicRequirementsPlanner implements RequirementsPlanner {
     };
     const forbidsForms = has("no forms", "without forms");
     const forbidsLogin = has("no login", "no member login", "no forms or login", "without login");
+    const mockOnly = /\b(?:frontend mock|front-end mock|frontend-only|mock-only|demo-only)\b/i.test(prompt);
     const siteType = has("portfolio")
       ? "portfolio"
       : has("restaurant")
@@ -74,6 +75,7 @@ export class DeterministicRequirementsPlanner implements RequirementsPlanner {
                 : "business";
     const pageCandidates = [
       { name: "Home", path: "/", purpose: "Primary landing page", include: true },
+      { name: "Product Detail", path: "/product", include: /\bproduct[- ]details?\b/i.test(prompt) },
       { name: "About", path: "/about", include: has("about") },
       { name: "Services", path: "/services", include: has("services") },
       {
@@ -113,22 +115,22 @@ export class DeterministicRequirementsPlanner implements RequirementsPlanner {
     });
     let formFeature: string | undefined;
     if (!forbidsForms && has("reservation")) {
-      collections.push(submission("reservation_requests"));
+      if (!mockOnly) collections.push(submission("reservation_requests"));
       formFeature = "reservation form";
     } else if (!forbidsForms && has("appointment")) {
-      collections.push(submission("appointment_requests"));
+      if (!mockOnly) collections.push(submission("appointment_requests"));
       formFeature = "appointment form";
     } else if (!forbidsForms && has("inquiry form")) {
-      collections.push(submission("inquiries"));
+      if (!mockOnly) collections.push(submission("inquiries"));
       formFeature = "inquiry form";
     } else if (!forbidsForms && has("demo request")) {
-      collections.push(submission("demo_requests"));
+      if (!mockOnly) collections.push(submission("demo_requests"));
       formFeature = "demo request form";
     } else if (
       !forbidsForms &&
       (has("contact form", "contact details") || (has("contact") && has("member login")))
     ) {
-      collections.push(submission("contact_submissions"));
+      if (!mockOnly) collections.push(submission("contact_submissions"));
       formFeature = "contact form";
     }
     if (has("testimonials"))

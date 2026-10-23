@@ -135,7 +135,19 @@ img, video, canvas, iframe { display: block; max-width: 100%; height: auto; }
     }
   }
 
-  if (beforeEvidence.length > 0) {
+    if (files.has(stylesPath)) {
+      const source = await execution.readFile(environmentId, stylesPath);
+      const marker = "/* Sites intrinsic grid sizing guard */";
+      if (!source.includes(marker)) {
+        await execution.writeFile(environmentId, stylesPath, source + `\n${marker}\n:where(main,section,article) :where(div,section,article) { min-width: 0; }\n`);
+        changed.push(stylesPath);
+        fixes.push(Object.freeze({ id: "INTRINSIC_GRID_SIZING_GUARD", filesChanged: Object.freeze([stylesPath]),
+          reason: "Allow nested grid/flex items to shrink within their columns rather than clipping tablet controls",
+          before: Object.freeze([`${stylesPath}:missing-intrinsic-grid-sizing-guard`]), after: Object.freeze([`${stylesPath}:${marker}`]) }));
+      }
+    }
+
+    if (beforeEvidence.length > 0) {
     fixes.unshift(Object.freeze({
       id: "IMPORT_SPECIFIER_NORMALIZATION",
       filesChanged: Object.freeze(changed.filter((path) => path !== "src/styles.css")),

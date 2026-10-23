@@ -25,6 +25,7 @@ tests/*
 !tests/site-templates-phase-7.test.ts
 !tests/targeted-edit-completeness.test.ts
 !tests/targeted-edit-reliability.test.ts
+!tests/targeted-edit-schema-reliability.test.ts
 !tests/openai-prompt-cache-key.test.ts
 !tests/browser-qa-fragment-navigation.test.ts
 !tests/site-templates-phase-7l.test.ts
@@ -32,9 +33,15 @@ tests/*
 !tests/corporate-business-browser-qa.test.ts
 !tests/corporate-business-v2-publication.test.ts
 !tests/template-reference-generation.test.ts
+!tests/reference-generation-reliability.test.ts
+!tests/functional-generation-reliability.test.ts
+!tests/functional-qa-reliability.test.ts
+!tests/exact-template-workflow.test.ts
 !tests/mongodb-persistence.test.ts
 !tests/fixtures/
 tests/fixtures/*
+!tests/fixtures/functional-generation-sites.ts
+!tests/fixtures/repaired-template-controls.ts
 !tests/fixtures/template-publisher-valid/
 !tests/fixtures/template-publisher-valid/**
 !tests/sites-premerge-hardening.test.ts
@@ -47,3 +54,5 @@ docs/*
 !docs/template-publishing.md
 !docs/site-version-api.md
 !docs/template-reference-generation.md
+!docs/functional-generation-reliability.md
+!docs/exact-template-workflow.md

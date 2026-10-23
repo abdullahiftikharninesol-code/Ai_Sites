@@ -18,6 +18,8 @@ import type { TemplateCatalogQuery } from "../templates/http/template-catalog-qu
 import { reportTemplatePreviewFailure } from "../templates/application/template-instantiation-diagnostics.js";
 import { parseTemplateReference, type TemplateReferenceSelection } from "../templates/application/template-design-context.js";
 import type { SiteGenerationResult } from "../sites/generation/local-site-generation-pipeline.js";
+import { createDevelopmentFailedCandidateEvidence, type LocalFailedCandidateEvidence } from "../sites/generation/failed-candidate-evidence.js";
+import { createDevelopmentGenerationTelemetry } from "../sites/generation/generation-development-telemetry.js";
 
 export interface PlaygroundConfig {
   host: string;
@@ -85,6 +87,7 @@ const playgroundOrigins = (env: NodeJS.ProcessEnv): readonly string[] => {
  * a default owner.
  */
 export class PlaygroundService {
+  readonly #failedCandidateEvidence: LocalFailedCandidateEvidence | undefined;
   /**
    * Development identity used only by the unauthenticated loopback Socket.IO
    * playground until the GetChatly socket integration phase. Authenticated HTTP
@@ -118,12 +121,16 @@ export class PlaygroundService {
     })();
     this.agentModel =
       realAgentComposition?.orchestrationAgent.getCapabilities().models[0] ?? "mock-sites-v1";
+    this.#failedCandidateEvidence = createDevelopmentFailedCandidateEvidence(config.dataRoot);
+    const developmentTelemetry = createDevelopmentGenerationTelemetry();
     this.product = createMongoPersistentSitesProduct({
       ...(config.databaseUri ? { databaseUri: config.databaseUri } : {}),
       ...(mongoConnection ? { mongoConnection } : {}),
       artifactRoot: join(config.dataRoot, "artifacts"),
       executionRoot: join(config.dataRoot, "execution"),
       ...(realAgentComposition ?? {}),
+      ...(this.#failedCandidateEvidence ? { failedCandidateEvidence: this.#failedCandidateEvidence } : {}),
+      ...(developmentTelemetry ? { developmentTelemetry } : {}),
     });
     this.identities = new MongoIdentityRepository(this.product.database.connection);
     this.#mediaStore = new ArtifactMediaStore(this.product.artifacts);
@@ -143,6 +150,7 @@ export class PlaygroundService {
   async start() {
     if (this.#started) return;
     await mkdir(this.config.dataRoot, { recursive: true });
+    await this.#failedCandidateEvidence?.prune().catch(() => console.warn("[sites] Local diagnostic cleanup unavailable"));
     try {
       await this.product.connectPersistence();
       await this.hosting.start();

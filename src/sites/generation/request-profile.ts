@@ -1,4 +1,5 @@
 import type { SiteSpec } from "../domain/site-spec.js";
+import { functionalRequirements, type FunctionalRequirements } from "./functional-capabilities.js";
 
 export type RequestComplexity = "NORMAL" | "COMPLEX";
 
@@ -6,6 +7,7 @@ export interface RequestProfile {
   readonly complexity: RequestComplexity;
   readonly reasons: readonly string[];
   readonly needsAgentPlanning: boolean;
+  readonly functional: FunctionalRequirements;
 }
 
 // This is deliberately conservative. Ordinary multi-page marketing sites are
@@ -28,6 +30,7 @@ export function analyzeRequestProfile(prompt: string): RequestProfile {
     complexity: reasons.length > 0 ? "COMPLEX" : "NORMAL",
     reasons: Object.freeze(reasons),
     needsAgentPlanning: reasons.length > 0,
+    functional: functionalRequirements(prompt),
   });
 }
 

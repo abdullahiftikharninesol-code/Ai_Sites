@@ -129,7 +129,9 @@ function Footer() {
 
 export function SiteShell({ children }) {
   const location = useLocation();
-  useEffect(() => window.scrollTo({ top: 0, behavior: "auto" }), [location.pathname]);
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }, [location.pathname]);
   return (
     <>
       <a className="skip-link" href="#main-content">

@@ -3,6 +3,8 @@ import type { ResolvedCapabilities } from "../../sites/generation/capability-res
 import type { ResolvedDependencyManifest } from "../../sites/generation/resolved-dependency-manifest.js";
 import type { SitesUiRegistryItem } from "../../sites/generation/sites-ui-registry.js";
 import { isVisualReferenceAsset, type AssetManifest } from "../../sites/assets/asset-domain.js";
+import { analyzeRequestProfile } from "../../sites/generation/request-profile.js";
+import { functionalGenerationContract } from "../../sites/generation/functional-capabilities.js";
 
 export interface CapabilityAwareGenerationContextInput {
   readonly profile: GeneratedAppProfile;
@@ -67,6 +69,9 @@ export function buildCapabilityAwareGenerationContext(
     `Allowed package roots: ${packageRoots.join(", ") || "none"}`,
     `Sites UI registry (named exports, import from): ${uiItems.join(", ") || "none"}`,
     `Asset manifest: ${assets.length ? JSON.stringify(assets) : "none"}`,
+    functionalGenerationContract(analyzeRequestProfile(input.requestText ?? "").functional),
+    "Dismiss/close controls must hide or remove the associated content, not just the icon/button. For notices use a labelled region with data-sites-dismissible (or aria-controls pointing to its id), and conditionally render the entire region from React state. Do not let CSS display rules override hidden content.",
+    "Toggle controls, including task completion, must update meaningful content/state and expose aria-pressed or aria-checked as appropriate. Hover/focus styling alone is not an action.",
     ...(references.length ? [
       `Design references: ${references.map((asset) => asset.provenance.userUploadName ?? asset.assetId).join(", ")}. Their image content is attached separately for visual analysis, not as website media paths.`,
       "Match the entire reference page: its dominant background, page frame, navigation, hero arrangement, content sequence, visual density, cards, controls, typography, and accent colours. Build nested interface previews as real HTML/CSS/React. Do not display or animate the reference image itself. Follow the user's requested content while preserving the reference composition.",

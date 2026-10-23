@@ -81,12 +81,15 @@ import type { AssetManifest } from "../../sites/assets/asset-domain.js";
 import {
   assertStructuredResponseComplete,
   parseStructuredResponse,
+  parseStructuredAgentResponse,
 } from "../../agents/shared/structured-response-parser.js";
 import { SITES_UI_REGISTRY } from "../../sites/generation/sites-ui-registry.js";
 import { buildCapabilityAwareGenerationContext } from "./capability-aware-generation-context.js";
-import { validateReferenceInteractions } from "./reference-interaction-validator.js";
+import { GENERATION_NAVIGATION_RULES, validateReferenceInteractions, validateStaticFragmentNavigation } from "./reference-interaction-validator.js";
 import { templateDesignPrompt } from "../../templates/application/template-design-context.js";
 import { validateTemplateReferenceBundle } from "../../templates/application/template-reference-generation-contract.js";
+import type { FailedCandidateEvidence } from "../../sites/generation/failed-candidate-evidence.js";
+import { recordGenerationTelemetry, referenceContextTelemetry, type GenerationDevelopmentTelemetry } from "../../sites/generation/generation-development-telemetry.js";
 import {
   parseEditRequirements,
   containsRenameLiteral,
@@ -102,6 +105,10 @@ import {
   type EditRequirements,
 } from "./edit-requirements.js";
 import { isEditableSiteEditPath } from "./site-coder-file-bundle.js";
+import { analyzeRequestProfile } from "../../sites/generation/request-profile.js";
+import { assertFunctionalBackendSupport, functionalGenerationContract, validateFunctionalBackendBundle } from "../../sites/generation/functional-capabilities.js";
+import { materializeFunctionalRuntime } from "../../sites/generation/functional-runtime.js";
+import { recoverFunctionalPlaceholders } from "../../sites/generation/functional-recovery.js";
 import {
   getDefaultProfile,
   getProfile,
@@ -242,6 +249,7 @@ export class LocalCliAgentRuntime {
     private readonly providers: AgentProviderRegistry,
     private readonly execution: LocalExecutionProvider,
     private readonly progress?: CliAgentProgressListener,
+    private readonly generationDiagnostics?: { readonly evidence?: FailedCandidateEvidence; readonly telemetry?: GenerationDevelopmentTelemetry },
   ) {}
   async run(
     environmentId: string,
@@ -331,13 +339,16 @@ export class LocalCliAgentRuntime {
         if (name === "run_build") this.progress?.("BUILDING", "Running real local build");
       },
     });
+    const functional = analyzeRequestProfile(task.userRequest).functional;
     if (operation === "GENERATE_SITE") {
+      assertFunctionalBackendSupport(functional, task.siteSpec);
       await scaffoldDeterministicReactVite(this.execution, environmentId, {
         ...(task.siteSpec?.project.name ? { projectName: task.siteSpec.project.name } : {}),
         designSeed: task.userRequest,
       });
       if (dependencyManifest?.capabilities.some(({ id }) => id === "ui"))
         await SITES_UI_REGISTRY.materialize(this.execution, environmentId, technicalProfile);
+      await materializeFunctionalRuntime(this.execution, environmentId, task.siteId);
     }
     const before = new Map<string, string>();
     const scaffoldHashes: Record<string, string> = {};
@@ -455,6 +466,62 @@ export class LocalCliAgentRuntime {
     let directUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
     let directModel = capabilities.models[0] ?? "unknown";
     let requirementRepairRequestSize: ReturnType<typeof measureRequestSize> | undefined;
+    let generatedCandidate: SiteCoderFileBundle | undefined;
+    const functionalAutofixes: string[] = [];
+    // Static navigation/control and compiler failures share the existing repair allowance.
+    // Spending it before materialization must not create another build-repair slot.
+    const maxBuildRepairs = task.limits?.maxBuildRepairs ?? 1;
+    let repairModelCalls = 0;
+    let repairInputTokens = 0;
+    let repairCachedInputTokens = 0;
+    let repairOutputTokens = 0;
+    const requestSourceRepair = async (output: string, repairContext: string, kind: "build" | "navigation" | "interaction" = "build") => {
+      const repairPrompt = resolveAgentPrompt("sites.build-repair", { expectedStage: "BUILD_REPAIR" });
+      const repairProvider = effectiveContext.createScopedProvider(rawGatewayProvider, "BUILD_REPAIR");
+      const repairPolicy = getInferenceContextPolicy("BUILD_REPAIR", { overrideMaxOutput: task.limits?.maxOutputTokens });
+      const responseContract = {
+        type: "JSON_SCHEMA" as const, name: "BuildRepairPatchBundle",
+        schema: BUILD_REPAIR_PATCH_BUNDLE_JSON_SCHEMA, strict: true,
+      };
+      const response = await repairProvider.createResponse({
+        model: capabilities.models[0] ?? "unknown",
+        systemInstructions: repairPrompt.prompt.systemPrompt,
+        messages: [{ role: "user", content: [
+          "Return exactly one JSON BuildRepairPatchBundle. Do not call tools.",
+          kind === "navigation"
+            ? "Only repair the reported missing navigation destinations. Keep the existing design and working functionality. Implement meaningful visible content for existing links, or a real semantic button with working state for actions. Do not insert fake/empty IDs, disable links, redirect to unrelated sections, or remove requested functionality."
+            : kind === "interaction"
+              ? "Complete every reported inert control with meaningful working React behavior or a real navigation destination. Preserve the existing design and working functionality. Use the managed functional APIs below where relevant. For support/story/size controls provide genuine relevant content; demo checkout must show honest no-payment feedback, never claim a transaction. Social navigation needs an actual supplied destination, not a fabricated URL. Do not remove or disable controls, add no-op/alert-only handlers, or redirect to unrelated content to satisfy validation."
+            : "Only repair the reported build failure. Do not modify managed files, package manifests, or dependencies.",
+          kind === "interaction" ? functionalGenerationContract(functional) : "",
+          "Do not modify managed files, package manifests, or dependencies. Patch only the supplied application source.",
+          "Address every reported diagnostic, and leave each patched file syntactically complete: balanced JSX tags, braces, and parentheses.",
+          "Each 'find' must match the file byte-for-byte. Any leading 'NN: ' line numbers in the source excerpt below are display only and are not part of the file.",
+          `${kind === "build" ? "Build output" : "Static validation diagnostics"}:\n${output}`,
+          dependencyManifest ? `Current dependency manifest:\n${JSON.stringify({
+            dependencies: dependencyManifest.dependencies, devDependencies: dependencyManifest.devDependencies,
+          })}` : "",
+          repairContext ? `Relevant source files:\n${repairContext}` : "",
+        ].filter(Boolean).join("\n\n") }],
+        maxOutputTokens: repairPolicy.outputPolicy.defaultMaxOutputTokens,
+        reasoningPolicy: repairPolicy.reasoningPolicy,
+        responseContract,
+        ...(signal ? { signal } : {}),
+      });
+      repairModelCalls += 1;
+      repairInputTokens += response.usage.inputTokens;
+      repairCachedInputTokens += response.usage.cachedInputTokens ?? 0;
+      repairOutputTokens += response.usage.outputTokens;
+      assertStructuredResponseComplete(response, "Build repair");
+      return parseStructuredResponse({
+        content: response.message.content, contract: responseContract,
+        capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
+        validate: validateBuildRepairPatchBundle, errorContext: "Build repair",
+      }).value;
+    };
+    const referenceText = task.templateDesignReference ? templateDesignPrompt(task.templateDesignReference.design) : undefined;
+    let contextTelemetry = referenceContextTelemetry(task.templateDesignReference?.design);
+    try {
     this.progress?.("GENERATING", operation === "EDIT_SITE" ? "Applying bounded edit patch" : "Generating bounded source file bundle");
     if (boundedStructuredOperation) {
       const responseContract = operation === "EDIT_SITE" && !broadFunctionalEdit ? {
@@ -495,6 +562,7 @@ export class LocalCliAgentRuntime {
               "The bundle must contain a complete, non-empty src/App.tsx application entry component.",
               "You may add components, views, pages, and custom CSS files. Every local import you add must resolve to a file in this bundle or the documented scaffold.",
               "Return compilable TypeScript/TSX, use React state for requested demo interactions, and do not regenerate unchanged scaffold boilerplate.",
+              "Every control you add, including story/support/size-guide/footer controls, must work. Only include social links with supplied destinations; do not invent them. A demo checkout must provide honest visible no-payment feedback, not an inert Checkout button or a fake transaction.",
               "In JSX text, write < and > as &lt; and &gt; and { } as &#123; &#125;; copy such as \"go live in <5 minutes\" is a TypeScript syntax error. Keep every JSX tag, brace, and parenthesis balanced.",
             ].join(" ")
           : "",
@@ -536,6 +604,10 @@ export class LocalCliAgentRuntime {
         ].filter(Boolean).join("\n\n"),
         ...(imageParts.length ? { imageParts } : {}),
       };
+      if (operation === "GENERATE_SITE") {
+        contextTelemetry = referenceContextTelemetry(task.templateDesignReference?.design, referenceText && primaryMessage.content.includes(referenceText) ? referenceText : undefined);
+        recordGenerationTelemetry(this.generationDiagnostics?.telemetry, { jobId: task.jobId, role: "sites.site-coder", model: capabilities.models[0], ...contextTelemetry });
+      }
       let response = await gatewayProvider.createResponse({
         model: capabilities.models[0] ?? "unknown",
         systemInstructions: runtimePrompt.prompt.systemPrompt,
@@ -547,12 +619,8 @@ export class LocalCliAgentRuntime {
         responseContract,
         ...(signal ? { signal } : {}),
       });
-      assertStructuredResponseComplete(
+      let parsed = parseStructuredAgentResponse<SiteCoderFileBundle | SiteEditPatchBundle>({
         response,
-        operation === "EDIT_SITE" ? "Targeted edit" : "Site coder",
-      );
-      let parsed = parseStructuredResponse<SiteCoderFileBundle | SiteEditPatchBundle>({
-        content: response.message.content,
         contract: responseContract,
         capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
         validate: (value) => operation === "EDIT_SITE" && !broadFunctionalEdit
@@ -560,6 +628,11 @@ export class LocalCliAgentRuntime {
           : validateSiteCoderFileBundle(value, completionRequirements),
         errorContext: operation === "EDIT_SITE" ? "Site edit" : "Site coder",
       }).value;
+      if (operation === "GENERATE_SITE") {
+        const recovered = recoverFunctionalPlaceholders(parsed as SiteCoderFileBundle, task.userRequest);
+        parsed = recovered.bundle; generatedCandidate = recovered.bundle;
+        functionalAutofixes.push(...recovered.fixes);
+      }
       const responses = [response];
       if (operation === "GENERATE_SITE" && imageParts.length) {
         try {
@@ -597,6 +670,9 @@ export class LocalCliAgentRuntime {
             validate: (value) => validateSiteCoderFileBundle(value, completionRequirements),
             errorContext: "Reference interaction repair",
           }).value;
+          generatedCandidate = parsed;
+          const recovered = recoverFunctionalPlaceholders(parsed, task.userRequest);
+          parsed = recovered.bundle; generatedCandidate = recovered.bundle; functionalAutofixes.push(...recovered.fixes);
           validateReferenceInteractions(parsed);
         }
       }
@@ -607,6 +683,44 @@ export class LocalCliAgentRuntime {
             "patches" in parsed ? parsed.patches : parsed.files,
           )
         : [];
+      if (operation === "GENERATE_SITE") {
+        try {
+          validateReferenceInteractions(parsed as SiteCoderFileBundle);
+        } catch (cause) {
+          if (!(cause instanceof ApplicationError) || cause.code !== "GENERATION_INCOMPLETE" ||
+            !["navigation.fragments", "interaction.controls"].includes(String(cause.metadata?.validationCheck)) || repairModelCalls >= maxBuildRepairs) throw cause;
+          const kind = cause.metadata?.validationCheck === "interaction.controls" ? "interaction" : "navigation";
+          this.progress?.("GENERATING", "Repairing incomplete navigation/controls within the build-repair allowance");
+          const candidate = parsed as SiteCoderFileBundle;
+          // The public error abbreviates after five findings. The repair must see
+          // all bounded findings, including footer controls beyond that summary.
+          const findings = cause.metadata?.findings;
+          const diagnostics = [cause.message, ...(Array.isArray(findings) ? findings.filter((item): item is string => typeof item === "string").slice(0, 25) : [])].join("\n");
+          const repairContext = await this.#extractRepairContext(environmentId, diagnostics, candidate);
+          const patches = await requestSourceRepair(diagnostics, repairContext, kind);
+          // Repair the uncommitted bundle in memory. Invalid source never replaces
+          // the working scaffold/current project and never bypasses normal checks.
+          const files = new Map(candidate.files.map(file => [file.path, file.content]));
+          await applyBuildRepairPatchBundle({
+            readFile: (_environmentId, path) => {
+              const content = files.get(path);
+              if (content === undefined) throw new ApplicationError("VALIDATION_FAILED", `Source repair targeted a file outside the candidate: ${path}`);
+              return Promise.resolve(content);
+            },
+            writeFile: (_environmentId, path, content) => { files.set(path, content); return Promise.resolve(); },
+          }, environmentId, patches);
+          generatedCandidate = { ...candidate, files: [...files].map(([path, content]) => ({ path, content })) };
+          parsed = validateSiteCoderFileBundle(generatedCandidate, completionRequirements);
+          const recovered = recoverFunctionalPlaceholders(parsed, task.userRequest);
+          parsed = recovered.bundle; generatedCandidate = recovered.bundle;
+          functionalAutofixes.push(...recovered.fixes);
+          validateReferenceInteractions(parsed);
+        }
+      }
+      if (operation === "GENERATE_SITE") {
+        validateReferenceInteractions(parsed as SiteCoderFileBundle);
+        validateFunctionalBackendBundle(parsed as SiteCoderFileBundle, functional);
+      }
       if (operation === "GENERATE_SITE" && task.templateDesignReference)
         validateTemplateReferenceBundle(parsed as SiteCoderFileBundle, task.templateDesignReference, task.userRequest);
       if (operation === "EDIT_SITE" && !broadFunctionalEdit) {
@@ -721,9 +835,8 @@ export class LocalCliAgentRuntime {
               ...(signal ? { signal } : {}),
             });
             responses.push(repairResponse);
-            assertStructuredResponseComplete(repairResponse, "Targeted edit requirement repair");
-            const repairBundle = parseStructuredResponse({
-              content: repairResponse.message.content,
+            const repairBundle = parseStructuredAgentResponse({
+              response: repairResponse,
               contract: {
                 type: "JSON_SCHEMA" as const,
                 name: "SiteEditPatchBundle",
@@ -826,10 +939,6 @@ export class LocalCliAgentRuntime {
         );
     }
     let automaticBuildAttempts = 0;
-    let repairModelCalls = 0;
-    let repairInputTokens = 0;
-    let repairCachedInputTokens = 0;
-    let repairOutputTokens = 0;
     let initialBuildDiagnostics: string | undefined;
     let build = this.execution.getLastBuildResult(environmentId);
     if (this.execution.getLastBuildSuccess(environmentId) !== true) {
@@ -858,9 +967,8 @@ export class LocalCliAgentRuntime {
         });
       }
     }
-    const maxBuildRepairs = task.limits?.maxBuildRepairs ?? 1;
     for (
-      let repairAttempt = 1;
+      let repairAttempt = repairModelCalls + 1;
       build && (build.exitCode !== 0 || build.timedOut) && repairAttempt <= maxBuildRepairs;
       repairAttempt += 1
     ) {
@@ -873,59 +981,8 @@ export class LocalCliAgentRuntime {
         `Repairing production build (${repairAttempt}/${maxBuildRepairs})`,
       );
       const repairContext = await this.#extractRepairContext(environmentId, output);
-      const repairPrompt = resolveAgentPrompt("sites.build-repair", {
-        expectedStage: "BUILD_REPAIR",
-      });
-      const repairProvider = effectiveContext.createScopedProvider(
-        rawGatewayProvider,
-        "BUILD_REPAIR",
-      );
-      const repairPolicy = getInferenceContextPolicy("BUILD_REPAIR", {
-        overrideMaxOutput: task.limits?.maxOutputTokens,
-      });
-      {
-        const responseContract = {
-          type: "JSON_SCHEMA" as const,
-          name: "BuildRepairPatchBundle",
-          schema: BUILD_REPAIR_PATCH_BUNDLE_JSON_SCHEMA,
-          strict: true,
-        };
-        const response = await repairProvider.createResponse({
-          model: capabilities.models[0] ?? "unknown",
-          systemInstructions: repairPrompt.prompt.systemPrompt,
-          messages: [{ role: "user", content: [
-            "Return exactly one JSON BuildRepairPatchBundle. Do not call tools.",
-            "Only repair the reported build failure. Do not modify managed files, package manifests, or dependencies.",
-            "Address every reported diagnostic, and leave each patched file syntactically complete: balanced JSX tags, braces, and parentheses.",
-            "Each 'find' must match the file byte-for-byte. Any leading 'NN: ' line numbers in the source excerpt below are display only and are not part of the file.",
-            `Build output:\n${output}`,
-            dependencyManifest
-              ? `Current dependency manifest:\n${JSON.stringify({
-                  dependencies: dependencyManifest.dependencies,
-                  devDependencies: dependencyManifest.devDependencies,
-                })}`
-              : "",
-            repairContext ? `Relevant source files:\n${repairContext}` : "",
-          ].filter(Boolean).join("\n\n") }],
-          maxOutputTokens: repairPolicy.outputPolicy.defaultMaxOutputTokens,
-          reasoningPolicy: repairPolicy.reasoningPolicy,
-          responseContract,
-          ...(signal ? { signal } : {}),
-        });
-        assertStructuredResponseComplete(response, "Build repair");
-        const patchBundle = parseStructuredResponse({
-          content: response.message.content,
-          contract: responseContract,
-          capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
-          validate: validateBuildRepairPatchBundle,
-          errorContext: "Build repair",
-        }).value;
-        await applyBuildRepairPatchBundle(this.execution, environmentId, patchBundle);
-        repairModelCalls = 1;
-        repairInputTokens = response.usage.inputTokens;
-        repairCachedInputTokens = response.usage.cachedInputTokens ?? 0;
-        repairOutputTokens = response.usage.outputTokens;
-      }
+      const patchBundle = await requestSourceRepair(output, repairContext);
+      await applyBuildRepairPatchBundle(this.execution, environmentId, patchBundle);
       automaticBuildAttempts += 1;
       build = await this.execution.executeCommand(environmentId, {
         executable: "npm",
@@ -951,12 +1008,16 @@ export class LocalCliAgentRuntime {
         },
       );
     }
-    if (operation === "GENERATE_SITE" && task.templateDesignReference) {
+    if (operation === "GENERATE_SITE") {
       const current = [];
       for (const entry of await this.execution.listFiles(environmentId))
         if (entry.type === "FILE" && isEditableSiteEditPath(entry.path) && /^src\/.+\.(tsx?|jsx?)$/.test(entry.path))
           current.push({ path: entry.path, content: await this.execution.readFile(environmentId, entry.path) });
-      validateTemplateReferenceBundle({ files: current }, task.templateDesignReference, task.userRequest);
+      generatedCandidate = { files: current };
+      validateStaticFragmentNavigation(generatedCandidate);
+      validateReferenceInteractions(generatedCandidate);
+      validateFunctionalBackendBundle(generatedCandidate, functional);
+      if (task.templateDesignReference) validateTemplateReferenceBundle({ files: current }, task.templateDesignReference, task.userRequest);
     }
     if (!this.execution.getLatestPreview(environmentId)?.url) {
       this.progress?.("BUILDING", "Starting required local preview");
@@ -1024,7 +1085,7 @@ export class LocalCliAgentRuntime {
       },
       ...(generationCompletion ? { generationCompletion } : {}),
       generationMode: operation === "EDIT_SITE" ? "TARGETED_EDIT" : "FAST_GENERATION",
-      deterministicAutofixes: autofixResult.fixes.map((fix) => fix.id),
+      deterministicAutofixes: [...autofixResult.fixes.map((fix) => fix.id), ...new Set(functionalAutofixes)],
       buildRepairInvoked: repairModelCalls > 0,
       ...(operation === "GENERATE_SITE" && bundle?.siteName
         ? { generatedSiteName: bundle.siteName }
@@ -1035,6 +1096,31 @@ export class LocalCliAgentRuntime {
           : {}
         : {}),
     };
+    } catch (cause) {
+      if (operation === "GENERATE_SITE" && cause instanceof ApplicationError &&
+        ["GENERATION_INCOMPLETE", "VALIDATION_FAILED", "SOURCE_SECURITY_VALIDATION_FAILED", "REPAIR_LIMIT_REACHED"].includes(cause.code)) {
+        const failureStage = cause.metadata?.failureStage === "BUILD" ? "BUILD" : "STATIC_VALIDATION";
+        let candidateDiagnosticPath: string | undefined;
+        if (generatedCandidate && this.generationDiagnostics?.evidence) {
+          try {
+            const path = await this.generationDiagnostics.evidence.preserve({ execution: this.execution, environmentId,
+              jobId: task.jobId, siteId: task.siteId, candidate: generatedCandidate,
+              functionalRequirements: functional, referenceContext: contextTelemetry,
+              ...(generationCompletion ? { completion: generationCompletion } : {}),
+              validationFailure: { failureStage, code: cause.code,
+                check: typeof cause.metadata?.validationCheck === "string" ? cause.metadata.validationCheck : failureStage === "BUILD" ? "build.diagnostics" : "generation.static",
+                message: cause.message + (failureStage === "BUILD" && typeof cause.metadata?.diagnostics === "string" ? `\n${cause.metadata.diagnostics}` : ""), buildPassed: this.execution.getLastBuildSuccess(environmentId) === true },
+            });
+            if (path) candidateDiagnosticPath = path;
+          } catch { console.warn("[sites] Early candidate diagnostics unavailable; original validation failure preserved"); }
+        } else if (this.generationDiagnostics?.evidence) {
+          console.warn("[sites] No parsed candidate source available for early failure diagnostics");
+        }
+        recordGenerationTelemetry(this.generationDiagnostics?.telemetry, { jobId: task.jobId, role: "sites.site-coder",
+          model: capabilities.models[0], ...contextTelemetry, failureStage, candidateDiagnosticPath });
+      }
+      throw cause;
+    }
   }
   async #discoverContext(
     environmentId: string,
@@ -1067,6 +1153,7 @@ export class LocalCliAgentRuntime {
         ...profile.files.managed.map((path) => `- ${path}`),
         "",
         "Rules:",
+        GENERATION_NAVIGATION_RULES,
         "- Do not add external packages unless explicitly permitted.",
         "- Return a complete src/App.tsx. Override src/styles.css only when custom baseline styling is needed; otherwise keep the scaffold stylesheet.",
         "",
@@ -1148,11 +1235,14 @@ export class LocalCliAgentRuntime {
 
     // Sorted so the prefix is byte-stable between edits, and so a file changed by
     // one edit only invalidates the cache from its own position onward.
-    const sorted = [...editableFiles].sort((left, right) => left.path.localeCompare(right.path));
+    const broadFunctionalEdit = isBroadFunctionalEdit(task.userRequest);
+    // Full-file edits cannot write managed root HTML. Do not advertise it as
+    // editable under that contract; precise branding patches still receive it.
+    const sorted = editableFiles.filter(file => !broadFunctionalEdit || file.path !== "index.html")
+      .sort((left, right) => left.path.localeCompare(right.path));
     const baseline = sorted.find((file) => file.path === BASELINE_STYLESHEET);
     const core = sorted.filter((file) => file.path !== BASELINE_STYLESHEET);
     const coreBytes = core.reduce((total, file) => total + Buffer.byteLength(file.content), 0);
-    const broadFunctionalEdit = isBroadFunctionalEdit(task.userRequest);
     const selection = selectEditContextFiles(task.userRequest, sorted, { maxFiles, includeAllEditable: broadFunctionalEdit });
 
     // Small projects: send all application source inside the cached prefix. It
@@ -1188,7 +1278,7 @@ export class LocalCliAgentRuntime {
     const excerptSent = withinBudget(tokenExcerpts);
 
     const stable = [
-      `Sites-managed and off-limits (not shown): ${profile.files.managed.filter((path) => path !== "index.html").join(", ")}`,
+      `Sites-managed and off-limits (not shown): ${profile.files.managed.filter((path) => broadFunctionalEdit || path !== "index.html").join(", ")}`,
       `Editable project files: ${sorted.map((file) => file.path).join(", ")}`,
       // Without the stylesheet itself, the model still needs to know the tokens exist.
       ...(baseline ? [summarizeDesignSystem(baseline.content)] : []),
@@ -1253,13 +1343,13 @@ export class LocalCliAgentRuntime {
       ].join("\n"),
     );
   }
-  async #extractRepairContext(environmentId: string, buildOutput: string): Promise<string> {
+  async #extractRepairContext(environmentId: string, buildOutput: string, candidate?: SiteCoderFileBundle): Promise<string> {
     const normalizedOutput = buildOutput.replaceAll("\\", "/");
     const fileMatches = normalizedOutput.match(/(?:src\/[a-zA-Z0-9_./-]+\.(?:tsx?|jsx?|css|json))/g);
     const targetFiles = Array.from(new Set(fileMatches ?? []));
     if (targetFiles.length === 0) {
       try {
-        const list = await this.execution.listFiles(environmentId);
+        const list = candidate?.files ?? await this.execution.listFiles(environmentId);
         if (list.some((item) => item.path === "src/App.tsx")) {
           targetFiles.push("src/App.tsx");
         }
@@ -1272,7 +1362,10 @@ export class LocalCliAgentRuntime {
     const maxBytes = 16_000;
     for (const filePath of targetFiles.slice(0, 5)) {
       try {
-        const content = await this.execution.readFile(environmentId, filePath);
+        const content = candidate
+          ? candidate.files.find(file => file.path === filePath)?.content
+          : await this.execution.readFile(environmentId, filePath);
+        if (content === undefined) continue;
         const remaining = maxBytes - totalBytes;
         if (remaining <= 0) break;
         const excerpt = buildRepairSourceExcerpt(filePath, content, normalizedOutput, remaining);

@@ -26,7 +26,7 @@ export default tseslint.config(
   },
   {
     ...tseslint.configs.disableTypeChecked,
-    files: ["scripts/corporate-business-v2-publication.mjs"],
+    files: ["scripts/corporate-business-v2-publication.mjs", "scripts/prepare-exact-template-finalization.mjs"],
   },
   {
     files: [

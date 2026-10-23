@@ -4,6 +4,8 @@ import type { SiteCoderFileBundle } from "./site-coder-file-bundle.js";
 
 type Element = ts.JsxOpeningElement | ts.JsxSelfClosingElement;
 
+export const GENERATION_NAVIGATION_RULES = "NAVIGATION: every href must reach a real route or rendered section on that page. A Size guide link needs visible sizing content at its destination, not an empty ID. ACTIONS: use working React buttons/forms for cart, search, account, filters and newsletter. Cart drawer: <button onClick={openCart}>Cart</button>; page: <a href=\"/cart\">Cart</a> only if /cart exists. Never use <a href=\"#cart\">Cart</a> without a rendered #cart destination. Before returning, check every href against rendered destinations; no placeholders or fake/empty targets.";
+
 function attribute(element: Element, name: string): ts.JsxAttribute | undefined {
   return element.attributes.properties.find((item): item is ts.JsxAttribute =>
     ts.isJsxAttribute(item) && item.name.getText() === name,
@@ -19,18 +21,19 @@ function literalAttribute(element: Element, name: string): string | undefined {
   return value && ts.isStringLiteral(value) ? value.text : undefined;
 }
 
-function ineffectiveHandler(value: ts.JsxAttribute | undefined): boolean {
+export function ineffectiveHandler(value: ts.JsxAttribute | undefined): boolean {
   const initializer = value?.initializer;
   if (!initializer || !ts.isJsxExpression(initializer)) return false;
   const expression = initializer.expression;
   if (!expression) return true;
-  if (ts.isIdentifier(expression) && ["undefined", "null"].includes(expression.text)) return true;
+  if (expression.kind === ts.SyntaxKind.NullKeyword || (ts.isIdentifier(expression) && expression.text === "undefined")) return true;
   if (!ts.isArrowFunction(expression) && !ts.isFunctionExpression(expression)) return false;
   const body = expression.body;
   if (ts.isBlock(body)) {
     if (body.statements.length === 0) return true;
+    if (body.statements.length === 1 && ts.isReturnStatement(body.statements[0]!) && !body.statements[0].expression) return true;
     if (body.statements.length !== 1 || !ts.isExpressionStatement(body.statements[0]!)) return false;
-    return ineffectiveCall(body.statements[0]!.expression);
+    return ineffectiveCall(body.statements[0].expression);
   }
   return ineffectiveCall(body);
 }
@@ -53,8 +56,66 @@ function handledFormAncestor(node: ts.Node): boolean {
   return false;
 }
 
+/** Only reject decidable native fragment links. Runtime QA owns dynamic/router behavior. */
+export function validateStaticFragmentNavigation(bundle: SiteCoderFileBundle): void {
+  const targets = new Set<string>();
+  const links: Array<{ target: string; location: string }> = [];
+  const components = new Set<string>();
+  let dynamicTargets = false;
+  const sources = bundle.files.filter((file) => /\.(?:tsx?|jsx?)$/i.test(file.path)).map((file) => ({
+    file, ast: ts.createSourceFile(file.path, file.content, ts.ScriptTarget.Latest, true,
+      /x$/i.test(file.path) ? ts.ScriptKind.TSX : ts.ScriptKind.TS),
+  }));
+  for (const { ast } of sources) {
+    const declarations = (node: ts.Node): void => {
+      if (ts.isFunctionDeclaration(node) && node.name && node.body) components.add(node.name.text);
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer &&
+        (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))) components.add(node.name.text);
+      ts.forEachChild(node, declarations);
+    };
+    declarations(ast);
+  }
+  for (const { file, ast } of sources) {
+    const visit = (node: ts.Node): void => {
+      if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+        const tag = node.tagName.getText(ast);
+        // Unavailable component implementations/spreads may supply valid targets.
+        if (hasSpread(node) || attribute(node, "dangerouslySetInnerHTML") ||
+          (/^[A-Z]/.test(tag) && !components.has(tag))) dynamicTargets = true;
+        const id = attribute(node, "id");
+        if (id) {
+          const initializer = id.initializer;
+          const expression = initializer && ts.isJsxExpression(initializer) ? initializer.expression : initializer;
+          if (expression && (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression))) targets.add(expression.text);
+          else dynamicTargets = true;
+        }
+        if (tag === "a") {
+          const href = literalAttribute(node, "href");
+          const click = attribute(node, "onClick");
+          if (href?.startsWith("#") && href.length > 1 && !hasSpread(node) && (!click || ineffectiveHandler(click))) {
+            let target = href.slice(1);
+            try { target = decodeURIComponent(target); } catch { /* Invalid encodings remain unmatched. */ }
+            links.push({ target, location: `${file.path}:${ast.getLineAndCharacterOfPosition(node.getStart(ast)).line + 1}` });
+          }
+        }
+      }
+      if (ts.isCallExpression(node) && /(?:createElement|setAttribute|insertAdjacentHTML)$/.test(node.expression.getText(ast))) dynamicTargets = true;
+      if (ts.isBinaryExpression(node) && /(?:innerHTML|outerHTML|\.id)$/.test(node.left.getText(ast))) dynamicTargets = true;
+      if (ts.isPropertyAccessExpression(node) && node.name.text === "hash") dynamicTargets = true;
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+  }
+  if (dynamicTargets) return;
+  const missing = links.filter(({ target }) => !targets.has(target));
+  if (missing.length) throw new ApplicationError("GENERATION_INCOMPLETE",
+    `Navigation has missing fragment destinations: ${missing.slice(0, 5).map(({ target, location }) => `${location} -> #${target}`).join("; ")}`,
+    { metadata: { failureStage: "STATIC_VALIDATION", validationCheck: "navigation.fragments" } });
+}
+
 /** Rejects obvious screenshot-only controls before a reference-based site is saved. */
 export function validateReferenceInteractions(bundle: SiteCoderFileBundle): void {
+  validateStaticFragmentNavigation(bundle);
   const issues: string[] = [];
   for (const file of bundle.files) {
     if (!/\.(?:tsx|jsx)$/i.test(file.path)) continue;
@@ -100,5 +161,6 @@ export function validateReferenceInteractions(bundle: SiteCoderFileBundle): void
     throw new ApplicationError(
       "GENERATION_INCOMPLETE",
       `Reference-based site has non-functional controls: ${issues.slice(0, 5).join("; ")}${issues.length > 5 ? `; and ${issues.length - 5} more` : ""}`,
+      { metadata: { failureStage: "STATIC_VALIDATION", validationCheck: "interaction.controls", findings: issues.slice(0, 25) } },
     );
 }

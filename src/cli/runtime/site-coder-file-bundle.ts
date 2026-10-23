@@ -51,21 +51,29 @@ export const SITE_EDIT_PATCH_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unknown
 });
 
 export function validateSiteEditPatchBundle(value: unknown): SiteEditPatchBundle {
-  if (!value || typeof value !== "object" || !Array.isArray((value as { patches?: unknown }).patches))
-    throw new ApplicationError("VALIDATION_FAILED", "SiteEditPatchBundle must contain a patches array");
+  function invalid(path: string, detail: string, managed = false): never {
+    throw new ApplicationError(managed ? "MANAGED_FILE_MODIFICATION" : "VALIDATION_FAILED",
+      `SiteEditPatchBundle ${path}: ${detail}`, { metadata: { validationPath: path, validationCategory: managed ? "DISALLOWED_PATH" : "SCHEMA_MISMATCH" } });
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) invalid("$", "expected an object");
+  if (!Array.isArray((value as { patches?: unknown }).patches)) invalid("$.patches", "required array is missing or invalid");
+  if (Object.keys(value).some(key => key !== "patches")) invalid("$", "unexpected fields; expected only patches");
   const patches = (value as { patches: readonly unknown[] }).patches;
   if (patches.length === 0 || patches.length > 8)
-    throw new ApplicationError("VALIDATION_FAILED", "Site edit patch count is outside the allowed range");
+    invalid("$.patches", "expected between 1 and 8 patches");
   // Several patches may target one file: "change the headline and the CTA" is a
   // single ordinary edit, and each patch is applied against freshly read content.
-  return Object.freeze({ patches: Object.freeze(patches.map((item) => {
-    if (!item || typeof item !== "object") throw new ApplicationError("VALIDATION_FAILED", "Invalid site edit patch");
+  return Object.freeze({ patches: Object.freeze(patches.map((item, index) => {
+    const at = `$.patches[${index}]`;
+    if (!item || typeof item !== "object" || Array.isArray(item)) invalid(at, "expected an object");
+    if (Object.keys(item).some(key => !["path", "find", "replace", "mode"].includes(key))) invalid(at, "unexpected patch fields");
     const patch = item as { path?: unknown; find?: unknown; replace?: unknown; mode?: unknown };
-    if (typeof patch.path !== "string" || typeof patch.find !== "string" || !patch.find ||
-      typeof patch.replace !== "string" || !isEditableSiteEditPath(patch.path))
-      throw new ApplicationError("MANAGED_FILE_MODIFICATION", `Site edit patch contains a disallowed path: ${String(patch.path)}`);
+    if (typeof patch.path !== "string") invalid(`${at}.path`, "required string is missing or invalid");
+    if (typeof patch.find !== "string" || !patch.find) invalid(`${at}.find`, "required non-empty string is missing or invalid");
+    if (typeof patch.replace !== "string") invalid(`${at}.replace`, "required string is missing or invalid");
+    if (!isEditableSiteEditPath(patch.path)) invalid(`${at}.path`, "disallowed path", true);
     if (patch.mode !== undefined && patch.mode !== "unique" && patch.mode !== "all")
-      throw new ApplicationError("VALIDATION_FAILED", `Site edit patch mode must be "unique" or "all": ${String(patch.mode)}`);
+      invalid(`${at}.mode`, 'mode must be "unique" or "all"');
     // Providers without strict schema support may omit the mode; unique is the safe default.
     const mode: SiteEditPatchMode = patch.mode === "all" ? "all" : "unique";
     return Object.freeze({ path: patch.path, find: patch.find, replace: patch.replace, mode });

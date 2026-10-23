@@ -4,6 +4,66 @@ import {
   type BrowserQAEvidence,
 } from "./browser-qa-domain.js";
 import type { BrowserQACheckExecutor } from "./browser-qa-runner.js";
+import type { Page, Locator } from "playwright";
+
+export async function closeControlledPanel(page: Page, control: Locator): Promise<boolean> {
+  const id = await control.getAttribute("aria-controls");
+  if (!id) return false;
+  const panel = page.locator(`[id="${escapeCssId(id)}"]`);
+  const close = panel.getByRole("button", { name: /^close(?:\s|$)/i }).first();
+  if (!(await panel.isVisible()) || !(await close.count()) || !(await close.isVisible())) return false;
+  if (await close.evaluate(element => (element as HTMLButtonElement).type === "submit" && !!element.closest("form"))) return false;
+  await close.click({ timeout: 800 });
+  return true;
+}
+
+/** Close through a real control, never force-click through an overlay or hide it. */
+export async function closeVisibleDialog(page: Page): Promise<boolean> {
+  const dialogs = page.locator('dialog[open],[role="dialog"]');
+  for (const dialog of await dialogs.all()) {
+    if (!(await dialog.isVisible())) continue;
+    const close = dialog.getByRole("button", { name: /^close(?:\s|$)/i }).last();
+    if (await close.count() && await close.isVisible()) await close.click({ timeout: 800 });
+    else if (await dialog.evaluate(element => element.tagName === "DIALOG")) await page.keyboard.press("Escape");
+    else throw new Error("Opened dialog has no usable Close control");
+    if (await dialog.isVisible()) throw new Error("Dialog Close control does not close its panel");
+    return true;
+  }
+  return false;
+}
+
+export async function probeSizeSelection(page: Page): Promise<void> {
+  const select = page.getByRole("combobox", { name: /^size$/i }).first();
+  if (await select.count()) {
+    const current = await select.inputValue();
+    const options = await select.locator("option").evaluateAll(items => items.filter(item => !(item as HTMLOptionElement).disabled).map(item => (item as HTMLOptionElement).value));
+    const alternative = options.find(value => value && value !== current);
+    if (!alternative) throw new Error("Size selector has no alternative usable option");
+    await select.selectOption(alternative);
+    if (await select.inputValue() !== alternative) throw new Error("Size selection does not change");
+    return;
+  }
+  const sizes = page.getByRole("button", { name: /^(?:(?:select\s+)?size\s+)?(?:XS|S|M|L|XL|XXL)$/i });
+  for (const size of await sizes.all()) {
+    if (!(await size.isVisible()) || !(await size.isEnabled()) || await size.getAttribute("aria-pressed") === "true") continue;
+    await size.click({ timeout: 800 });
+    if (await size.getAttribute("aria-pressed") !== "true") throw new Error("Size selection exposes no accessible selected state");
+    return;
+  }
+  const group = page.getByRole("radiogroup", { name: /size/i });
+  for (const radio of await group.getByRole("radio").all()) {
+    if (await radio.isChecked() || !(await radio.isEnabled())) continue;
+    await radio.check({ timeout: 800 });
+    if (!(await radio.isChecked())) throw new Error("Size selection does not change");
+    return;
+  }
+  throw new Error("Requested accessible size control is missing");
+}
+async function restoreExpansion(page: Page, control: Locator, before: string | null): Promise<void> {
+  if (await control.getAttribute("aria-expanded") === before) return;
+  if (before === "false" && await closeControlledPanel(page, control)) return;
+  await control.click({ timeout: 800 });
+}
 
 const result = (
   context: Parameters<BrowserQACheckExecutor["execute"]>[0],
@@ -49,16 +109,18 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
   {
     definition: definition("interaction-smoke", "INTERACTION", "ERROR", 3_000),
     async execute(context) {
-      const expandable = context.page.locator("button[aria-expanded][aria-controls]").first();
-      if (await expandable.count()) {
+      const candidates = context.page.locator("button[aria-expanded][aria-controls]");
+      let expandable: Locator | undefined;
+      for (const candidate of await candidates.all()) if (await candidate.isVisible() && await candidate.isEnabled()) { expandable = candidate; break; }
+      if (expandable) {
         const before = await expandable.getAttribute("aria-expanded");
         const controlledId = await expandable.getAttribute("aria-controls");
         await expandable.click({ timeout: 2_000 });
         const after = await expandable.getAttribute("aria-expanded");
         const controlledVisible = controlledId
-          ? await context.page.locator(`#${escapeCssId(controlledId)}`).isVisible().catch(() => false)
+          ? await context.page.locator(`[id="${escapeCssId(controlledId)}"]`).isVisible().catch(() => false)
           : false;
-        await expandable.click({ timeout: 2_000 }).catch(() => undefined);
+        await restoreExpansion(context.page, expandable, before);
         if (before === after && !controlledVisible)
           return result(context, {
             checkId: "interaction-smoke",
@@ -82,17 +144,18 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
       }
       const summary = context.page.locator("details > summary").first();
       if (await summary.count()) {
-        const details = summary.locator("..", { has: summary });
+        const details = summary.locator("xpath=parent::details");
         const before = await details.getAttribute("open");
         await summary.click({ timeout: 2_000 });
         const after = await details.getAttribute("open");
         await summary.click({ timeout: 2_000 }).catch(() => undefined);
-        return result(context, after === before
+        const restored = await details.getAttribute("open");
+        return result(context, (before !== null) === (after !== null) || (restored !== null) !== (before !== null)
           ? {
               checkId: "interaction-smoke",
               category: "INTERACTION",
               status: "FAIL",
-              severity: "WARNING",
+              severity: "ERROR",
               message: "Representative details/summary control did not change state",
             }
           : {
@@ -123,7 +186,16 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
           severity: "INFO",
           message: "Mobile navigation is scoped to the mobile viewport",
         });
-      const control = context.page.locator("button[aria-expanded][aria-controls]").first();
+      const controls = context.page.locator("button[aria-expanded][aria-controls]");
+      let control: Locator | undefined;
+      for (const candidate of await controls.all()) {
+        const id = await candidate.getAttribute("aria-controls");
+        const label = (await candidate.getAttribute("aria-label")) || (await candidate.innerText());
+        const target = id ? context.page.locator(`[id="${escapeCssId(id)}"]`) : undefined;
+        const navigation = target && await target.count() && await target.evaluate(element => element.tagName === "NAV" || element.getAttribute("role") === "navigation");
+        if (navigation || /\b(?:menu|navigation)\b/i.test(label)) { control = candidate; break; }
+      }
+      if (!control) return result(context, { checkId: "interaction.mobile-nav", category: "INTERACTION", status: "SKIPPED", severity: "INFO", message: "No semantic mobile navigation toggle was present" });
       if (!(await control.count()))
         return result(context, {
           checkId: "interaction.mobile-nav",
@@ -136,8 +208,8 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
       await control.click({ timeout: 2_000 });
       const after = await control.getAttribute("aria-expanded");
       const targetId = await control.getAttribute("aria-controls");
-      const visible = targetId ? await context.page.locator(`#${escapeCssId(targetId)}`).isVisible().catch(() => false) : false;
-      await control.click({ timeout: 2_000 }).catch(() => undefined);
+      const visible = targetId ? await context.page.locator(`[id="${escapeCssId(targetId)}"]`).isVisible().catch(() => false) : false;
+      await restoreExpansion(context.page, control, before);
       return result(context, after !== before && visible
         ? { checkId: "interaction.mobile-nav", category: "INTERACTION", status: "PASS", severity: "ERROR", message: "Mobile navigation opened and exposed its controlled menu" }
         : { checkId: "interaction.mobile-nav", category: "INTERACTION", status: "FAIL", severity: "WARNING", message: "Mobile navigation toggle did not expose its controlled menu" });
@@ -170,11 +242,11 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
   },
   {
     definition: definition("browser-safety-events", "INTERACTION", "ERROR", 1_000),
-    async execute(context) {
+    execute(context) {
       const events = [...context.events.dialogs, ...context.events.popups, ...context.events.downloads];
-      return result(context, events.length
+      return Promise.resolve(result(context, events.length
         ? { checkId: "browser-safety-events", category: "INTERACTION", status: "FAIL", severity: "ERROR", message: "Unexpected dialog, popup, or download was handled", evidence: events }
-        : { checkId: "browser-safety-events", category: "INTERACTION", status: "PASS", severity: "ERROR", message: "No unexpected dialog, popup, or download occurred" });
+        : { checkId: "browser-safety-events", category: "INTERACTION", status: "PASS", severity: "ERROR", message: "No unexpected dialog, popup, or download occurred" }));
     },
   },
 ];

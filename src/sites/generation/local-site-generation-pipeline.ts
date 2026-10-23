@@ -5,6 +5,7 @@ import type {
   LocalCliAgentRuntime,
 } from "../../cli/runtime/local-cli-agent-runtime.js";
 import { ApplicationError } from "../../app/errors/application-error.js";
+import { functionalBrowserChecks } from "../../browser-qa/functional-capability-checks.js";
 import type { LocalExecutionProvider } from "../../execution/local/local-execution.provider.js";
 import type { BuildResult, PreviewSession } from "../../execution/execution-types.js";
 import type { ArtifactStore } from "../../persistence/artifact-store.js";
@@ -63,7 +64,9 @@ import { loadAssetManifest, persistAssetManifest } from "../assets/asset-manifes
 import { validateRequiredUserAssetReferences } from "../assets/asset-reference-validator.js";
 import { resolveCapabilities, type ResolvedCapabilities } from "./capability-resolver.js";
 import { analyzeRequestProfile, type RequestProfile } from "./request-profile.js";
-import { logSiteTokenUsage } from "./site-token-usage-log.js";
+import { logSiteTokenUsage, siteFailureStage } from "./site-token-usage-log.js";
+import type { FailedCandidateEvidence, FailedCandidateEvidenceRequest } from "./failed-candidate-evidence.js";
+import { recordGenerationTelemetry, referenceContextTelemetry, type GenerationDevelopmentTelemetry } from "./generation-development-telemetry.js";
 import { createAssetIntent } from "../assets/asset-domain.js";
 import type { BrowserQAReport } from "../../browser-qa/browser-qa-domain.js";
 import type { BrowserQARunner, BrowserQACheckExecutor } from "../../browser-qa/browser-qa-runner.js";
@@ -171,6 +174,8 @@ export interface LocalSiteGenerationPipelineDependencies {
   assetMediaStore?: MediaStore;
   billing?: SiteCreditBillingService;
   templateDesignReferences?: TemplateDesignReferenceResolver;
+  failedCandidateEvidence?: FailedCandidateEvidence;
+  developmentTelemetry?: GenerationDevelopmentTelemetry;
   resolveAgentModel(provider: string): string | undefined;
 }
 export class LocalSiteGenerationPipeline {
@@ -225,6 +230,8 @@ export class LocalSiteGenerationPipeline {
       throw new ApplicationError("PROVIDER_CONFIGURATION_ERROR", "Template design references are not configured");
     const templateReference = request.templateReference
       ? await this.deps.templateDesignReferences!.resolve(request.templateReference) : undefined;
+    recordGenerationTelemetry(this.deps.developmentTelemetry, { jobId, role: "generation", model: this.deps.resolveAgentModel(request.agentProvider),
+      ...referenceContextTelemetry(request.templateReference, templateReference ? templateDesignPrompt(templateReference.design) : undefined) });
     if (templateReference && request.referenceGenerationSiteId) {
       const previous = await this.deps.projects.getById(siteId);
       if (previous && (previous.ownerId !== request.userId || previous.latestVersionId))
@@ -243,6 +250,8 @@ export class LocalSiteGenerationPipeline {
     const isAgentPlanning = requestProfile.needsAgentPlanning &&
       (request.planningMode === "agent" || request.planningMode === "agent-with-fallback") &&
       Boolean(this.deps.intelligencePlanning);
+    if (isAgentPlanning) recordGenerationTelemetry(this.deps.developmentTelemetry, { jobId, role: "sites.site-planner", model: this.deps.resolveAgentModel(request.agentProvider),
+      ...referenceContextTelemetry(request.templateReference, templateReference ? templateDesignPrompt(templateReference.design) : undefined) });
     const sitePlanResult = isAgentPlanning
       ? await this.deps.intelligencePlanning!.planSite(request.prompt, request.signal, runContext, templateReference ? templateDesignPrompt(templateReference.design) : undefined)
       : undefined;
@@ -372,7 +381,11 @@ export class LocalSiteGenerationPipeline {
         previewResult.url,
         siteSpec,
         assetManifest,
-        templateReference ? [templateReferenceBrowserCheck(templateReference, request.prompt)] : [],
+        [...(templateReference ? [templateReferenceBrowserCheck(templateReference, request.prompt)] : []),
+          ...functionalBrowserChecks(requestProfile.functional, siteSpec.requirements.pages.map(page => page.path), Boolean(siteSpec.runtime?.enabled))],
+        { execution: this.deps.execution, environmentId: environment.id, jobId, siteId, completion: session.generationCompletion,
+          functionalRequirements: requestProfile.functional,
+          referenceContext: referenceContextTelemetry(request.templateReference, templateReference ? templateDesignPrompt(templateReference.design) : undefined) },
       );
       // Browser QA is the sole default runtime QA system. Legacy screenshot
       // review/repair flags remain readable on old request objects but have no
@@ -483,6 +496,8 @@ export class LocalSiteGenerationPipeline {
     }
     } catch (cause) {
       terminalError = cause;
+      recordGenerationTelemetry(this.deps.developmentTelemetry, { jobId, role: "generation",
+        failureStage: cause instanceof ApplicationError && typeof cause.metadata?.failureStage === "string" ? cause.metadata.failureStage : siteFailureStage(cause) });
       if (!jobFinalized) {
         job = this.#finalJob(job, runContext.getSummary(), false, cause);
         await this.deps.jobs.save(job);
@@ -721,6 +736,21 @@ export class LocalSiteGenerationPipeline {
       throw cause;
     } finally {
       logSiteTokenUsage("edit", request.agentProvider, runContext.getSummary(), terminalError);
+      if (terminalError instanceof ApplicationError &&
+        (terminalError.code.startsWith("STRUCTURED_RESPONSE_") || terminalError.code === "MODEL_OUTPUT_TRUNCATED")) {
+        const metadata = terminalError.metadata;
+        const text = (key: string) => typeof metadata?.[key] === "string" ? metadata[key] : undefined;
+        recordGenerationTelemetry(this.deps.developmentTelemetry, {
+          jobId: editJobId, role: "sites.targeted-edit", provider: request.agentProvider,
+          model: this.deps.resolveAgentModel(request.agentProvider), failureStage: siteFailureStage(terminalError),
+          responseSchema: text("responseSchema"), responseSchemaVersion: text("responseSchemaVersion"),
+          validationCategory: text("validationCategory") ?? terminalError.code, validationPath: text("validationPath"),
+          finishReason: text("finishReason"), truncated: metadata?.truncated === true,
+          inputTokens: runContext.getSummary().providerUsage?.inputTokens,
+          outputTokens: runContext.getSummary().providerUsage?.outputTokens,
+          billingStatus: job.billingStatus, creditsCharged: job.creditsCharged ?? 0,
+        });
+      }
     }
   }
   async restoreVersion(
@@ -832,6 +862,7 @@ export class LocalSiteGenerationPipeline {
     siteSpec: SiteSpec | undefined,
     assetManifest?: AssetManifest,
     additionalChecks: readonly BrowserQACheckExecutor[] = [],
+    failedCandidate?: Omit<FailedCandidateEvidenceRequest, "report">,
   ): Promise<{ readonly report: BrowserQAReport; readonly artifactRef: string } | undefined> {
     if (!enabled) return undefined;
     if (!this.deps.browserQA)
@@ -839,10 +870,10 @@ export class LocalSiteGenerationPipeline {
     const checks = [
       ...browserQACoreCheckExecutors,
       ...browserQAResponsiveAndInteractionChecks,
+      ...additionalChecks,
       ...browserQARuntimeChecks.filter(({ definition }) =>
         definition.checkId !== "broken-images" || (assetManifest?.assets.length ?? 0) > 0,
       ),
-      ...additionalChecks,
     ];
     const report = await this.deps.browserQA.run({
       runId: `${siteId}-${versionId}`,
@@ -857,6 +888,14 @@ export class LocalSiteGenerationPipeline {
     });
     const artifactRef = await persistBrowserQAReport(this.deps.artifacts, siteId, versionId, report);
     if (report.status === "FAIL") {
+      if (failedCandidate && this.deps.failedCandidateEvidence) {
+        try {
+          const path = await this.deps.failedCandidateEvidence.preserve({ ...failedCandidate, report });
+          recordGenerationTelemetry(this.deps.developmentTelemetry, { jobId: failedCandidate.jobId, role: "generation", failureStage: "BROWSER_QA",
+            ...(path ? { candidateDiagnosticPath: path } : {}) });
+        }
+        catch { console.warn("[sites] Local failed-candidate diagnostics unavailable; original QA failure preserved"); }
+      }
       // Name the blocking checks: "Browser QA failed" alone cannot be acted on.
       const blocking = report.checks.filter(
         (check) => check.status === "FAIL" && check.severity === "ERROR",

@@ -89,8 +89,9 @@ describe("Phase 7C mandatory requirement guidance and plan coverage", () => {
     const plan = { patches: [
       { path: "index.html", find: "FlowPilot", replace: "NovaPay", mode: "all" },
       { path: "src/styles/tokens.css", find: "blue", replace: "green", mode: "unique" },
-    ], styleCompleted: false, requirementsSatisfied: false };
+    ] };
     expect(() => validateEditPlanCoverage(requirements, context, validateSiteEditPatchBundle(plan).patches)).not.toThrow();
+    expect(() => validateSiteEditPatchBundle({ ...plan, styleCompleted: false, requirementsSatisfied: false })).toThrow("unexpected fields");
   });
 
   it("rejects style omission even when a rename changes a file containing unrelated className styling", () => {
@@ -99,12 +100,13 @@ describe("Phase 7C mandatory requirement guidance and plan coverage", () => {
     ])).toThrow("required style operation");
   });
 
-  it("rejects CSS operations on unsupplied paths and ignores self-reported success", () => {
+  it("rejects CSS operations on unsupplied paths and rejects self-reported success fields", () => {
     const claims = { styleCompleted: true, requirementsSatisfied: true, patches: [
       { path: "src/Brand.jsx", find: "FlowPilot", replace: "NovaPay", mode: "all" },
       { path: "src/unseen.css", find: "blue", replace: "green", mode: "unique" },
     ] };
-    expect(() => validateEditPlanCoverage(requirements, context, validateSiteEditPatchBundle(claims).patches)).toThrow("required style operation");
+    expect(() => validateSiteEditPatchBundle(claims)).toThrow("unexpected fields");
+    expect(() => validateEditPlanCoverage(requirements, context, validateSiteEditPatchBundle({ patches: claims.patches }).patches)).toThrow("required style operation");
   });
 
   it("rejects obvious rename omission before application", () => {

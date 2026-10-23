@@ -32,8 +32,16 @@ export const BASELINE_STYLESHEET = "src/styles.css";
 
 /** Whole-app behavior requests cannot fit safely into a few exact-text patches. */
 export function isBroadFunctionalEdit(instruction: string): boolean {
-  return /\b(functional(?:ity)?|working|interactive|clickable|work)\b/i.test(instruction) &&
-    /\b(all|whole|entire|every|pages?|screens?|buttons?|links?|navigation|features?|site|website|dashboard|app)\b/i.test(instruction);
+  // Preservation is a constraint, not permission to rewrite the application.
+  // Keep functional intent and its scope in the same clause; otherwise a hero
+  // edit plus "preserve all functionality" incorrectly selects a file bundle.
+  const clauses = instruction.split(/[.;\n]+|\b(?:and|but|while)\s+(?=(?:please\s+)?(?:keep|preserve|retain|maintain|leave|make|implement|enable|fix|add|ensure|do not|don't)\b)/i);
+  return clauses.some((clause) => {
+    const requested = clause.replace(/\b(?:keep|preserve|retain|maintain|leave|without (?:changing|altering|breaking))\b.*$/i, "");
+    return !/\b(?:do not|don't|must not|should not|never)\b/i.test(requested) &&
+      /\b(functional(?:ity)?|working|interactive|clickable|work)\b/i.test(requested) &&
+      /\b(all|whole|entire|every|pages?|screens?|buttons?|links?|navigation|features?|site|website|dashboard|app)\b/i.test(requested);
+  });
 }
 
 /** "Preserve the styling" is not permission to rewrite a stylesheet. */

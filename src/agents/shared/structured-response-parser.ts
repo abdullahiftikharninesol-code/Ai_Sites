@@ -5,6 +5,7 @@
  * Implements strict Markdown code fence stripping without broad regex extraction or guessing.
  */
 
+import { createHash } from "node:crypto";
 import { ApplicationError } from "../../app/errors/application-error.js";
 import type {
   AgentResponse,
@@ -41,6 +42,31 @@ export interface ParseStructuredResponseOptions<T> {
 export interface StructuredResponseParseResult<T> {
   readonly value: T;
   readonly telemetry: StructuredResponseTelemetry;
+}
+
+/** Parse the actual response, retaining only bounded contract/usage diagnostics. */
+export function parseStructuredAgentResponse<T>(
+  options: Omit<ParseStructuredResponseOptions<T>, "content"> & { readonly response: AgentResponse },
+): StructuredResponseParseResult<T> {
+  const { response, ...parserOptions } = options;
+  try {
+    assertStructuredResponseComplete(response, options.errorContext);
+    return parseStructuredResponse({ ...parserOptions, content: response.message.content });
+  } catch (cause) {
+    if (!(cause instanceof ApplicationError)) throw cause;
+    throw new ApplicationError(cause.code, cause.message, { cause, retryable: cause.retryable, metadata: {
+      ...cause.metadata,
+      ...(options.contract?.type === "JSON_SCHEMA" ? {
+        responseSchema: options.contract.name,
+        // Content-addressed version: changes whenever the actual supplied schema changes.
+        responseSchemaVersion: createHash("sha256").update(JSON.stringify(options.contract.schema)).digest("hex").slice(0, 16),
+      } : {}),
+      finishReason: response.finishReason,
+      truncated: response.finishReason === "length",
+      inputTokens: response.usage.inputTokens,
+      outputTokens: response.usage.outputTokens,
+    } });
+  }
 }
 
 /**
@@ -107,7 +133,7 @@ export function parseStructuredResponse<T>(
   } catch (cause) {
     throw new ApplicationError(
       "STRUCTURED_RESPONSE_PARSE_FAILED",
-      `${errorContext} returned invalid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+      `${errorContext} returned invalid JSON; the response could not be parsed`,
       {
         cause,
         metadata: {
@@ -115,6 +141,8 @@ export function parseStructuredResponse<T>(
           responseContractType,
           structuredOutputMode: capability,
           fallbackParserUsed: stripped,
+          validationCategory: "MALFORMED_JSON",
+          validationPath: "$",
         },
       },
     );
@@ -134,6 +162,9 @@ export function parseStructuredResponse<T>(
           responseContractType,
           structuredOutputMode: capability,
           fallbackParserUsed: stripped,
+          validationCategory: cause instanceof ApplicationError ? cause.metadata?.validationCategory ?? "SCHEMA_MISMATCH" : "SCHEMA_MISMATCH",
+          ...(cause instanceof ApplicationError && typeof cause.metadata?.validationPath === "string"
+            ? { validationPath: cause.metadata.validationPath } : {}),
         },
       },
     );

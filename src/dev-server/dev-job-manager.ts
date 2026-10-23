@@ -34,6 +34,7 @@ export interface DevJobRecord {
     providerParam?: string;
     requestId?: string;
     retryable?: boolean;
+    failureStage?: string;
     quotaCategory?: string;
     retryAfterSeconds?: number;
     diagnostics?: string;
@@ -175,6 +176,7 @@ export class DevJobManager {
         job.error = {
           code: candidate.code ?? "DEV_OPERATION_FAILED",
           message: candidate.message ?? "Development operation failed",
+          ...(typeof metadata.failureStage === "string" ? { failureStage: metadata.failureStage } : {}),
           ...(typeof metadata.status === "number" ? { status: metadata.status } : {}),
           ...(typeof metadata.quotaCategory === "string"
             ? { quotaCategory: metadata.quotaCategory }

@@ -7,6 +7,7 @@ const display = (value: number | undefined): string =>
 export function siteFailureStage(error: unknown): string {
   const applicationError = error instanceof ApplicationError ? error : undefined;
   if (applicationError?.metadata?.failureStage === "BROWSER_QA") return "BROWSER_QA";
+  if (applicationError?.metadata?.failureStage === "STATIC_VALIDATION") return "STATIC_VALIDATION";
   const code = applicationError?.code;
   if (code === "MODEL_OUTPUT_TRUNCATED") return "STRUCTURED_OUTPUT_TRUNCATED";
   if (code?.startsWith("STRUCTURED_RESPONSE_")) return "STRUCTURED_OUTPUT_PARSE";

@@ -7,6 +7,7 @@ import type { SiteCoderFileBundle } from "../../cli/runtime/site-coder-file-bund
 import { validateReferenceInteractions } from "../../cli/runtime/reference-interaction-validator.js";
 import { createBrowserQACheckResult } from "../../browser-qa/browser-qa-domain.js";
 import type { BrowserQACheckExecutor } from "../../browser-qa/browser-qa-runner.js";
+import { closeVisibleDialog, probeSizeSelection } from "../../browser-qa/browser-qa-interaction-checks.js";
 import type { ResolvedTemplateDesignReference } from "./template-design-context.js";
 
 const identity = (value: string) => value.replace(/&amp;|&#38;/gi, "&").normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
@@ -88,17 +89,8 @@ export function templateReferenceBrowserCheck(reference: ResolvedTemplateDesignR
       if (context.route === "/product" && /product[- ]detail/i.test(prompt)) {
         if (/gallery/i.test(prompt) && (await context.page.locator('main img, main [role="img"]').count()) < 2) issues.push("Requested product gallery placeholders are missing");
         if (/\bsizes?\b/i.test(prompt)) {
-          const select = context.page.getByRole("combobox", { name: /size/i }).first();
-          const radio = context.page.getByRole("radio").first();
-          const button = context.page.getByRole("button", { name: /^(?:select\s+)?size\b/i }).first();
-          if (await select.count()) {
-            const options = await select.locator("option").evaluateAll((items) => items.map((item) => ({ value: (item as HTMLOptionElement).value, disabled: (item as HTMLOptionElement).disabled })));
-            const option = options.find((item) => !item.disabled && item.value !== "");
-            if (!option) issues.push("Size selector has no usable options");
-            else { await select.selectOption(option.value); if (await select.inputValue() !== option.value) issues.push("Size selection does not change"); }
-          } else if (await radio.count()) { await radio.check(); if (!(await radio.isChecked())) issues.push("Size selection does not change"); }
-          else if (await button.count()) { await button.click(); if (await button.getAttribute("aria-pressed") !== "true") issues.push("Size button does not expose selected state"); }
-          else issues.push("Requested accessible size control is missing");
+          try { await probeSizeSelection(context.page); }
+          catch (error) { issues.push(error instanceof Error ? error.message : "Size selection failed"); }
         }
         if (/quantity/i.test(prompt)) {
           const quantity = context.page.getByRole("spinbutton", { name: /quantity/i }).first();
@@ -117,6 +109,7 @@ export function templateReferenceBrowserCheck(reference: ResolvedTemplateDesignR
             const before = await context.page.locator("body").innerText(); await add.click();
             try { await context.page.waitForFunction((previous) => document.body.innerText !== previous, before, { timeout: 1_000 }); }
             catch { issues.push("Add to Cart has no observable local result"); }
+            await closeVisibleDialog(context.page);
           }
         }
       }

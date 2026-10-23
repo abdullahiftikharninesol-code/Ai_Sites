@@ -130,6 +130,7 @@ export function Faq() {
 
 export function Cta() {
   const [email, setEmail] = useState("");
+  const [started, setStarted] = useState(false);
   return (
     <section aria-label="Call to action">
       <label htmlFor="cta-email">Email</label>
@@ -139,7 +140,8 @@ export function Cta() {
         value={email}
         onChange={(event) => setEmail(event.target.value)}
       />
-      <button type="button">Get started</button>
+      <button type="button" onClick={() => setStarted(true)}>Get started</button>
+      {started && <p role="status">Demo request noted locally. Nothing was sent.</p>}
     </section>
   );
 }
@@ -375,12 +377,15 @@ describe("Sites generation reliability recovery", () => {
               {
                 path: "src/App.tsx",
                 content: `import { Button } from "${button.importPath}";
+import { useState } from "react";
 
 export function App() {
+  const [started, setStarted] = useState(false);
   return (
     <div aria-label="AI Sites Generated Hero">
       <h1>Acme</h1>
-      <Button>Get started</Button>
+      <Button onClick={() => setStarted(true)}>Get started</Button>
+      {started && <p role="status">Demo started locally.</p>}
     </div>
   );
 }

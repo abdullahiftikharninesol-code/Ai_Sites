@@ -213,6 +213,7 @@ export class BrowserQARunner {
       serviceWorkers: "block",
     });
     let page: Page | undefined;
+    let openingProbe = false;
     try {
       await context.route("**/*", async (route) => {
         const request = route.request();
@@ -225,28 +226,31 @@ export class BrowserQARunner {
       });
       page = await context.newPage();
       context.on("page", (popup) => {
-        if (popup === page) return;
+        if (popup === page || openingProbe) return;
         events.popups.push(Object.freeze({ type: "network", url: popup.url() || "about:blank", failureText: "Unexpected popup blocked" }));
         void popup.close().catch(() => undefined);
       });
-      page.on("pageerror", (error) => events.pageErrors.push(error.message.slice(0, 2_000)));
-      page.on("console", (message) => {
+      const observe = (observed: Page) => {
+      observed.on("pageerror", (error) => events.pageErrors.push(error.message.slice(0, 2_000)));
+      observed.on("console", (message) => {
         const evidence = Object.freeze({ type: "console" as const, level: message.type(), message: message.text().slice(0, 2_000) });
         if (message.type() === "error") events.consoleErrors.push(evidence);
         if (message.type() === "warning") events.consoleWarnings.push(evidence);
       });
-      page.on("requestfailed", (request) => events.failedRequests.push(networkEvidence(request, undefined, request.failure()?.errorText ?? "failed")));
-      page.on("response", (response) => {
+      observed.on("requestfailed", (request) => events.failedRequests.push(networkEvidence(request, undefined, request.failure()?.errorText ?? "failed")));
+      observed.on("response", (response) => {
         if (response.status() >= 400) events.badResponses.push(networkEvidence(response.request(), response.status()));
       });
-      page.on("dialog", (dialog) => {
+      observed.on("dialog", (dialog) => {
         events.dialogs.push(Object.freeze({ type: "console", level: dialog.type(), message: dialog.message().slice(0, 1_000) }));
         void dialog.dismiss().catch(() => undefined);
       });
-      page.on("download", (download) => {
+      observed.on("download", (download) => {
         events.downloads.push(Object.freeze({ type: "network", url: download.url(), failureText: "Unexpected download" }));
         if (!input.policy.allowDownloads) void download.cancel().catch(() => undefined);
       });
+      };
+      observe(page);
       await page.emulateMedia({ reducedMotion: input.policy.reducedMotion ? "reduce" : "no-preference" });
       const destination = new URL(input.route, input.baseUrl);
       if (destination.origin !== input.baseUrl.origin) throw new BrowserQAPolicyError("Browser QA routes must remain on the preview origin");
@@ -298,12 +302,25 @@ export class BrowserQARunner {
         context,
         route: input.route,
         viewport: input.viewport,
-        events: freezeEvents(events),
+        get events() { return freezeEvents(events); },
         ...(screenshotRef === undefined ? {} : { screenshotRef }),
       };
       for (const check of input.checks) {
+        let probe: Page | undefined;
         try {
-          pageChecks.push(await withTimeout(check.execute(pageContext), check.definition.timeoutMs, check.definition.checkId));
+          // Interaction checks must not inherit overlays, scroll or modified
+          // form/filter state from other probes. A separate page also lets us
+          // abort a timed-out check without its pending clicks affecting the next.
+          if (check.definition.category === "INTERACTION" || check.definition.category === "FORM") {
+            openingProbe = true;
+            try { probe = await context.newPage(); } finally { openingProbe = false; }
+            observe(probe);
+            await probe.emulateMedia({ reducedMotion: input.policy.reducedMotion ? "reduce" : "no-preference" });
+            const response = await probe.goto(destination.toString(), { waitUntil: "load", timeout: input.policy.navigationTimeoutMs });
+            if (!response?.ok()) throw new Error(`Interaction route failed to load (${response?.status() ?? "no response"})`);
+            await probe.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done()))));
+          }
+          pageChecks.push(await withTimeout(check.execute(probe ? { ...pageContext, page: probe, get events() { return freezeEvents(events); } } : pageContext), check.definition.timeoutMs, check.definition.checkId));
         } catch (error) {
           pageChecks.push(createBrowserQACheckResult({
             checkId: check.definition.checkId,
@@ -314,6 +331,8 @@ export class BrowserQARunner {
             viewport: input.viewport,
             message: `Browser QA check failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2_000),
           }));
+        } finally {
+          await probe?.close();
         }
       }
       return { checks: pageChecks };

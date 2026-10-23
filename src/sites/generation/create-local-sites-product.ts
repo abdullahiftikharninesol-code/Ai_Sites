@@ -36,6 +36,8 @@ import { ArtifactMediaStore } from "../assets/media-store.js";
 import { AdapterBackedAssetResolver, PlaceholderAssetSourceAdapter } from "../assets/source-adapters.js";
 import type { SiteCreditBillingService } from "../../billing/credit-billing.js";
 import type { TemplateDesignReferenceResolver } from "../../templates/application/template-design-context.js";
+import type { FailedCandidateEvidence } from "./failed-candidate-evidence.js";
+import type { GenerationDevelopmentTelemetry } from "./generation-development-telemetry.js";
 export interface LocalSitesProductOptions {
   readonly executionRoot: string;
   readonly artifactRoot: string;
@@ -53,6 +55,8 @@ export interface LocalSitesProductOptions {
   readonly runtimeProvider?: SiteRuntimeProvider;
   readonly billing?: SiteCreditBillingService;
   readonly templateDesignReferences?: TemplateDesignReferenceResolver;
+  readonly failedCandidateEvidence?: FailedCandidateEvidence;
+  readonly developmentTelemetry?: GenerationDevelopmentTelemetry;
 }
 export function createLocalSitesProduct(options: LocalSitesProductOptions) {
   const execution = new LocalExecutionProvider({
@@ -76,7 +80,10 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
   });
   if (!options.agentRegistry) registry.register(mockAgent);
   const gateway = new InProcessAgentGateway(registry);
-  const runtime = new LocalCliAgentRuntime(gateway, registry, execution);
+  const runtime = new LocalCliAgentRuntime(gateway, registry, execution, undefined, {
+    ...(options.failedCandidateEvidence ? { evidence: options.failedCandidateEvidence } : {}),
+    ...(options.developmentTelemetry ? { telemetry: options.developmentTelemetry } : {}),
+  });
   const orchestrationAgent = options.orchestrationAgent ?? mockAgent;
   const templates = new StarterTemplateRegistry();
   const template = {
@@ -118,6 +125,8 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
     ...(options.runtimeProvider ? { runtimeProvider: options.runtimeProvider } : {}),
     ...(options.billing ? { billing: options.billing } : {}),
     ...(options.templateDesignReferences ? { templateDesignReferences: options.templateDesignReferences } : {}),
+    ...(options.failedCandidateEvidence ? { failedCandidateEvidence: options.failedCandidateEvidence } : {}),
+    ...(options.developmentTelemetry ? { developmentTelemetry: options.developmentTelemetry } : {}),
     resolveAgentModel: (provider) =>
       registry.get(provider === "mock" ? "mock-agent" : provider).getCapabilities().models[0],
   });

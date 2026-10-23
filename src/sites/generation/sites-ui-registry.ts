@@ -2,6 +2,7 @@ import { ApplicationError } from "../../app/errors/application-error.js";
 import type { ExecutionProvider } from "../../execution/execution-provider.js";
 import type { GeneratedAppProfile } from "../../cli/runtime/site-technical-profile.js";
 import type { SiteCapabilityId } from "./capability-registry.js";
+import { FUNCTIONAL_RUNTIME_PATH, FUNCTIONAL_RUNTIME_SOURCE } from "./functional-runtime.js";
 
 export type SitesUiCategory = "primitive" | "component" | "section" | "tokens";
 
@@ -21,6 +22,7 @@ const profile = "react-vite-v1";
 const source = (file: string): string => `src/sites-ui/${file}`;
 
 const sources: Readonly<Record<string, string>> = {
+  [FUNCTIONAL_RUNTIME_PATH]: FUNCTIONAL_RUNTIME_SOURCE,
   [source("tokens.css")]: `:root {
   --sites-container: 72rem;
   --sites-space-1: 0.25rem;
@@ -46,16 +48,12 @@ const sources: Readonly<Record<string, string>> = {
   margin-inline: auto;
 }
 `,
-  [source("primitives/Button.tsx")]: `export interface ButtonProps {
-  readonly children: string;
-  readonly type?: "button" | "submit" | "reset";
-  readonly className?: string;
-  readonly disabled?: boolean;
-}
+  [source("primitives/Button.tsx")]: `import type { ButtonHTMLAttributes } from "react";
+export type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement>;
 
-export function Button({ children, type = "button", className = "", disabled = false }: ButtonProps) {
+export function Button({ children, type = "button", className = "", ...props }: ButtonProps) {
   return (
-    <button className={\`sites-ui-button \${className}\`.trim()} type={type} disabled={disabled}>
+    <button {...props} className={\`sites-ui-button \${className}\`.trim()} type={type}>
       {children}
     </button>
   );
@@ -139,18 +137,13 @@ export function FeatureGrid({ items }: { readonly items: readonly FeatureItem[] 
   );
 }
 `,
-  [source("sections/ContactSection.tsx")]: `import { Button } from "../primitives/Button";
-import { FormField } from "../primitives/FormField";
+  [source("sections/ContactSection.tsx")]: `import { DemoForm } from "../functional";
 
 export function ContactSection() {
   return (
     <section data-sites-section="contact" aria-labelledby="contact-title">
       <h2 id="contact-title">Contact</h2>
-      <form>
-        <FormField id="name" label="Name" required />
-        <FormField id="email" label="Email" type="email" required />
-        <Button type="submit">Send message</Button>
-      </form>
+      <DemoForm />
     </section>
   );
 }
