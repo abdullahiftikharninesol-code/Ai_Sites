@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { editTextDigest } from "../src/cli/runtime/site-edit-patch-resolver.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { AgentProviderRegistry } from "../src/agents/registry/agent-provider-registry.js";
@@ -150,7 +151,7 @@ describe("Targeted Edit patch contract", () => {
         { find: '"FlowPilot gave our team a common language."', replace: "x" },
       ]))).rejects.toMatchObject({
         code: "VALIDATION_FAILED",
-        metadata: { matches: 0, matchesInShownSource: 0, diagnostics: expect.stringContaining("FlowPilot gave our team") as string },
+        metadata: { matches: 0, matchesInShownSource: 0, findDigest: editTextDigest('"FlowPilot gave our team a common language."') },
       });
     });
 

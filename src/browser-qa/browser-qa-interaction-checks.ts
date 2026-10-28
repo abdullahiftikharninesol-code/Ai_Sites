@@ -32,7 +32,7 @@ export async function closeVisibleDialog(page: Page): Promise<boolean> {
   return false;
 }
 
-export async function probeSizeSelection(page: Page): Promise<void> {
+export async function probeSizeSelection(page: Page | Locator): Promise<void> {
   const select = page.getByRole("combobox", { name: /^size$/i }).first();
   if (await select.count()) {
     const current = await select.inputValue();
@@ -229,9 +229,12 @@ export const browserQAResponsiveAndInteractionChecks: readonly BrowserQACheckExe
       const findings = await context.page.evaluate(() => {
         const issues: string[] = [];
         for (const control of document.querySelectorAll("input, textarea, select")) {
-          const id = control.getAttribute("id");
+          if (control instanceof HTMLInputElement && ["hidden", "submit", "button", "reset", "image"].includes(control.type)) continue;
           if (!control.getAttribute("name")) issues.push("form control without name");
-          if (!control.getAttribute("aria-label") && !control.getAttribute("aria-labelledby") && !(id && document.querySelector(`label[for="${CSS.escape(id)}"]`))) issues.push("form control without label");
+          const field = control as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+          const native = [...(field.labels ?? [])].some(label => !!label.textContent?.trim());
+          const labelled = (control.getAttribute("aria-labelledby") ?? "").split(/\s+/).some(id => !!document.getElementById(id)?.textContent?.trim());
+          if (!control.getAttribute("aria-label")?.trim() && !labelled && !native) issues.push("form control without label");
         }
         return issues.slice(0, 25);
       });

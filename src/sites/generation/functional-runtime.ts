@@ -3,7 +3,13 @@ import { createHash } from "node:crypto";
 
 export const FUNCTIONAL_RUNTIME_PATH = "src/sites-ui/functional.tsx";
 /** Layout-neutral, React-only managed source. No credentials, network or backend-success simulation. */
-export const FUNCTIONAL_RUNTIME_SOURCE = String.raw`import { useId, useRef, useState, useSyncExternalStore, type ReactNode, type FormEvent } from "react";
+export const FUNCTIONAL_RUNTIME_SOURCE = String.raw`import { useId, useRef, useState, useSyncExternalStore, type ReactNode, type FormEvent, type AnchorHTMLAttributes } from "react";
+export function PageContent({ children, className = "" }: { children: ReactNode; className?: string }) {
+  return <main className={className}>{children}</main>;
+}
+export function SiteLink(props: AnchorHTMLAttributes<HTMLAnchorElement>) {
+  return <a {...props}/>;
+}
 export interface Product { id: string; name: string; price: number; image?: string; category?: string }
 export interface CartItem { key: string; product: Product; quantity: number; size: string }
 const cartStorageKey = "sites-demo-cart-v1";

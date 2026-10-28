@@ -3,6 +3,8 @@ import type { SiteSpec } from "../domain/site-spec.js";
 import type { SiteCoderFileBundle } from "../../cli/runtime/site-coder-file-bundle.js";
 import ts from "typescript";
 import { posix } from "node:path";
+import { assignFunctionalRequirements, functionalRouteGuidance, type FunctionalRequirement } from "./functional-route-contract.js";
+import { functionalIntent } from "./functional-intent.js";
 
 export type FunctionalCapability = "cart" | "quantity" | "size" | "gallery" | "category-filter" | "product-navigation" |
   "mobile-nav" | "tabs" | "accordion" | "dialog" | "search" | "form" | "newsletter";
@@ -11,31 +13,23 @@ export interface FunctionalRequirements {
   readonly capabilities: readonly FunctionalCapability[];
   readonly backendRequired: boolean;
   readonly unsupportedTransactions: boolean;
+  readonly requirements?: readonly FunctionalRequirement[];
+  readonly conflictingCapabilities?: readonly FunctionalCapability[];
 }
-const patterns: readonly [FunctionalCapability, RegExp][] = [
-  ["cart", /\b(?:add to (?:cart|bag)|shopping (?:cart|bag)|cart (?:view|drawer|state|button))\b/i],
-  ["quantity", /\bquantity\b/i], ["size", /\b(?:product sizes?|size selection|size selector|sizes)\b/i],
-  ["gallery", /\b(?:(?:selectable|interactive|product) gallery|gallery (?:selection|placeholders?)|gallery.*thumbnails)\b/i],
-  ["category-filter", /\b(?:categor(?:y|ies) filter(?:s|ing)?|filter.*categor(?:y|ies))\b/i],
-  ["product-navigation", /\bproduct[- ]detail(?:s)?\b/i], ["mobile-nav", /\bmobile (?:menu|nav(?:igation)?)\b/i],
-  ["tabs", /\btabs\b/i], ["accordion", /\baccordions?\b/i], ["dialog", /\b(?:modal|dialog)\b/i],
-  ["search", /\b(?:search|searchable)\b/i], ["form", /\b(?:contact|inquiry|feedback) form\b/i],
-  ["newsletter", /\bnewsletter\b/i],
-];
 /** Explicit behavior only; visual adjectives/template controls never add requirements. */
 export function functionalRequirements(prompt: string): FunctionalRequirements {
-  const affirmative = prompt.split(/[.;\n]/).filter(clause => !/^\s*(?:no|without|do not|don't|omit|exclude)\b/i.test(clause)).join(". ");
-  const commerce = /\b(?:product|products|clothing|ecommerce|store|cart)\b/i.test(affirmative);
-  const capabilities = patterns.filter(([id, pattern]) => {
-    if (id === "size" && !commerce && !/\bsize (?:selection|selector)\b/i.test(affirmative)) return false;
-    return [...affirmative.matchAll(new RegExp(pattern.source, "gi"))].some(match =>
-      !/\b(?:no|without|omit|exclude|do not|don't)\s+(?:(?:include|add|any|a|the)\s+)*$/i.test(affirmative.slice(0, match.index)));
-  }).map(([id]) => id);
-  return Object.freeze({ version: 1, capabilities: Object.freeze(capabilities),
+  const { affirmative, capabilities, conflicts } = functionalIntent(prompt);
+  return Object.freeze({ version: 1, capabilities: Object.freeze(capabilities), requirements: Object.freeze(assignFunctionalRequirements(prompt, capabilities)),
+    ...(conflicts.length ? { conflictingCapabilities: Object.freeze(conflicts) } : {}),
     backendRequired: /\b(?:real backend|persistent submissions|send (?:actual|real) emails|real account creation|real payments|process payments|charge cards|persistent bookings)\b/i.test(affirmative),
     unsupportedTransactions: /\b(?:real payments|process payments|charge cards|persistent bookings|send (?:actual|real) emails)\b/i.test(affirmative) });
 }
+export function assertFunctionalRequestConsistency(requirements: FunctionalRequirements): void {
+  if (requirements.conflictingCapabilities?.length)
+    throw new ApplicationError("UNSUPPORTED_SITE_REQUIREMENT", "Conflicting include/exclude instructions for: " + requirements.conflictingCapabilities.join(", "));
+}
 export function assertFunctionalBackendSupport(requirements: FunctionalRequirements, spec?: SiteSpec): void {
+  assertFunctionalRequestConsistency(requirements);
   if (requirements.unsupportedTransactions || (requirements.backendRequired && !spec?.runtime?.enabled && !spec?.auth?.authRequired))
     throw new ApplicationError("UNSUPPORTED_SITE_REQUIREMENT", "Requested real backend behavior has no configured implementation; frontend mock success cannot satisfy it");
 }
@@ -87,8 +81,10 @@ const contracts: Record<FunctionalCapability, string> = {
 export function functionalGenerationContract(requirements: FunctionalRequirements): string {
   if (!requirements.capabilities.length) return "";
   return ["Functional capability contract v1 (mandatory requested behavior):",
-    "Managed imports from ./sites-ui/functional (named exports; use className/CSS for your design). Reuse these verified controllers/components or implement equivalent observable behavior. No empty/alert-only callbacks or invented destinations.",
+    "Prefer verified named imports from ./sites-ui/functional; style with className/CSS. Equivalent custom behavior is allowed. No empty/alert-only callbacks or fake destinations.",
+    "PageContent({children,className?}) renders main; SiteLink accepts standard anchor props including onClick. Use useEffect with cleanup for listeners. Custom tabs: aria-selected, aria-controls, real tabpanel. Mobile menus: aria-expanded, linked navigation panel. Never add empty semantic markers.",
     ...requirements.capabilities.map(id => `${id}: ${contracts[id]}`),
+    functionalRouteGuidance(requirements),
     requirements.backendRequired ? "Real backend requested: demo-only forms cannot fulfill that requirement. Use the existing configured runtime contract, or fail clearly." : "Frontend mock data only; show honest demo feedback, never fake remote success.",
     requirements.capabilities.includes("cart") ? 'Safe repair opt-in: only a Cart trigger wired to const cart=useCart() may use data-sites-action="cart.open"; render CartPanel as its actual destination.' : "",
   ].filter(Boolean).join("\n");

@@ -3,6 +3,12 @@ import type { ExecutionProvider } from "../../execution/execution-provider.js";
 import type { GenerationCompletionManifest, GenerationCompletionRequirements } from "../../agents/validation/generation-completion.js";
 import { GenerationCompletionValidator } from "../../agents/validation/generation-completion.js";
 import { validateSiteNameCandidate } from "../../sites/generation/site-name.js";
+import { editTextDigest, exactMatchOffsets, explicitlyAuthorizedGlobalRename, patchIntendedOperation, patchLocations, uniqueContextualOffset,
+  type SiteEditPatchContext, type SiteEditPatchDiagnostic } from "./site-edit-patch-resolver.js";
+import { parseEditRequirements, validateEditRequirements } from "./edit-requirements.js";
+import { explicitlyAuthorizedProtectedPatch, independentScopedPatches, protectedEditValues, scopeError, validateEditScopeCompletion, validateProtectedEditValues } from "./edit-scope.js";
+import { applyValidatedBuildRepairPatches, type BuildRepairPatchDiagnostic } from "./build-repair-patch-resolver.js";
+import type { BuildRepairSourceSnapshot } from "./build-repair-source.js";
 
 export interface SiteCoderFileBundleFile {
   readonly path: string;
@@ -84,56 +90,118 @@ export async function applySiteEditPatchBundle(
   execution: Pick<ExecutionProvider, "readFile" | "writeFile">,
   environmentId: string,
   bundle: SiteEditPatchBundle,
+  context?: SiteEditPatchContext & {
+    readonly requirementSource?: ReadonlyMap<string, string> | undefined;
+    readonly onScopeExclusion?: (count: number) => void;
+  },
 ): Promise<readonly string[]> {
   const changed: string[] = [];
+  const requirements = context ? parseEditRequirements(context.instruction) : undefined;
+  const scope = requirements?.scope;
+  const original = new Map<string, string>();
+  for (const path of new Set([...bundle.patches.map(patch => patch.path), ...(context?.requirementSource?.keys() ?? [])]))
+    original.set(path, await execution.readFile(environmentId, path));
+  const scoped = scope ? independentScopedPatches(bundle.patches, original, scope) : { patches: bundle.patches, excluded: [] };
   // Every find is written against the source the model was shown, but patches
   // apply in order. A later find overlapping text an earlier patch to the same
   // file already rewrote (a brand rename inside the hero being rewritten) is
   // rebased by applying those earlier patches to the find text itself, then
   // matched exactly again under the same uniqueness rules.
   const shown = new Map<string, string>();
+  const staged = new Map<string, string>();
+  const inserted = new Map<string, { start: number; end: number }[]>();
+  const diagnostics: SiteEditPatchDiagnostic[] = [];
   const applied: SiteEditPatch[] = [];
-  for (const patch of bundle.patches) {
-    const source = await execution.readFile(environmentId, patch.path);
+  for (const patch of scoped.patches) {
+    const source = staged.get(patch.path) ?? original.get(patch.path)!;
     if (!shown.has(patch.path)) shown.set(patch.path, source);
     let find = patch.find;
-    let matches = countOccurrences(source, find);
+    let offsets = exactMatchOffsets(source, find);
+    let matches = offsets.length;
+    let rebased = false;
     const shownMatches = countOccurrences(shown.get(patch.path)!, patch.find);
     if (matches === 0 && (patch.mode === "all" ? shownMatches > 0 : shownMatches === 1)) {
       find = applied
         .filter((earlier) => earlier.path === patch.path)
         .reduce((text, earlier) => rewriteFindText(text, earlier), patch.find);
       matches = find === patch.find ? 0 : countOccurrences(source, find);
+      offsets = exactMatchOffsets(source, find);
+      rebased = find !== patch.find;
     }
-    if (matches === 0)
+    const diagnostic = (resolution: string, reason: string, operation = patchIntendedOperation(patch, context)): SiteEditPatchDiagnostic => ({
+      path: patch.path, findDigest: editTextDigest(patch.find), replacementDigest: editTextDigest(patch.replace),
+      matchCount: matches, locations: patchLocations(source, offsets), requestedMode: patch.mode,
+      resolution, intendedOperation: operation, rebased, reason,
+    });
+    const reject = (reason: string, resolution: string, message: string): never => {
+      const detail = diagnostic(resolution, reason);
       throw new ApplicationError(
-        "VALIDATION_FAILED",
-        `Edit find text was not found in ${patch.path}. It must match the file byte-for-byte.`,
-        { metadata: {
-          path: patch.path,
-          mode: patch.mode,
-          matches: 0,
-          matchesInShownSource: shownMatches,
-          diagnostics: `Rejected find text: ${JSON.stringify(patch.find.slice(0, 1_500))}`,
-        } },
+        "VALIDATION_FAILED", message,
+        { metadata: { path: patch.path, mode: patch.mode, matches, matchesInShownSource: shownMatches,
+          failureStage: "PATCH_APPLICATION", validationCheck: "edit.patch-resolution",
+          findDigest: detail.findDigest, patchDiagnostics: [...diagnostics, detail],
+          diagnostics: `Patch resolution rejected: ${reason}; find digest ${detail.findDigest}` } },
       );
-    // Ambiguity stays an error rather than a guess: picking an occurrence would
-    // silently edit the wrong place.
-    if (patch.mode === "unique" && matches > 1)
-      throw new ApplicationError(
-        "VALIDATION_FAILED",
-        `Edit find text matched ${matches} times in ${patch.path}; a unique patch needs more surrounding source context as an anchor, or mode "all" when every occurrence is meant.`,
-        { metadata: { path: patch.path, mode: patch.mode, matches } },
-      );
-    const first = source.indexOf(find);
-    const next =
-      patch.mode === "all"
-        ? source.split(find).join(patch.replace)
-        : source.slice(0, first) + patch.replace + source.slice(first + find.length);
-    await execution.writeFile(environmentId, patch.path, next);
+    };
+    if (matches === 0) reject("EXACT_SOURCE_NOT_FOUND", "REJECTED_MISSING_ANCHOR",
+      `Edit find text was not found in ${patch.path}. It must match the file byte-for-byte.`);
+    // A prior replacement must not silently manufacture new targets for a later
+    // patch written against the original source (including mode all).
+    if (!rebased && shownMatches > 0 && offsets.some(offset => (inserted.get(patch.path) ?? [])
+      .some(range => range.start === range.end ? range.start > offset && range.start < offset + find.length
+        : range.start < offset + find.length && range.end > offset)))
+      reject("EARLIER_PATCH_INTRODUCED_MATCH", "REJECTED_CASCADE",
+        `Edit find text matched ${matches} times in ${patch.path}, including text introduced by an earlier patch; an independent unique source anchor is required.`);
+    let targets = offsets;
+    let resolution = rebased ? "REBASED_UNIQUE" : patch.mode === "all" ? "REQUESTED_ALL" : "EXACT_UNIQUE";
+    let operation = "EXACT_PATCH";
+    if (patch.mode === "unique" && matches > 1) {
+      if (explicitlyAuthorizedGlobalRename(patch, context)) {
+        resolution = "SCOPED_GLOBAL_RENAME"; operation = "GLOBAL_RENAME";
+      } else {
+        const scoped = uniqueContextualOffset(source, offsets, { ...patch, find }, context);
+        if (!scoped) reject("NO_UNIQUE_AUTHORIZED_CONTEXT", "REJECTED_AMBIGUITY",
+          `Edit find text matched ${matches} times in ${patch.path}; a unique patch needs more surrounding source context as an anchor, or mode "all" when every occurrence is meant. No unique authorized component/section or explicit global rename could be verified.`);
+        targets = [scoped!.offset]; operation = scoped!.operation; resolution = "SCOPED_CONTEXT";
+      }
+    } else if (patch.mode === "unique") targets = [offsets[0]!];
+    // A proved global display-brand rename never includes a protected destination,
+    // even if its brand substring happens to match the same exact find.
+    if (scope && explicitlyAuthorizedGlobalRename(patch, context) && !explicitlyAuthorizedProtectedPatch(patch, scope)) {
+      const protectedValues = protectedEditValues(source);
+      targets = targets.filter(start => !protectedValues.some(value => value.start < start + find.length && value.end > start));
+      if (!targets.length) throw scopeError(patch.path, "NO_AUTHORIZED_DISPLAY_RENAME_TARGET", patch);
+    }
+    let next = source;
+    let ranges = inserted.get(patch.path) ?? [];
+    // Reverse offsets keep every target anchored in the same pre-patch source.
+    for (const start of [...targets].reverse()) {
+      const end = start + find.length, delta = patch.replace.length - find.length;
+      next = next.slice(0, start) + patch.replace + next.slice(end);
+      ranges = ranges.flatMap(range => range.end <= start ? [range] : range.start >= end
+        ? [{ start: range.start + delta, end: range.end + delta }]
+        : [...(range.start < start ? [{ start: range.start, end: start }] : []),
+          ...(range.end > end ? [{ start: end + delta, end: range.end + delta }] : [])]);
+      if (patch.replace !== find) ranges.push({ start, end: start + patch.replace.length });
+    }
+    inserted.set(patch.path, ranges);
+    staged.set(patch.path, next);
+    diagnostics.push(diagnostic(resolution, "VERIFIED_EXACT_SCOPE", operation));
     changed.push(patch.path);
-    applied.push(patch);
+    applied.push(targets.length > 1 ? { ...patch, mode: "all" } : patch);
   }
+  // Preflight the whole bundle before any write: an unsafe later patch must not
+  // leave even the isolated candidate half-edited. Persistence remains unchanged.
+  if (scope) {
+    const candidate = new Map([...original, ...staged]);
+    validateProtectedEditValues(scope, original, candidate);
+    if (scoped.excluded.length) {
+      validateEditRequirements(requirements, context?.requirementSource ?? original, candidate);
+      validateEditScopeCompletion(scope, context?.requirementSource ?? original, candidate);
+    }
+  }
+  for (const [path, content] of staged) await execution.writeFile(environmentId, path, content);
+  if (scoped.excluded.length) context?.onScopeExclusion?.(scoped.excluded.length);
   return Object.freeze(changed);
 }
 
@@ -152,16 +220,19 @@ export const BUILD_REPAIR_PATCH_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unkn
 });
 
 export function validateBuildRepairPatchBundle(value: unknown): BuildRepairPatchBundle {
-  if (!value || typeof value !== "object" || !Array.isArray((value as { patches?: unknown }).patches))
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => key !== "patches") || !Array.isArray((value as { patches?: unknown }).patches))
     throw new ApplicationError("VALIDATION_FAILED", "BuildRepairPatchBundle must contain a patches array");
   const patches = (value as { patches: readonly unknown[] }).patches;
   if (patches.length > 8) throw new ApplicationError("VALIDATION_FAILED", "Too many build repair patches");
   return Object.freeze({ patches: Object.freeze(patches.map((item) => {
-    if (!item || typeof item !== "object") throw new ApplicationError("VALIDATION_FAILED", "Invalid build repair patch");
+    if (!item || typeof item !== "object" || Array.isArray(item) || Object.keys(item).some(key => !["path", "find", "replace"].includes(key))) throw new ApplicationError("VALIDATION_FAILED", "Invalid build repair patch");
     const patch = item as { path?: unknown; find?: unknown; replace?: unknown };
-    if (typeof patch.path !== "string" || typeof patch.find !== "string" || !patch.find || typeof patch.replace !== "string" || !safePath(patch.path) || !editableSourcePath(patch.path) || isManagedSitePath(patch.path))
+    // Accept relative Windows separators and a leading ./, never guess extensions,
+    // case-fold paths, or resolve traversal/absolute/managed destinations.
+    const path = typeof patch.path === "string" ? patch.path.replaceAll("\\", "/").replace(/^\.\//, "") : "";
+    if (typeof patch.find !== "string" || !patch.find || typeof patch.replace !== "string" || !safePath(path) || path.split("/").some(part => !part || part === ".") || !editableSourcePath(path) || isManagedSitePath(path))
       throw new ApplicationError("MANAGED_FILE_MODIFICATION", `Build repair patch contains a disallowed path: ${String(patch.path)}`);
-    return Object.freeze({ path: patch.path, find: patch.find, replace: patch.replace });
+    return Object.freeze({ path, find: patch.find, replace: patch.replace });
   })) });
 }
 
@@ -169,14 +240,10 @@ export async function applyBuildRepairPatchBundle(
   execution: Pick<ExecutionProvider, "readFile" | "writeFile">,
   environmentId: string,
   bundle: BuildRepairPatchBundle,
+  snapshot?: BuildRepairSourceSnapshot,
+  onDiagnostics?: (diagnostics: readonly BuildRepairPatchDiagnostic[]) => void,
 ): Promise<void> {
-  for (const patch of bundle.patches) {
-    const source = await execution.readFile(environmentId, patch.path);
-    const index = source.indexOf(patch.find);
-    if (index < 0) throw new ApplicationError("VALIDATION_FAILED", `Build repair find text was not found in ${patch.path}`);
-    const next = source.slice(0, index) + patch.replace + source.slice(index + patch.find.length);
-    await execution.writeFile(environmentId, patch.path, next);
-  }
+  await applyValidatedBuildRepairPatches(execution, environmentId, validateBuildRepairPatchBundle(bundle), snapshot, onDiagnostics);
 }
 
 export const SITE_CODER_FILE_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unknown>> = Object.freeze({

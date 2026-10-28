@@ -28,16 +28,27 @@ import { verifyRepairedTemplateControls } from "./fixtures/repaired-template-con
 import { MockExecutionProvider } from "../src/execution/mock-execution-provider.js";
 import { applyDeterministicAutofix } from "../src/sites/generation/deterministic-autofix.js";
 import type { GenerationDevelopmentEvent } from "../src/sites/generation/generation-development-telemetry.js";
+import { strFromU8, unzipSync } from "fflate";
+import { LocalFailedCandidateEvidence } from "../src/sites/generation/failed-candidate-evidence.js";
+import { maskProtectedEditValues } from "../src/cli/runtime/edit-scope.js";
 
 const keys = ['modern-saas','creative-agency','personal-portfolio','corporate-business','ecommerce-store','restaurant','real-estate','healthcare-clinic'];
 const parent = resolve('.sites-runtime/exact-workflow-tests'), roots: string[] = [];
 const artifacts = new Map<string, Uint8Array>();
+const storeInstruction = `Customize this existing Ecommerce Store website for a premium clothing brand named "North & Loom".
+1. Replace "Atelier Row" with "North & Loom" throughout the website.
+2. Change the homepage headline to "Everyday Essentials, Thoughtfully Made".
+3. Update the hero description to "Discover timeless clothing designed for comfort, confidence, and modern everyday living."
+4. Change the primary accent color to charcoal (#292929), preserving the cream background and original visual style.
+5. Rename the featured collection heading to "The North & Loom Collection".
+Preserve all existing product cards, product pages, image galleries, size selectors, quantity controls, shopping interactions, navigation, and responsive layout.
+Edit the current website rather than generating a new one.`;
+let storePatches: { path: string; find: string; replace: string; mode: string }[];
 const nexoraInstruction = 'Rename ApexBridge Group to Nexora Technologies. Change the homepage headline and hero description. Change the primary accent color to #2563EB. Preserve the existing layout and all functionality.';
 const nexoraPatches = [
   { path: 'src/App.jsx', find: 'ApexBridge Group', replace: 'Nexora Technologies', mode: 'all' },
   { path: 'src/App.jsx', find: 'APEXBRIDGE<small>GROUP</small>', replace: 'NEXORA<small>TECHNOLOGIES</small>', mode: 'all' },
   { path: 'src/App.jsx', find: 'ApexBridge', replace: 'Nexora Technologies', mode: 'all' },
-  { path: 'src/App.jsx', find: 'apexbridge.com', replace: 'nexora.example', mode: 'all' },
   { path: 'index.html', find: 'ApexBridge Advisory', replace: 'Nexora Technologies', mode: 'all' },
   { path: 'src/App.jsx', find: 'See the whole.<br/><em>Shape what’s next.</em>', replace: 'Technology for tomorrow.<br/><em>Built with Nexora.</em>', mode: 'unique' },
   { path: 'src/App.jsx', find: 'We help leaders make consequential decisions, move through complexity and build businesses that endure.', replace: 'Nexora Technologies builds practical technology for ambitious businesses.', mode: 'unique' },
@@ -56,6 +67,23 @@ beforeAll(async () => {
       return { ...manifest, id: `${key}:${manifest.version}`, categoryId: manifest.categoryKey, status: 'active' as const, sourceObject: `${key}.zip`, sourceSha256: archive.sha256, previews: {}, createdAt: new Date(0), updatedAt: new Date(0) };
     }));
   }
+  const files = unzipSync(artifacts.get('ecommerce-store')!);
+  const source = strFromU8(files['src/App.jsx']!);
+  const home = source.match(/^function Home\(\).*$/m)![0];
+  const customizedHome = home.replace('Objects for the<br/><i>everyday ritual.</i>', 'Everyday Essentials,<br/><i>Thoughtfully Made</i>')
+    .replace('A thoughtful edit of furniture and objects—made to be used, lived with, and kept close.', 'Discover timeless clothing designed for comfort, confidence, and modern everyday living.')
+    .replace('The newest forms<br/>in the studio.', 'The North &amp; Loom Collection');
+  storePatches = [
+    // Intentionally ambiguous unique brand patch: the generic resolver must prove global scope.
+    { path: 'src/App.jsx', find: 'Atelier Row', replace: 'North & Loom', mode: 'unique' },
+    { path: 'src/App.jsx', find: 'ATELIER <i>ROW</i>', replace: 'NORTH &amp; <i>LOOM</i>', mode: 'unique' },
+    { path: 'src/App.jsx', find: 'ATELIER /', replace: 'NORTH &amp; LOOM /', mode: 'all' },
+    { path: 'src/App.jsx', find: 'Atelier collection', replace: 'North & Loom collection', mode: 'all' },
+    { path: 'index.html', find: 'Atelier Row', replace: 'North & Loom', mode: 'all' },
+    { path: 'src/App.jsx', find: home, replace: customizedHome, mode: 'unique' },
+    { path: 'src/styles.css', find: '--green:#25372d', replace: '--green:#292929', mode: 'unique' },
+    { path: 'src/App.jsx', find: '<span>A / R</span>', replace: '<span>N / L</span>', mode: 'unique' },
+  ];
 });
 afterEach(async () => {
   vi.restoreAllMocks(); vi.unstubAllEnvs();
@@ -73,7 +101,7 @@ class CurrentVersions implements SiteVersionRepository {
   async save(version: SiteVersion) { this.current.set(version.siteId, version); }
   async listBySite(id: SiteId) { const value = this.current.get(id); return { items: value ? [value] : [] }; }
 }
-async function harness(record: SiteTemplate) {
+async function harness(record: SiteTemplate, editResponses?: readonly { readonly patches: readonly { readonly path: string; readonly find: string; readonly replace: string; readonly mode: string }[] }[]) {
   vi.stubEnv('npm_config_offline', 'true');
   await mkdir(parent, { recursive: true }); const root = await mkdtemp(join(parent, 'case-')); roots.push(root);
   let failEdit = false;
@@ -81,18 +109,11 @@ async function harness(record: SiteTemplate) {
   const requests: AgentRequest[] = [];
   const provider = new MockAgentProvider({ customResponse: request => {
     requests.push(request);
-    return { id: 'offline-exact-edit', model: request.model, message: { role: 'assistant', content: JSON.stringify({ patches: failEdit
+    return { id: 'offline-exact-edit', model: request.model, message: { role: 'assistant', content: JSON.stringify(editResponses?.[requests.length - 1] ?? { patches: failEdit
       ? [{ path: 'src/App.jsx', find: 'THIS TEXT DOES NOT EXIST', replace: 'invalid' }]
-      : record.templateKey === 'corporate-business' ? nexoraPatches : [
-        { path: 'src/App.jsx', find: 'Atelier Row', replace: 'North & Loom', mode: 'all' },
-        { path: 'src/App.jsx', find: 'ATELIER <i>ROW</i>', replace: 'NORTH &amp; <i>LOOM</i>' },
-        { path: 'src/App.jsx', find: 'ATELIER /', replace: 'NORTH &amp; LOOM /', mode: 'all' },
-        { path: 'src/App.jsx', find: 'Atelier collection', replace: 'North & Loom collection', mode: 'all' },
-        { path: 'index.html', find: 'Atelier Row', replace: 'North & Loom', mode: 'all' },
-        { path: 'src/App.jsx', find: 'A thoughtful edit of furniture and objects—made to be used, lived with, and kept close.', replace: 'Considered clothing for everyday life, crafted with care by North & Loom.' },
-        { path: 'src/styles.css', find: '--green:#25372d', replace: '--green:#262626' },
-        { path: 'src/styles.css', find: '--cream:#f6f0e5', replace: '--cream:#f4efe7' },
-      ] }) }, toolCalls: [], usage: { inputTokens: 100, outputTokens: 100 }, latencyMs: 0, finishReason: 'stop', ...responseOverride };
+      : record.templateKey === 'corporate-business' ? nexoraPatches
+      : record.templateKey === 'restaurant' ? [{ path: 'src/App.jsx', find: 'Gather close.<br/><i>Eat well.</i>', replace: 'Gather together.<br/><i>Eat well.</i>', mode: 'unique' }]
+      : storePatches }) }, toolCalls: [], usage: { inputTokens: 100, outputTokens: 100 }, latencyMs: 0, finishReason: 'stop', ...responseOverride };
   } });
   Object.defineProperty(provider, 'id', { value: 'offline-exact-template' });
   const registry = new AgentProviderRegistry(); registry.register(provider);
@@ -106,7 +127,7 @@ async function harness(record: SiteTemplate) {
   const billing = { preflight: vi.fn(async () => ({})), finalizeSuccessfulJob: vi.fn(async (job: unknown) => job) };
   const developmentTelemetry = { record: vi.fn<(event: GenerationDevelopmentEvent) => void>() };
   const api = createLocalSitesProduct({ executionRoot: join(root, 'execution'), artifactRoot: join(root, 'artifacts'), projects, versions, versionCommitter: committer,
-    agentRegistry: registry, orchestrationAgent: provider, developmentTelemetry, billing: billing as unknown as SiteCreditBillingService });
+    agentRegistry: registry, orchestrationAgent: provider, developmentTelemetry, failedCandidateEvidence: new LocalFailedCandidateEvidence(join(root, 'diagnostics')), billing: billing as unknown as SiteCreditBillingService });
   const source = { readObject: vi.fn(async () => artifacts.get(record.templateKey)) };
   const templates = { findLatestActiveTemplate: vi.fn(async () => record), findTemplateVersion: vi.fn(async () => ({ ...record, version: 1, status: 'archived' as const })), listActiveTemplates: vi.fn(), findById: async () => record };
   const qa = vi.spyOn(api.browserQA, 'run');
@@ -131,6 +152,108 @@ async function exerciseStore(page: Page, url: string) {
 }
 
 describe('Original exact-template workflow, no live AI', () => {
+  it('commits all five scoped North & Loom changes from one response while independently excluding its unauthorized unique email patch', async () => {
+    const record = catalog.find(item => item.templateKey === 'ecommerce-store')!;
+    // Keep the existing eight-operation schema limit. The three exact copy
+    // changes are separate operations, not a rewritten component or full site.
+    const patches = [storePatches[0]!, storePatches[1]!, storePatches[4]!,
+      { path: 'src/App.jsx', find: 'Objects for the<br/><i>everyday ritual.</i>', replace: 'Everyday Essentials,<br/><i>Thoughtfully Made</i>', mode: 'unique' },
+      { path: 'src/App.jsx', find: 'A thoughtful edit of furniture and objects—made to be used, lived with, and kept close.', replace: 'Discover timeless clothing designed for comfort, confidence, and modern everyday living.', mode: 'unique' },
+      { path: 'src/App.jsx', find: 'The newest forms<br/>in the studio.', replace: 'The North &amp; Loom Collection', mode: 'unique' },
+      storePatches[6]!, { path: 'src/App.jsx', find: 'hello@atelierrow.com', replace: 'hello@northandloom.com', mode: 'unique' },
+    ];
+    const h = await harness(record, [{ patches }]);
+    const created = await h.service.instantiate({ ownerId: 'exact-owner' as UserId, templateKey: record.templateKey });
+    try {
+      const original = await snapshot(h, created.versionId);
+      const edited = await h.api.pipeline.edit({ userId: 'exact-owner' as UserId, siteId: created.projectId, instruction: storeInstruction, agentProvider: h.provider.id, browserQAEnabled: true, retainPreview: true });
+      try {
+        expect(h.requests).toHaveLength(1); expect(edited.build.success).toBe(true);
+        expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce();
+        const current = await snapshot(h, edited.newVersionId);
+        expect(current.files['src/App.jsx']).not.toContain('hello@northandloom.com');
+        expect(current.files['src/App.jsx']).toContain('<a href="mailto:hello@atelierrow.com">hello@atelierrow.com</a>');
+        expect(current.files['src/App.jsx']).not.toContain('Atelier Row');
+        expect(current.files['src/styles.css']).toContain('--green:#292929');
+        expect(current.files['src/styles.css']).toContain('--cream:#f6f0e5');
+        expect(current.files['src/main.jsx']).toBe(original.files['src/main.jsx']);
+        const qa = await new BrowserQARunner().run({ runId: 'scoped-north-and-loom', target: { baseUrl: edited.preview.url! }, routes: record.routes.map(route => route.path), checks: [...browserQACoreCheckExecutors, ...browserQAResponsiveAndInteractionChecks], policy: { captureScreenshots: false } });
+        expect(qa.status).not.toBe('FAIL'); expect(qa.checks.filter(check => check.status === 'FAIL' && check.severity === 'ERROR')).toEqual([]);
+        const browser = await chromium.launch({ headless: true });
+        try {
+          for (const viewport of BROWSER_QA_VIEWPORTS) {
+            const checks = qa.checks.filter(check => check.viewport?.id === viewport.id);
+            expect(new Set(checks.map(check => check.route))).toEqual(new Set(record.routes.map(route => route.path)));
+            const page = await browser.newPage({ viewport: { width: viewport.width, height: viewport.height } });
+            const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
+            await page.goto(edited.preview.url!, { waitUntil: 'networkidle' });
+            expect((await page.locator('h1').innerText()).replace(/\s+/g, ' ')).toBe('Everyday Essentials, Thoughtfully Made');
+            expect(await page.locator('.store-hero p').innerText()).toBe('Discover timeless clothing designed for comfort, confidence, and modern everyday living.');
+            expect(await page.locator('.featured h2').innerText()).toBe('The North & Loom Collection');
+            await exerciseStore(page, edited.preview.url!); expect(errors).toEqual([]); await page.close();
+          }
+        } finally { await browser.close(); }
+        const restore = await h.api.execution.createEnvironment({});
+        try {
+          const version = (await h.api.versions.getById(edited.newVersionId))!;
+          expect((await new SiteSourceSnapshotService(h.api.artifacts).restore(h.api.execution, restore.id, version.sourceArtifactRef)).files).toEqual(current.files);
+        } finally { await h.api.execution.destroyEnvironment(restore.id); }
+        expect((await h.api.projects.getById(created.projectId))?.latestVersionId).toBe(edited.newVersionId);
+        expect(await h.api.versions.getById(created.versionId)).toBeUndefined();
+        expect((await h.api.versions.listBySite(created.projectId)).items).toHaveLength(1);
+      } finally { await h.api.execution.destroyEnvironment(edited.preview.environmentId); }
+    } finally { await h.api.execution.destroyEnvironment(created.environmentId); }
+  }, 420_000);
+  it('safely excludes the digest-verified 4415e5f5 unauthorized repair operation and commits the complete edit once', async () => {
+    const record = catalog.find(item => item.templateKey === 'ecommerce-store')!;
+    const find = 'Atelier Row began as a conversation between a designer and a ceramicist about the objects they could never find: warm but minimal, artful but useful, distinct without demanding attention.';
+    const repair = { patches: [
+      { path: 'src/App.jsx', find, replace: find.replace('Atelier Row', 'North & Loom'), mode: 'unique' },
+      { path: 'src/App.jsx', find: 'hello@atelierrow.com', replace: 'hello@northandloom.com', mode: 'unique' },
+    ] };
+    const expectedDigests = [
+      ['6adf17cf54072a901d872c45ea79d3540e90392bbbf180826b5ed67b3cf95280', '6f6f062a866ba9d364adb19531e93ccb84bbdadea789d67287df96f8698ba019'],
+      ['53307090a937a4ced9c6134921b9ac4928f6b1c67e38d729f41b2cc00d294592', '8da3b8a1ee36a18ebf6e4c88466e703e141747a4ba3d109c72ce665257840025'],
+    ];
+    repair.patches.forEach((patch, index) => {
+      expect(createHash('sha256').update(patch.find).digest('hex')).toBe(expectedDigests[index]![0]);
+      expect(createHash('sha256').update(patch.replace).digest('hex')).toBe(expectedDigests[index]![1]);
+    });
+    // The full first response was not retained. Reproduce its known pattern:
+    // the five changes are planned, but About still requires brand completion.
+    const first = { patches: storePatches.map(patch => patch.path === 'src/App.jsx' && patch.find === 'Atelier Row'
+      ? { ...patch, find: '© 2026 Atelier Row', replace: '© 2026 North & Loom', mode: 'unique' } : patch) };
+    const h = await harness(record, [first, repair]);
+    const created = await h.service.instantiate({ ownerId: 'exact-owner' as UserId, templateKey: record.templateKey });
+    try {
+      const original = await snapshot(h, created.versionId);
+      const outerRequestId = '11111111-1111-4111-8111-111111111111';
+      const edited = await h.api.pipeline.edit({ userId: 'exact-owner' as UserId, siteId: created.projectId, outerRequestId,
+        instruction: storeInstruction, agentProvider: h.provider.id, browserQAEnabled: true, retainPreview: true });
+      try {
+        expect(h.requests).toHaveLength(2);
+        expect(h.requests[1]?.messages[0]?.content).toContain('attempt 2 of 2');
+        expect(h.requests.every(request => request.messages[0]?.content.includes('EDIT SCOPE:'))).toBe(true);
+        expect(JSON.stringify(h.requests)).not.toContain(outerRequestId);
+        expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce();
+        expect(edited.build.success).toBe(true); expect(edited.browserQA?.status).not.toBe('FAIL');
+        const current = await snapshot(h, edited.newVersionId);
+        expect(current.files['src/App.jsx']).toContain('mailto:hello@atelierrow.com');
+        expect(current.files['src/App.jsx']).not.toContain('hello@northandloom.com');
+        expect(current.files['src/App.jsx']).not.toContain('Atelier Row');
+        expect(current.files['src/App.jsx']).toContain('Everyday Essentials,');
+        expect(current.files['src/App.jsx']).toContain('Discover timeless clothing designed for comfort, confidence, and modern everyday living.');
+        expect(current.files['src/App.jsx']).toContain('The North &amp; Loom Collection');
+        expect(current.files['src/styles.css']).toContain('--green:#292929');
+        expect(current.files['src/styles.css']).toContain('--cream:#f6f0e5');
+        expect((await h.api.projects.getById(created.projectId))?.latestVersionId).toBe(edited.newVersionId);
+        expect(await h.api.versions.getById(created.versionId)).toBeUndefined();
+        expect((await h.api.versions.listBySite(created.projectId)).items).toHaveLength(1);
+        expect(current.files['src/main.jsx']).toBe(original.files['src/main.jsx']);
+        expect(h.developmentTelemetry.record.mock.calls.some(([event]) => event.validationCategory === 'INDEPENDENT_UNAUTHORIZED_OPERATION_EXCLUDED' && event.excludedOperationCount === 1)).toBe(true);
+      } finally { await h.api.execution.destroyEnvironment(edited.preview.environmentId); }
+    } finally { await h.api.execution.destroyEnvironment(created.environmentId); }
+  }, 300_000);
   it.runIf(process.env.SITES_VERIFY_PUBLISHED_HEALTHCARE_V1 === '1')('rejects the actual active Healthcare v1 at Browser QA before persistence', async () => {
     const record = catalog.find(item => item.templateKey === 'healthcare-clinic')!;
     expect(record.version).toBe(1);
@@ -185,6 +308,7 @@ describe('Original exact-template workflow, no live AI', () => {
       expect((await h.api.versions.listBySite(created.projectId)).items).toHaveLength(1);
       if (key === 'ecommerce-store') await verifyStore(h, created, record);
       if (key === 'corporate-business') await verifyCorporate(h, created, record);
+      if (key === 'restaurant') await verifyRestaurant(h, created, record);
       if (['creative-agency','real-estate','healthcare-clinic'].includes(key)) await verifyRepairedTemplateControls(key, created.preview.url, proof);
     } finally { await h.api.execution.destroyEnvironment(created.environmentId); }
   }, 420_000);
@@ -194,6 +318,27 @@ describe('Original exact-template workflow, no live AI', () => {
     expect(h.source.readObject).not.toHaveBeenCalled(); expect(h.provider.callCount).toBe(0);
   });
 });
+
+async function verifyRestaurant(h: Awaited<ReturnType<typeof harness>>, created: Awaited<ReturnType<TemplateInstantiationService['instantiate']>>, record: SiteTemplate) {
+  const original = await snapshot(h, created.versionId);
+  const edited = await h.api.pipeline.edit({ userId: 'exact-owner' as UserId, siteId: created.projectId,
+    instruction: 'Update the homepage hero heading to "Gather together. Eat well.". Preserve the existing layout and functionality.',
+    agentProvider: h.provider.id, browserQAEnabled: true, retainPreview: true });
+  try {
+    expect(edited.build.success).toBe(true); expect(edited.browserQA?.status).not.toBe('FAIL');
+    expect(h.requests).toHaveLength(1); expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce();
+    const current = await snapshot(h, edited.newVersionId);
+    expect(current.files['src/App.jsx']).toBe(original.files['src/App.jsx']!.replace('Gather close.<br/><i>Eat well.</i>', 'Gather together.<br/><i>Eat well.</i>'));
+    expect(current.files['src/main.jsx']).toBe(original.files['src/main.jsx']);
+    const qa = await new BrowserQARunner().run({ runId: 'restaurant-edit-control', target: { baseUrl: edited.preview.url! },
+      routes: record.routes.map(route => route.path), checks: [...browserQACoreCheckExecutors, ...browserQAResponsiveAndInteractionChecks], policy: { captureScreenshots: false } });
+    expect(qa.status).not.toBe('FAIL');
+    for (const viewport of BROWSER_QA_VIEWPORTS) {
+      const checks = qa.checks.filter(check => check.viewport?.id === viewport.id);
+      expect(checks.length).toBeGreaterThan(0); expect(checks.filter(check => check.status === 'FAIL' && check.severity === 'ERROR')).toEqual([]);
+    }
+  } finally { await h.api.execution.destroyEnvironment(edited.preview.environmentId); }
+}
 
 async function verifyCorporate(h: Awaited<ReturnType<typeof harness>>, created: Awaited<ReturnType<TemplateInstantiationService['instantiate']>>, record: SiteTemplate) {
   expect(record.version).toBe(2);
@@ -220,7 +365,8 @@ async function verifyCorporate(h: Awaited<ReturnType<typeof harness>>, created: 
       for (const path of Object.keys(expected)) expected[path] = await normalizer.readFile(normalizationEnvironment.id, path);
     } finally { await normalizer.destroyEnvironment(normalizationEnvironment.id); }
     expect(current.files).toEqual(expected);
-    expect(current.files['src/App.jsx']).not.toMatch(/apexbridge/i);
+    expect(maskProtectedEditValues(current.files['src/App.jsx']!)).not.toMatch(/apexbridge/i);
+    expect(current.files['src/App.jsx']).toContain('apexbridge.com');
     expect(current.files['index.html']).toContain('Nexora Technologies');
     const qa = await new BrowserQARunner().run({ runId: 'nexora-all-routes', target: { baseUrl: edited.preview.url! }, routes: record.routes.map(route => route.path), checks: [...browserQACoreCheckExecutors, ...browserQAResponsiveAndInteractionChecks], policy: { captureScreenshots: false } });
     for (const viewport of BROWSER_QA_VIEWPORTS) {
@@ -312,19 +458,47 @@ async function verifyStore(h: Awaited<ReturnType<typeof harness>>, created: Awai
       }
       await exerciseStore(page, created.preview.url); await page.close();
     }
-    const edited = await h.api.pipeline.edit({ userId: 'exact-owner' as UserId, siteId: created.projectId, instruction: 'Rename Atelier Row to North & Loom. Update the homepage hero copy and use charcoal and cream colors. Keep the layout and all product interactions.', agentProvider: h.provider.id, browserQAEnabled: true, retainPreview: true });
+    const edited = await h.api.pipeline.edit({ userId: 'exact-owner' as UserId, siteId: created.projectId, instruction: storeInstruction, agentProvider: h.provider.id, browserQAEnabled: true, retainPreview: true });
     try {
       expect(edited.build.success).toBe(true); expect(edited.browserQA?.status).not.toBe('FAIL');
+      expect(h.requests).toHaveLength(1);
       expect(h.requests.every(request => request.responseContract?.type === 'JSON_SCHEMA' && request.responseContract.name === 'SiteEditPatchBundle')).toBe(true);
       expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce(); expect(h.source.readObject).toHaveBeenCalledOnce();
       const current = await snapshot(h, edited.newVersionId);
       expect(current.files['src/App.jsx']).toContain('North & Loom'); expect(current.files['src/App.jsx']).not.toContain('Atelier Row');
       expect(current.files['src/main.jsx']).toBe(original.files['src/main.jsx']); expect(current.files['src/components.css']).toBe(original.files['src/components.css']);
-      expect(current.files['src/App.jsx']).toContain('Contour Carafe'); expect(current.files['src/styles.css']).toContain('--green:#262626');
+      expect(current.files['src/App.jsx']).toContain('Contour Carafe'); expect(current.files['src/styles.css']).toContain('--green:#292929');
+      expect(current.files['src/App.jsx']).toContain('Everyday Essentials,');
+      expect(current.files['src/App.jsx']).toContain('Discover timeless clothing designed for comfort, confidence, and modern everyday living.');
+      expect(current.files['src/App.jsx']).toContain('The North &amp; Loom Collection');
+      expect(current.files['src/App.jsx']).toContain('mailto:hello@atelierrow.com');
+      expect(current.files['src/App.jsx']).not.toContain('hello@northandloom.com');
+      expect(current.files['src/styles.css']).toContain('--cream:#f6f0e5');
+      const expected = { ...original.files };
+      for (const patch of storePatches) expected[patch.path] = patch.find === 'Atelier Row' || patch.mode === 'all'
+        ? expected[patch.path]!.split(patch.find).join(patch.replace) : expected[patch.path]!.replace(patch.find, patch.replace);
+      const normalizer = new MockExecutionProvider(), normalizationEnvironment = await normalizer.createEnvironment({});
+      try {
+        for (const [path, content] of Object.entries(expected)) await normalizer.writeFile(normalizationEnvironment.id, path, content);
+        await applyDeterministicAutofix(normalizer, normalizationEnvironment.id);
+        for (const path of Object.keys(expected)) expected[path] = await normalizer.readFile(normalizationEnvironment.id, path);
+      } finally { await normalizer.destroyEnvironment(normalizationEnvironment.id); }
+      expect(current.files).toEqual(expected);
       expect((await h.api.versions.listBySite(created.projectId)).items).toHaveLength(1);
       expect(await h.api.versions.getById(created.versionId)).toBeUndefined();
       const qa = await new BrowserQARunner().run({ runId: 'edited-template-all-routes', target: { baseUrl: edited.preview.url! }, routes: record.routes.map(route => route.path), checks: [...browserQACoreCheckExecutors, ...browserQAResponsiveAndInteractionChecks], policy: { captureScreenshots: false } });
       expect(qa.status).not.toBe('FAIL'); expect(qa.checks.filter(check => check.status === 'FAIL' && check.severity === 'ERROR')).toEqual([]);
+      for (const viewport of BROWSER_QA_VIEWPORTS) {
+        expect(qa.checks.filter(check => check.viewport?.id === viewport.id).length).toBeGreaterThan(0);
+        const viewportPage = await browser.newPage({ viewport: { width: viewport.width, height: viewport.height } });
+        const errors: string[] = []; viewportPage.on('pageerror', error => errors.push(error.message));
+        await viewportPage.goto(edited.preview.url!, { waitUntil: 'networkidle' });
+        expect((await viewportPage.locator('h1').innerText()).replace(/\s+/g, ' ')).toBe('Everyday Essentials, Thoughtfully Made');
+        expect(await viewportPage.locator('.featured h2').innerText()).toBe('The North & Loom Collection');
+        expect(await viewportPage.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--green').trim())).toBe('#292929');
+        await exerciseStore(viewportPage, edited.preview.url!);
+        expect(errors).toEqual([]); await viewportPage.close();
+      }
       const page = await browser.newPage(); await page.goto(edited.preview.url!, { waitUntil: 'networkidle' });
       expect(await page.locator('body').innerText()).toContain('NORTH & LOOM');
       await page.screenshot({ path: join(proof, 'customized-desktop.png') });

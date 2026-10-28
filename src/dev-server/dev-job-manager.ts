@@ -51,7 +51,7 @@ export class DevJobManager {
   constructor(private readonly progress: InMemoryProgressBus) {}
   start(
     operation: DevJobRecord["operation"],
-    execute: (onIntelligence: (updates: readonly AgentTaskTelemetry[]) => void) => Promise<{
+    execute: (onIntelligence: (updates: readonly AgentTaskTelemetry[]) => void, outerRequestId: string) => Promise<{
       projectId: string;
       versionId: string;
       preview?: { sessionId: string; url: string };
@@ -133,7 +133,7 @@ export class DevJobManager {
     void Promise.resolve()
       .then(() => {
         job.status = "RUNNING";
-        return execute(onIntelligence);
+        return execute(onIntelligence, job.id);
       })
       .then(({ projectId, versionId, preview, intelligence, billingStatus, creditsCharged, subscriberQuota }) => {
         job.projectId = projectId;

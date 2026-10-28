@@ -7,6 +7,7 @@ import type {
 } from "../../agents/intelligence/intelligence-types.js";
 import { SiteRuntimeSpecValidator } from "../../site-runtime/runtime-validator.js";
 import type { MotionIntent, MotionPolicyPreset } from "../motion/motion-domain.js";
+import type { FunctionalRequirements } from "../generation/functional-capabilities.js";
 
 export interface SitePageSpec {
   readonly name: string;
@@ -28,6 +29,7 @@ export interface SiteSpec {
     readonly siteType: string;
     readonly pages: readonly SitePageSpec[];
     readonly features: readonly string[];
+    readonly functional?: FunctionalRequirements;
   };
   readonly design: {
     readonly style?: string;

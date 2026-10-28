@@ -56,6 +56,8 @@ export interface BrowserQAPageContext {
 
 export interface BrowserQACheckExecutor {
   readonly definition: BrowserQACheckDefinition;
+  /** Deterministic route/viewport scope; an excluded check is recorded SKIPPED. */
+  readonly appliesTo?: (route: string, viewport: BrowserQAViewport) => boolean;
   execute(context: BrowserQAPageContext): Promise<BrowserQACheckResult>;
 }
 
@@ -131,10 +133,13 @@ export class BrowserQARunner {
     const browser = await this.#launchWithRetry(policy);
     this.#activeBrowsers++;
     try {
-      for (const viewport of viewports) {
+      routeRuns: for (const viewport of viewports) {
         for (const route of routes) {
-          if (this.#now().getTime() - started.getTime() > policy.totalTimeoutMs)
-            throw new BrowserQATimeoutError("Browser QA total run timeout exceeded");
+          if (this.#now().getTime() - started.getTime() > policy.totalTimeoutMs) {
+            checks.push(createBrowserQACheckResult({ checkId: "qa.run-budget", category: "RUNTIME", status: "FAIL", severity: "ERROR", route, viewport,
+              message: "Browser QA total run timeout exceeded; remaining routes were not validated" }));
+            break routeRuns;
+          }
           const pageResult = await this.#runPage({
             browser,
             baseUrl,
@@ -305,9 +310,20 @@ export class BrowserQARunner {
         get events() { return freezeEvents(events); },
         ...(screenshotRef === undefined ? {} : { screenshotRef }),
       };
-      for (const check of input.checks) {
+      // Include errors raised by clicks/forms on isolated probe pages. Checking
+      // startup errors before interactions would permanently record PASS even
+      // when a later required control throws an uncaught exception.
+      const finalEventChecks = new Set(["runtime.page-error", "runtime.console-error"]);
+      const orderedChecks = [...input.checks.filter(check => !finalEventChecks.has(check.definition.checkId)),
+        ...input.checks.filter(check => finalEventChecks.has(check.definition.checkId))];
+      for (const check of orderedChecks) {
         let probe: Page | undefined;
         try {
+          if (check.appliesTo && !check.appliesTo(input.route, input.viewport)) {
+            pageChecks.push(createBrowserQACheckResult({ checkId: check.definition.checkId, category: check.definition.category, status: "SKIPPED",
+              severity: check.definition.defaultSeverity, route: input.route, viewport: input.viewport, message: "No requirement assigned to this route and viewport" }));
+            continue;
+          }
           // Interaction checks must not inherit overlays, scroll or modified
           // form/filter state from other probes. A separate page also lets us
           // abort a timed-out check without its pending clicks affecting the next.

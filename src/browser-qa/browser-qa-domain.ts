@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { ApplicationError } from "../app/errors/application-error.js";
 import { STANDARD_VIEWPORTS, type ViewportName } from "../visual-qa/visual-qa-types.js";
+import type { FunctionalProbeResult } from "./functional-route-probes.js";
 
 export const BROWSER_QA_REPORT_VERSION = 1 as const;
 export const BROWSER_QA_STATUSES = ["PASS", "PASS_WITH_WARNINGS", "FAIL"] as const;
@@ -58,6 +59,7 @@ export interface BrowserQADiagnostic {
 }
 
 export interface BrowserQACheckResult {
+  readonly functionalProbes?: readonly FunctionalProbeResult[];
   readonly checkId: string;
   readonly category: BrowserQACategory;
   readonly status: BrowserQACheckStatus;

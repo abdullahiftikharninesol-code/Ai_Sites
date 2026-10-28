@@ -308,8 +308,9 @@ export class PlaygroundService {
         throw this.#error("VERSION_NOT_FOUND", "Version not found");
     }
     const assetManifest = this.#assets(owner, attachmentIds, referenceIds);
-    return this.jobs.start("EDIT", async (onIntelligence) => {
+    return this.jobs.start("EDIT", async (onIntelligence, outerRequestId) => {
       const result = await this.product.orchestrator.editWebsite({
+        outerRequestId,
         userId: owner as UserId,
         siteId: siteId as SiteId,
         versionId,

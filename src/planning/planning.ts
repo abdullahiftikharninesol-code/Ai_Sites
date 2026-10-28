@@ -9,6 +9,7 @@ import type {
 } from "../agents/intelligence/intelligence-types.js";
 import { stripOuterMarkdownFence } from "../agents/shared/structured-response-parser.js";
 import { getDefaultProfile } from "../cli/runtime/site-technical-profile.js";
+import { requestedPages } from "../sites/generation/requested-pages.js";
 
 export interface SiteRequirementSpec {
   readonly siteType: string;
@@ -78,6 +79,8 @@ export class DeterministicRequirementsPlanner implements RequirementsPlanner {
       { name: "Product Detail", path: "/product", include: /\bproduct[- ]details?\b/i.test(prompt) },
       { name: "About", path: "/about", include: has("about") },
       { name: "Services", path: "/services", include: has("services") },
+      { name: "Our Work", path: "/our-work", include: explicitPage("our work") },
+      { name: "Contact", path: "/contact", include: explicitPage("contact") },
       {
         name: "Menu",
         path: "/menu",
@@ -100,7 +103,8 @@ export class DeterministicRequirementsPlanner implements RequirementsPlanner {
           has("member portal", "member dashboard", "member login", "protected dashboard", "sign up"),
       },
     ];
-    const pages = pageCandidates
+    const explicitPages = requestedPages(prompt);
+    const pages = explicitPages.length ? explicitPages.map(({ name, path }) => ({ name, path })) : pageCandidates
       .filter(({ include }) => include)
       .map(({ name, path, purpose }) => ({ name, path, ...(purpose ? { purpose } : {}) }));
     const collections: SiteRuntimeCollectionSpec[] = [];

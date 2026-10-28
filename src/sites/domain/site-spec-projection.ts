@@ -39,6 +39,7 @@ export interface GenerationSiteSpec {
     readonly name: string;
   }[];
   readonly features: readonly string[];
+  readonly functionalRequirements?: readonly { readonly id: string; readonly capability: string; readonly page?: string; readonly routes?: readonly string[]; readonly mandatory: true }[];
   readonly design: SiteSpec["design"];
   readonly content?: SiteSpec["content"] | undefined;
   readonly technical: {
@@ -55,7 +56,7 @@ export interface GenerationSiteSpec {
  */
 export function toGenerationSiteSpec(
   spec: SiteSpec,
-  requirements?: GenerationCompletionRequirements | undefined,
+  requirements?: GenerationCompletionRequirements,
 ): GenerationSiteSpec {
   const pages = (spec.requirements?.pages ?? []).map((p) => {
     const id = canonicalizeIdentifier(p.name || p.path || "home");
@@ -96,6 +97,10 @@ export function toGenerationSiteSpec(
     pages,
     sections,
     features: spec.requirements.features ?? [],
+    ...(spec.requirements.functional ? { functionalRequirements: spec.requirements.functional.requirements?.map(requirement => ({
+      id: requirement.id, capability: requirement.capability, ...(requirement.target.pageName ? { page: requirement.target.pageName } : {}),
+      ...(requirement.routes ? { routes: requirement.routes } : {}), mandatory: true as const,
+    })) ?? [] } : {}),
     design: spec.design,
     ...(spec.content ? { content: spec.content } : {}),
     technical: {

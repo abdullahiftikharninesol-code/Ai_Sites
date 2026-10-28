@@ -1,10 +1,12 @@
 import { ApplicationError } from "../../app/errors/application-error.js";
 import type { ExecutionProvider } from "../../execution/execution-provider.js";
 import { isEditableSiteEditPath } from "./site-coder-file-bundle.js";
+import { analyzeEditScope, maskProtectedEditValues, type DeterministicEditScope } from "./edit-scope.js";
 
 export interface EditRequirements {
   readonly rename?: { readonly oldLiteral: string; readonly newLiteral: string };
   readonly style: boolean;
+  readonly scope?: DeterministicEditScope;
 }
 
 export interface EditRequirementContext {
@@ -22,7 +24,7 @@ export interface EditRequirementDiagnostic {
 
 /** Deliberately small grammar: explicit rename clauses, or quoted/single-name replacements. */
 export function parseEditRequirements(instruction: string): EditRequirements {
-  const clause = /\b(rename|change|replace)\s+(?:"([^"\n]+)"|'([^'\n]+)'|\u201c([^\u201d\n]+)\u201d|([^\n.,;!?]+?))\s+(to|with)\s+(?:"([^"\n]+)"|'([^'\n]+)'|\u201c([^\u201d\n]+)\u201d|([^\n.,;!?]+?))(?=\s*(?:[.,;!?\n]|$|\band\b))/gi;
+  const clause = /\b(rename|change|replace)\s+(?:"([^"\n]+)"|'([^'\n]+)'|\u201c([^\u201d\n]+)\u201d|([^\n.,;!?]+?))\s+(to|with)\s+(?:"([^"\n]+)"|'([^'\n]+)'|\u201c([^\u201d\n]+)\u201d|([^\n.,;!?]+?))(?:\s+(?:globally|everywhere|throughout (?:the )?(?:website|site|project)|across (?:the )?(?:(?:whole|entire) )?(?:website|site|project)))?(?=\s*(?:[.,;!?\n]|$|\band\b))/gi;
   const pairs: NonNullable<EditRequirements["rename"]>[] = [];
   for (const match of instruction.matchAll(clause)) {
     const verb = match[1]!.toLowerCase();
@@ -33,7 +35,8 @@ export function parseEditRequirements(instruction: string): EditRequirements {
     // Avoid interpreting "change the hero button text to ..." or colour instructions as names.
     const plainName = (text: string) => /^[A-Z][\p{L}\p{N}'& -]{0,79}$/u.test(text) &&
       !/\b(the|company|brand|restaurant|color|colour|accent|palette|theme|heading|headline|text|button|from|and)\b/i.test(text);
-    const confident = quoted || (verb === "rename"
+    const global = /\b(?:globally|everywhere|throughout (?:the )?(?:website|site|project)|across (?:the )?(?:(?:whole|entire) )?(?:website|site|project))\s*$/i.test(match[0]);
+    const confident = quoted || (verb === "rename" || global
       ? plainName(oldLiteral) && plainName(newLiteral)
       : /^[A-Z][\p{L}\p{N}]*$/u.test(oldLiteral) && /^[A-Z][\p{L}\p{N}]*$/u.test(newLiteral));
     if (confident && oldLiteral.length <= 80 && newLiteral.length <= 80 &&
@@ -45,6 +48,7 @@ export function parseEditRequirements(instruction: string): EditRequirements {
   const actionable = instruction.replace(/\b(?:keep|preserve|retain|without changing)\b[^.!?;\n]*/gi, "");
   return {
     ...(uniquePairs.length === 1 ? { rename: uniquePairs[0]! } : {}),
+    scope: analyzeEditScope(instruction, uniquePairs.length === 1 ? uniquePairs[0]! : undefined),
     style: /\b(?:colou?rs?|accent|palette|theme|visual\s+styl(?:e|ing))\b/i.test(actionable) ||
       /\b(?:change|update|adjust)\s+(?:the\s+)?styl(?:e|es|ing)\b/i.test(actionable),
   };
@@ -173,7 +177,7 @@ export function editRequirementDiagnostics(
   if (requirements.rename) {
     const { oldLiteral } = requirements.rename;
     const remainingFiles = [...after]
-      .filter(([path, content]) => isEditableRequirementPath(path) && containsRenameLiteral(content, oldLiteral))
+      .filter(([path, content]) => isEditableRequirementPath(path) && containsRenameLiteral(maskProtectedEditValues(content), oldLiteral))
       .map(([path]) => path).sort();
     if (remainingFiles.length)
       missing.push({

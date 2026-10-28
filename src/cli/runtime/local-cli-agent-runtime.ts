@@ -77,6 +77,8 @@ import {
   type SiteCoderFileBundle,
   type SiteEditPatchBundle,
 } from "./site-coder-file-bundle.js";
+import { createBuildRepairSourceSnapshot, type BuildRepairSourceSnapshot } from "./build-repair-source.js";
+import type { BuildRepairEvidence } from "./build-repair-patch-resolver.js";
 import type { AssetManifest } from "../../sites/assets/asset-domain.js";
 import {
   assertStructuredResponseComplete,
@@ -105,10 +107,13 @@ import {
   type EditRequirements,
 } from "./edit-requirements.js";
 import { isEditableSiteEditPath } from "./site-coder-file-bundle.js";
+import { targetedEditScopeGuidance, validateEditScopeCompletion, validateProtectedEditValues } from "./edit-scope.js";
 import { analyzeRequestProfile } from "../../sites/generation/request-profile.js";
 import { assertFunctionalBackendSupport, functionalGenerationContract, validateFunctionalBackendBundle } from "../../sites/generation/functional-capabilities.js";
 import { materializeFunctionalRuntime } from "../../sites/generation/functional-runtime.js";
 import { recoverFunctionalPlaceholders } from "../../sites/generation/functional-recovery.js";
+import { resolveFunctionalSourceContract } from "../../sites/generation/functional-source-contract.js";
+import type { ResolvedFunctionalContract } from "../../sites/generation/functional-route-contract.js";
 import {
   getDefaultProfile,
   getProfile,
@@ -131,6 +136,7 @@ export interface CliAgentSessionReport {
   readonly generationMode?: "FAST_GENERATION" | "ITERATIVE_FALLBACK" | "TARGETED_EDIT";
   readonly deterministicAutofixes?: readonly string[];
   readonly buildRepairInvoked?: boolean;
+  readonly functionalContract?: ResolvedFunctionalContract;
   readonly generatedSiteName?: string | undefined;
   readonly generatedDocumentTitle?: string | undefined;
 }
@@ -140,6 +146,13 @@ export type CliAgentProgressListener = (
 ) => void;
 
 export type TargetedEditRepairPreflight = () => Promise<void>;
+export type GenerationBehaviorValidation = (candidate: {
+  readonly previewUrl: string;
+  readonly model: string;
+  readonly functionalContract?: ResolvedFunctionalContract;
+  readonly completion?: GenerationCompletionTelemetry;
+  readonly buildRepair?: BuildRepairEvidence;
+}) => Promise<void>;
 
 const generatedDocumentTitle = (bundle: SiteCoderFileBundle): string | undefined => {
   for (const file of bundle.files) {
@@ -216,7 +229,6 @@ function finalRequirementFailure(
     },
   );
 }
-
 function finalRepairAttemptError(
   cause: ApplicationError,
   diagnostics: readonly EditRequirementDiagnostic[],
@@ -257,6 +269,7 @@ export class LocalCliAgentRuntime {
     externalSignal?: AbortSignal,
     runContext?: InferenceRunContext,
     repairPreflight?: TargetedEditRepairPreflight,
+    validateGenerationBehavior?: GenerationBehaviorValidation,
   ): Promise<CliAgentSessionReport> {
     const deadline = AbortSignal.timeout(task.limits?.timeoutMs ?? 600_000);
     const signal = externalSignal ? AbortSignal.any([externalSignal, deadline]) : deadline;
@@ -273,7 +286,7 @@ export class LocalCliAgentRuntime {
     const capabilities = this.providers.get(registryId).getCapabilities();
     const operation = task.operation === "EDIT_SITE" ? "EDIT_SITE" : "GENERATE_SITE";
     const editRequirements = parseEditRequirements(task.userRequest);
-    const requirementSource = operation === "EDIT_SITE" && (editRequirements.rename || editRequirements.style)
+    const requirementSource = operation === "EDIT_SITE"
       ? await readEditRequirementFiles(this.execution, environmentId)
       : undefined;
     const broadFunctionalEdit = operation === "EDIT_SITE" && isBroadFunctionalEdit(task.userRequest);
@@ -339,7 +352,9 @@ export class LocalCliAgentRuntime {
         if (name === "run_build") this.progress?.("BUILDING", "Running real local build");
       },
     });
-    const functional = analyzeRequestProfile(task.userRequest).functional;
+    const functional = operation === "GENERATE_SITE"
+      ? task.siteSpec?.requirements.functional ?? analyzeRequestProfile(task.userRequest).functional
+      : analyzeRequestProfile(task.userRequest).functional;
     if (operation === "GENERATE_SITE") {
       assertFunctionalBackendSupport(functional, task.siteSpec);
       await scaffoldDeterministicReactVite(this.execution, environmentId, {
@@ -390,6 +405,7 @@ export class LocalCliAgentRuntime {
       task.assetManifest,
     );
     const context = discovered.text;
+    const functionalGuidance = operation === "GENERATE_SITE" ? functionalGenerationContract(functional) : "";
 
     const promptForEstimation = [
       runtimePrompt.prompt.systemPrompt,
@@ -398,6 +414,7 @@ export class LocalCliAgentRuntime {
       `User request: ${task.userRequest}`,
       projectedSiteSpec ? `SiteSpec: ${JSON.stringify(projectedSiteSpec)}` : "",
       context,
+      functionalGuidance,
     ].join("\n");
 
     const conservativeEstimatedInput = estimateTokensConservative(promptForEstimation);
@@ -462,11 +479,13 @@ export class LocalCliAgentRuntime {
     let bundle: SiteCoderFileBundle | undefined;
     let generationCompletion: GenerationCompletionTelemetry | undefined;
     let generationAttempts = 1;
+    let editRepairRequirements: readonly EditRequirementName[] = [];
     let rejectedGenerationAttempts = 0;
     let directUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
     let directModel = capabilities.models[0] ?? "unknown";
     let requirementRepairRequestSize: ReturnType<typeof measureRequestSize> | undefined;
     let generatedCandidate: SiteCoderFileBundle | undefined;
+    let functionalContract: ResolvedFunctionalContract | undefined;
     const functionalAutofixes: string[] = [];
     // Static navigation/control and compiler failures share the existing repair allowance.
     // Spending it before materialization must not create another build-repair slot.
@@ -475,7 +494,12 @@ export class LocalCliAgentRuntime {
     let repairInputTokens = 0;
     let repairCachedInputTokens = 0;
     let repairOutputTokens = 0;
-    const requestSourceRepair = async (output: string, repairContext: string, kind: "build" | "navigation" | "interaction" = "build") => {
+    let buildRepairEvidence: BuildRepairEvidence | undefined;
+    let buildRepairSnapshot: BuildRepairSourceSnapshot | undefined;
+    const requestSourceRepair = async (output: string, snapshot: BuildRepairSourceSnapshot, kind: BuildRepairEvidence["kind"] = "build") => {
+      buildRepairSnapshot = snapshot;
+      buildRepairEvidence = { attempt: repairModelCalls + 1, kind, sourceRevision: snapshot.revision, contextDigest: snapshot.contextDigest,
+        initialDiagnostics: output.slice(0, 8_000), billingState: "NOT_FINALIZED", result: "REQUESTED", patches: [] };
       const repairPrompt = resolveAgentPrompt("sites.build-repair", { expectedStage: "BUILD_REPAIR" });
       const repairProvider = effectiveContext.createScopedProvider(rawGatewayProvider, "BUILD_REPAIR");
       const repairPolicy = getInferenceContextPolicy("BUILD_REPAIR", { overrideMaxOutput: task.limits?.maxOutputTokens });
@@ -488,20 +512,23 @@ export class LocalCliAgentRuntime {
         systemInstructions: repairPrompt.prompt.systemPrompt,
         messages: [{ role: "user", content: [
           "Return exactly one JSON BuildRepairPatchBundle. Do not call tools.",
-          kind === "navigation"
+           kind === "functional"
+             ? "Repair the reported functional completion/Browser QA failures. Implement the requested behavior on its assigned route and preserve working content/design. Fix real behavior, not only selected classes or empty markup. Honor explicit panel relationships and restore open/close state. Never remove requirements, controls, validation, or accessibility to obtain a pass."
+             : kind === "navigation"
             ? "Only repair the reported missing navigation destinations. Keep the existing design and working functionality. Implement meaningful visible content for existing links, or a real semantic button with working state for actions. Do not insert fake/empty IDs, disable links, redirect to unrelated sections, or remove requested functionality."
             : kind === "interaction"
               ? "Complete every reported inert control with meaningful working React behavior or a real navigation destination. Preserve the existing design and working functionality. Use the managed functional APIs below where relevant. For support/story/size controls provide genuine relevant content; demo checkout must show honest no-payment feedback, never claim a transaction. Social navigation needs an actual supplied destination, not a fabricated URL. Do not remove or disable controls, add no-op/alert-only handlers, or redirect to unrelated content to satisfy validation."
             : "Only repair the reported build failure. Do not modify managed files, package manifests, or dependencies.",
-          kind === "interaction" ? functionalGenerationContract(functional) : "",
+           functionalGenerationContract(functional),
           "Do not modify managed files, package manifests, or dependencies. Patch only the supplied application source.",
           "Address every reported diagnostic, and leave each patched file syntactically complete: balanced JSX tags, braces, and parentheses.",
-          "Each 'find' must match the file byte-for-byte. Any leading 'NN: ' line numbers in the source excerpt below are display only and are not part of the file.",
-          `${kind === "build" ? "Build output" : "Static validation diagnostics"}:\n${output}`,
+          "Each 'find' must copy a unique, contiguous verbatim anchor from the supplied source snapshot, including surrounding context when text repeats. Headers are not source. Reference only these exact paths; never guess an extension. All patches refer to this same snapshot: combine overlapping changes; do not target text created by an earlier patch.",
+          `Source revision: ${snapshot.revision}`,
+          `${kind === "build" ? "Build output" : kind === "functional" && output.startsWith("Browser QA") ? "Browser QA diagnostics" : "Static validation diagnostics"}:\n${output}`,
           dependencyManifest ? `Current dependency manifest:\n${JSON.stringify({
             dependencies: dependencyManifest.dependencies, devDependencies: dependencyManifest.devDependencies,
           })}` : "",
-          repairContext ? `Relevant source files:\n${repairContext}` : "",
+          snapshot.context ? `Relevant source files:\n${snapshot.context}` : "",
         ].filter(Boolean).join("\n\n") }],
         maxOutputTokens: repairPolicy.outputPolicy.defaultMaxOutputTokens,
         reasoningPolicy: repairPolicy.reasoningPolicy,
@@ -512,12 +539,15 @@ export class LocalCliAgentRuntime {
       repairInputTokens += response.usage.inputTokens;
       repairCachedInputTokens += response.usage.cachedInputTokens ?? 0;
       repairOutputTokens += response.usage.outputTokens;
-      assertStructuredResponseComplete(response, "Build repair");
-      return parseStructuredResponse({
-        content: response.message.content, contract: responseContract,
-        capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
-        validate: validateBuildRepairPatchBundle, errorContext: "Build repair",
-      }).value;
+      buildRepairEvidence = { ...buildRepairEvidence, result: "RESPONSE_RECEIVED" };
+      try {
+        assertStructuredResponseComplete(response, "Build repair");
+        return parseStructuredResponse({
+          content: response.message.content, contract: responseContract,
+          capability: capabilities.structuredOutputCapability ?? "FALLBACK_TEXT",
+          validate: validateBuildRepairPatchBundle, errorContext: "Build repair",
+        }).value;
+      } catch (cause) { buildRepairEvidence = { ...buildRepairEvidence, result: "INVALID_RESPONSE" }; throw cause; }
     };
     const referenceText = task.templateDesignReference ? templateDesignPrompt(task.templateDesignReference.design) : undefined;
     let contextTelemetry = referenceContextTelemetry(task.templateDesignReference?.design);
@@ -552,7 +582,7 @@ export class LocalCliAgentRuntime {
               "Patch requested editable source files and root index.html branding only; never modify package manifests, configuration, lockfiles, or other Sites-managed files.",
               "Every 'find' must match the file byte-for-byte, including whitespace and JSX entities such as &amp;.",
               'With mode "unique" the find text must occur exactly once in that file, so anchor it: include the surrounding attribute, tag or line rather than a bare word. `Menu` alone will match many times; `<a href="#menu">Menu</a>` identifies one place.',
-              'Use mode "all" only when the change genuinely applies to every exact occurrence in that file, such as renaming a brand that appears several times.',
+              'For a global brand rename, use mode "all" per relevant file. For a local edit, include the component/section/tag or CSS selector and declaration in a uniquely matching find; widen duplicate text anchors. Never rely on the first match or use "all" to hide local ambiguity.',
               "Use one patch per distinct change; several patches may target the same file.",
             ].join(" ")
           : "Write only editable application source files. Never modify package manifests, configuration, lockfiles, or Sites-managed files.",
@@ -566,6 +596,7 @@ export class LocalCliAgentRuntime {
               "In JSX text, write < and > as &lt; and &gt; and { } as &#123; &#125;; copy such as \"go live in <5 minutes\" is a TypeScript syntax error. Keep every JSX tag, brace, and parenthesis balanced.",
             ].join(" ")
           : "",
+        functionalGuidance,
         operation === "GENERATE_SITE"
           ? [
               "Approved optional packages, installed only if you import them — use only what the request actually needs:",
@@ -591,6 +622,7 @@ export class LocalCliAgentRuntime {
           context.slice(discovered.stableChars),
           operation === "EDIT_SITE" && discovered.editRequirementContext
             ? mandatoryEditRequirements(editRequirements, discovered.editRequirementContext) : "",
+          operation === "EDIT_SITE" && editRequirements.scope ? targetedEditScopeGuidance(editRequirements.scope) : "",
           operation === "GENERATE_SITE" && completionRequirements ? `Required pages/views: ${completionRequirements.requiredPages.join(", ")}\nRequired sections/features: ${completionRequirements.requiredSections.join(", ")}. Implement these semantically using appropriate React routes, state, tabs, views, or components. Legacy data-sites-page and data-sites-section attributes are optional and are not required.` : "",
           // A targeted edit works from current source, not from the original brief.
           projectedSiteSpec && operation === "GENERATE_SITE"
@@ -686,10 +718,11 @@ export class LocalCliAgentRuntime {
       if (operation === "GENERATE_SITE") {
         try {
           validateReferenceInteractions(parsed as SiteCoderFileBundle);
+          if (task.siteSpec?.requirements.functional) resolveFunctionalSourceContract(task.siteSpec, parsed as SiteCoderFileBundle);
         } catch (cause) {
           if (!(cause instanceof ApplicationError) || cause.code !== "GENERATION_INCOMPLETE" ||
-            !["navigation.fragments", "interaction.controls"].includes(String(cause.metadata?.validationCheck)) || repairModelCalls >= maxBuildRepairs) throw cause;
-          const kind = cause.metadata?.validationCheck === "interaction.controls" ? "interaction" : "navigation";
+            !["navigation.fragments", "interaction.controls", "functional.completion"].includes(String(cause.metadata?.validationCheck)) || repairModelCalls >= maxBuildRepairs) throw cause;
+          const kind = cause.metadata?.validationCheck === "functional.completion" ? "functional" : cause.metadata?.validationCheck === "interaction.controls" ? "interaction" : "navigation";
           this.progress?.("GENERATING", "Repairing incomplete navigation/controls within the build-repair allowance");
           const candidate = parsed as SiteCoderFileBundle;
           // The public error abbreviates after five findings. The repair must see
@@ -708,7 +741,10 @@ export class LocalCliAgentRuntime {
               return Promise.resolve(content);
             },
             writeFile: (_environmentId, path, content) => { files.set(path, content); return Promise.resolve(); },
-          }, environmentId, patches);
+          }, environmentId, patches, repairContext, diagnostics => {
+            if (buildRepairEvidence) buildRepairEvidence = { ...buildRepairEvidence, patches: diagnostics, result: "PATCH_PREFLIGHT" };
+          });
+          if (buildRepairEvidence) buildRepairEvidence = { ...buildRepairEvidence, result: "APPLIED" };
           generatedCandidate = { ...candidate, files: [...files].map(([path, content]) => ({ path, content })) };
           parsed = validateSiteCoderFileBundle(generatedCandidate, completionRequirements);
           const recovered = recoverFunctionalPlaceholders(parsed, task.userRequest);
@@ -720,11 +756,19 @@ export class LocalCliAgentRuntime {
       if (operation === "GENERATE_SITE") {
         validateReferenceInteractions(parsed as SiteCoderFileBundle);
         validateFunctionalBackendBundle(parsed as SiteCoderFileBundle, functional);
+        if (task.siteSpec?.requirements.functional) functionalContract = resolveFunctionalSourceContract(task.siteSpec, parsed as SiteCoderFileBundle);
       }
       if (operation === "GENERATE_SITE" && task.templateDesignReference)
         validateTemplateReferenceBundle(parsed as SiteCoderFileBundle, task.templateDesignReference, task.userRequest);
       if (operation === "EDIT_SITE" && !broadFunctionalEdit) {
-        await applySiteEditPatchBundle(this.execution, environmentId, parsed as SiteEditPatchBundle);
+        await applySiteEditPatchBundle(this.execution, environmentId, parsed as SiteEditPatchBundle, {
+          instruction: task.userRequest, rename: editRequirements.rename,
+          requirementSource,
+          onScopeExclusion: excludedOperationCount => recordGenerationTelemetry(this.generationDiagnostics?.telemetry, {
+            jobId: task.jobId, role: "sites.targeted-edit", validationCategory: "INDEPENDENT_UNAUTHORIZED_OPERATION_EXCLUDED", excludedOperationCount,
+          }),
+          relevantPaths: discovered.editSourcePaths ?? [],
+        });
       } else {
         const submittedBundle = parsed as SiteCoderFileBundle;
         const generatedBundle = broadFunctionalEdit && !broadFunctionalEditChangesStyle(task.userRequest)
@@ -743,6 +787,7 @@ export class LocalCliAgentRuntime {
         );
         if (missingDiagnostics.length) {
           const missingRequirements = missingDiagnostics.map(({ requirement }) => requirement);
+          editRepairRequirements = missingRequirements;
           const repairSelection = selectEditRepairContext(
             editRequirements,
             missingRequirements,
@@ -771,6 +816,7 @@ export class LocalCliAgentRuntime {
             `MISSING MANDATORY REQUIREMENTS:\n${missingRequirements.map((item) => item.toUpperCase()).join("\n")}`,
             repairInstruction ? `Relevant user instruction:\n${repairInstruction}` : "",
             mandatoryEditRequirements(repairRequirements, repairSelection.requirementContext),
+            editRequirements.scope ? targetedEditScopeGuidance(editRequirements.scope) : "",
             "Operate against the current uncommitted candidate source below. Return only additional exact edit operations needed for the missing requirements. Do not repeat completed edits unless technically necessary. Every find must match byte-for-byte; do not use fuzzy matching or regenerate whole files.",
             `Current candidate source for repair:\n${repairSelection.text}`,
           ].filter(Boolean).join("\n\n");
@@ -859,7 +905,14 @@ export class LocalCliAgentRuntime {
                 "PLAN",
                 repairSelection.files.map(({ path }) => path),
               );
-            await applySiteEditPatchBundle(this.execution, environmentId, repairBundle);
+            await applySiteEditPatchBundle(this.execution, environmentId, repairBundle, {
+              instruction: task.userRequest, rename: editRequirements.rename,
+              requirementSource,
+              onScopeExclusion: excludedOperationCount => recordGenerationTelemetry(this.generationDiagnostics?.telemetry, {
+                jobId: task.jobId, role: "sites.targeted-edit", validationCategory: "INDEPENDENT_UNAUTHORIZED_OPERATION_EXCLUDED", excludedOperationCount,
+              }),
+              relevantPaths: repairSelection.files.map(file => file.path),
+            });
             const finalCandidate = await readEditRequirementFiles(this.execution, environmentId);
             const finalDiagnostics = editRequirementDiagnostics(
               editRequirements,
@@ -893,6 +946,11 @@ export class LocalCliAgentRuntime {
     }
     if (requirementSource)
       validateEditRequirements(editRequirements, requirementSource, await readEditRequirementFiles(this.execution, environmentId));
+    if (requirementSource && editRequirements.scope) {
+      const candidate = await readEditRequirementFiles(this.execution, environmentId);
+      validateProtectedEditValues(editRequirements.scope, requirementSource, candidate);
+      validateEditScopeCompletion(editRequirements.scope, requirementSource, candidate);
+    }
     let autofixResult = await applyDeterministicAutofix(this.execution, environmentId);
     if (completionRequirements && operation === "GENERATE_SITE") {
       const completion = await validateSiteCoderBundleCompletion(
@@ -982,7 +1040,10 @@ export class LocalCliAgentRuntime {
       );
       const repairContext = await this.#extractRepairContext(environmentId, output);
       const patchBundle = await requestSourceRepair(output, repairContext);
-      await applyBuildRepairPatchBundle(this.execution, environmentId, patchBundle);
+      await applyBuildRepairPatchBundle(this.execution, environmentId, patchBundle, repairContext, diagnostics => {
+        if (buildRepairEvidence) buildRepairEvidence = { ...buildRepairEvidence, patches: diagnostics, result: "PATCH_PREFLIGHT" };
+      });
+      if (buildRepairEvidence) buildRepairEvidence = { ...buildRepairEvidence, result: "APPLIED" };
       automaticBuildAttempts += 1;
       build = await this.execution.executeCommand(environmentId, {
         executable: "npm",
@@ -1008,7 +1069,7 @@ export class LocalCliAgentRuntime {
         },
       );
     }
-    if (operation === "GENERATE_SITE") {
+    const validateGeneratedSource = async () => {
       const current = [];
       for (const entry of await this.execution.listFiles(environmentId))
         if (entry.type === "FILE" && isEditableSiteEditPath(entry.path) && /^src\/.+\.(tsx?|jsx?)$/.test(entry.path))
@@ -1017,11 +1078,49 @@ export class LocalCliAgentRuntime {
       validateStaticFragmentNavigation(generatedCandidate);
       validateReferenceInteractions(generatedCandidate);
       validateFunctionalBackendBundle(generatedCandidate, functional);
+      if (task.siteSpec?.requirements.functional) functionalContract = resolveFunctionalSourceContract(task.siteSpec, generatedCandidate);
       if (task.templateDesignReference) validateTemplateReferenceBundle({ files: current }, task.templateDesignReference, task.userRequest);
-    }
+    };
+    if (operation === "GENERATE_SITE") await validateGeneratedSource();
     if (!this.execution.getLatestPreview(environmentId)?.url) {
       this.progress?.("BUILDING", "Starting required local preview");
       await this.execution.startPreview(environmentId, { port: 4173 });
+    }
+    if (operation === "GENERATE_SITE" && validateGenerationBehavior) {
+      for (;;) {
+        try {
+          await validateGenerationBehavior({ previewUrl: this.execution.getLatestPreview(environmentId)!.url!, model: directModel,
+            ...(functionalContract ? { functionalContract } : {}), ...(generationCompletion ? { completion: generationCompletion } : {}),
+            ...(buildRepairEvidence ? { buildRepair: buildRepairEvidence } : {}) });
+          break;
+        } catch (cause) {
+          // Only source-grounded functional failures can spend the SAME repair
+          // allowance. Browser infrastructure/timeouts never trigger model repair.
+          const checks = cause instanceof ApplicationError ? cause.metadata?.blockingFindings : undefined;
+          if (!(cause instanceof ApplicationError) || cause.metadata?.failureStage !== "BROWSER_QA" || repairModelCalls >= maxBuildRepairs ||
+            !Array.isArray(checks) || !checks.length || checks.some((check: unknown) => !check || typeof check !== "object" ||
+              typeof (check as Record<string, unknown>).checkId !== "string" || !String((check as Record<string, unknown>).checkId).startsWith("functional.") ||
+              /timed? ?out|timeout|browser.*(?:closed|launch)/i.test(String((check as Record<string, unknown>).message)))) throw cause;
+          const diagnostics = [cause.message, ...(functionalContract?.requirements ?? []).flatMap(requirement => [
+            requirement.id + " [" + requirement.routes?.join(", ") + "]: " + requirement.expectedBehavior,
+            ...(requirement.sourceEvidence ?? []).map(ref => ref.path + ":" + ref.line),
+          ])].join("\n");
+          this.progress?.("BUILDING", "Repairing proven functional failure within the existing repair allowance");
+          const snapshot = await this.#extractRepairContext(environmentId, diagnostics);
+          const patches = await requestSourceRepair(diagnostics, snapshot, "functional");
+          await applyBuildRepairPatchBundle(this.execution, environmentId, patches, snapshot, diagnostics => {
+            if (buildRepairEvidence) buildRepairEvidence = { ...buildRepairEvidence, patches: diagnostics, result: "PATCH_PREFLIGHT" };
+          });
+          if (buildRepairEvidence) buildRepairEvidence = { ...buildRepairEvidence, result: "APPLIED" };
+          await validateGeneratedSource();
+          automaticBuildAttempts += 1;
+          build = await this.execution.executeCommand(environmentId, { executable: "npm", args: ["run", "build"], timeoutMs: task.limits?.timeoutMs ?? 60_000 });
+          if (build.exitCode !== 0 || build.timedOut) throw new ApplicationError("REPAIR_LIMIT_REACHED", "Functional repair failed production build; repair allowance exhausted", {
+            metadata: { failureStage: "BUILD", repairAttempts: repairModelCalls, diagnostics: safeBuildOutput(build.stderr, build.stdout) },
+          });
+          // A repaired candidate must pass the complete Browser QA run again.
+        }
+      }
     }
     const files: string[] = [];
     for (const entry of (await this.execution.listFiles(environmentId)).filter(
@@ -1036,6 +1135,11 @@ export class LocalCliAgentRuntime {
     }
     if (requirementSource)
       validateEditRequirements(editRequirements, requirementSource, await readEditRequirementFiles(this.execution, environmentId));
+    if (requirementSource && editRequirements.scope) {
+      const candidate = await readEditRequirementFiles(this.execution, environmentId);
+      validateProtectedEditValues(editRequirements.scope, requirementSource, candidate);
+      validateEditScopeCompletion(editRequirements.scope, requirementSource, candidate);
+    }
     const metrics = this.execution.getUsageMetrics(environmentId);
     const preview = this.execution.getLatestPreview(environmentId);
     const commandDelta = metrics.commandsExecuted - startingMetrics.commandsExecuted;
@@ -1087,6 +1191,7 @@ export class LocalCliAgentRuntime {
       generationMode: operation === "EDIT_SITE" ? "TARGETED_EDIT" : "FAST_GENERATION",
       deterministicAutofixes: [...autofixResult.fixes.map((fix) => fix.id), ...new Set(functionalAutofixes)],
       buildRepairInvoked: repairModelCalls > 0,
+      ...(functionalContract ? { functionalContract } : {}),
       ...(operation === "GENERATE_SITE" && bundle?.siteName
         ? { generatedSiteName: bundle.siteName }
         : {}),
@@ -1097,18 +1202,46 @@ export class LocalCliAgentRuntime {
         : {}),
     };
     } catch (cause) {
-      if (operation === "GENERATE_SITE" && cause instanceof ApplicationError &&
-        ["GENERATION_INCOMPLETE", "VALIDATION_FAILED", "SOURCE_SECURITY_VALIDATION_FAILED", "REPAIR_LIMIT_REACHED"].includes(cause.code)) {
-        const failureStage = cause.metadata?.failureStage === "BUILD" ? "BUILD" : "STATIC_VALIDATION";
+      if (operation === "EDIT_SITE" && cause instanceof ApplicationError && cause.metadata?.failureStage === "PATCH_APPLICATION") {
+        let candidateDiagnosticPath: string | undefined;
+        try {
+          const path = await this.generationDiagnostics?.evidence?.preserve({ execution: this.execution, environmentId,
+            jobId: task.jobId, siteId: task.siteId, patchDiagnostics: cause.metadata.patchDiagnostics ?? [],
+            ...(task.outerRequestId ? { outerRequestId: task.outerRequestId } : {}),
+            editAttempt: generationAttempts, repairRequirements: editRepairRequirements,
+            validationFailure: { failureStage: "PATCH_APPLICATION", code: cause.code, check: cause.metadata.validationCheck === "edit.scope" ? "edit.scope" : "edit.patch-resolution", message: cause.message, buildPassed: false },
+          });
+          if (path) candidateDiagnosticPath = path;
+        } catch { console.warn("[sites] Private patch diagnostics unavailable; original rejection preserved"); }
+        recordGenerationTelemetry(this.generationDiagnostics?.telemetry, { jobId: task.jobId, role: "sites.targeted-edit",
+          model: capabilities.models[0], failureStage: "PATCH_APPLICATION", candidateDiagnosticPath });
+      }
+      // The pipeline already captured the complete QA report and candidate.
+      // Do not relabel that same failure as an early static-validation error.
+      if (operation === "GENERATE_SITE" && cause instanceof ApplicationError && cause.metadata?.failureStage !== "BROWSER_QA" &&
+        (["GENERATION_INCOMPLETE", "VALIDATION_FAILED", "SOURCE_SECURITY_VALIDATION_FAILED", "REPAIR_LIMIT_REACHED"].includes(cause.code) || buildRepairEvidence)) {
+        const invalidRepairResponse = buildRepairEvidence?.result === "INVALID_RESPONSE";
+        const failureStage = cause.metadata?.failureStage === "BUILD" ? "BUILD" : cause.metadata?.failureStage === "PATCH_APPLICATION" || invalidRepairResponse ? "PATCH_APPLICATION" : "STATIC_VALIDATION";
         let candidateDiagnosticPath: string | undefined;
         if (generatedCandidate && this.generationDiagnostics?.evidence) {
           try {
+            const repairCandidate = buildRepairSnapshot ? { files: await Promise.all(buildRepairSnapshot.files.map(async ({ path, content }) => ({ path,
+              content: buildRepairEvidence?.result === "APPLIED" && buildRepairEvidence.kind === "build" ? await this.execution.readFile(environmentId, path) : content,
+            }))) } : undefined;
             const path = await this.generationDiagnostics.evidence.preserve({ execution: this.execution, environmentId,
-              jobId: task.jobId, siteId: task.siteId, candidate: generatedCandidate,
+              jobId: task.jobId, siteId: task.siteId,
+              candidate: repairCandidate ?? generatedCandidate,
+              ...(task.outerRequestId ? { outerRequestId: task.outerRequestId } : {}),
+              ...(buildRepairEvidence ? { buildRepair: { ...buildRepairEvidence,
+                ...(typeof cause.metadata?.currentSourceRevision === "string" ? { currentSourceRevision: cause.metadata.currentSourceRevision } : {}),
+                result: typeof cause.metadata?.reason === "string" ? cause.metadata.reason : buildRepairEvidence.result } } : {}),
               functionalRequirements: functional, referenceContext: contextTelemetry,
+              functionalContract: functionalContract ?? cause.metadata?.routeMapping,
+              accounting: { model: capabilities.models[0] ?? "unknown", role: "sites.site-coder", logicalRequests: effectiveContext.getSummary().logicalRequests,
+                physicalRequests: effectiveContext.getSummary().physicalRequests, billingStatus: "NOT_FINALIZED" },
               ...(generationCompletion ? { completion: generationCompletion } : {}),
               validationFailure: { failureStage, code: cause.code,
-                check: typeof cause.metadata?.validationCheck === "string" ? cause.metadata.validationCheck : failureStage === "BUILD" ? "build.diagnostics" : "generation.static",
+                check: typeof cause.metadata?.validationCheck === "string" ? cause.metadata.validationCheck : invalidRepairResponse ? "build-repair.response" : failureStage === "BUILD" ? "build.diagnostics" : "generation.static",
                 message: cause.message + (failureStage === "BUILD" && typeof cause.metadata?.diagnostics === "string" ? `\n${cause.metadata.diagnostics}` : ""), buildPassed: this.execution.getLastBuildSuccess(environmentId) === true },
             });
             if (path) candidateDiagnosticPath = path;
@@ -1130,7 +1263,7 @@ export class LocalCliAgentRuntime {
     resolvedCapabilities?: ResolvedCapabilities,
     dependencyManifest?: ResolvedDependencyManifest,
     assetManifest?: AssetManifest,
-  ): Promise<{ readonly text: string; readonly stableChars: number; readonly editRequirementContext?: EditRequirementContext }> {
+  ): Promise<{ readonly text: string; readonly stableChars: number; readonly editRequirementContext?: EditRequirementContext; readonly editSourcePaths?: readonly string[] }> {
     if (operation === "GENERATE_SITE") {
       const contractLines = [
         buildCapabilityAwareGenerationContext({
@@ -1304,6 +1437,7 @@ export class LocalCliAgentRuntime {
     return {
       text: context,
       stableChars: stable.length + 2,
+      editSourcePaths: [...included, ...excerptSent.map(file => file.path)],
       editRequirementContext: suppliedEditRequirementContext(
         parseEditRequirements(task.userRequest),
         [...stableSent, ...variableSent, ...excerptSent],
@@ -1343,40 +1477,13 @@ export class LocalCliAgentRuntime {
       ].join("\n"),
     );
   }
-  async #extractRepairContext(environmentId: string, buildOutput: string, candidate?: SiteCoderFileBundle): Promise<string> {
-    const normalizedOutput = buildOutput.replaceAll("\\", "/");
-    const fileMatches = normalizedOutput.match(/(?:src\/[a-zA-Z0-9_./-]+\.(?:tsx?|jsx?|css|json))/g);
-    const targetFiles = Array.from(new Set(fileMatches ?? []));
-    if (targetFiles.length === 0) {
-      try {
-        const list = candidate?.files ?? await this.execution.listFiles(environmentId);
-        if (list.some((item) => item.path === "src/App.tsx")) {
-          targetFiles.push("src/App.tsx");
-        }
-      } catch {
-        // ignore
-      }
-    }
-    const chunks: string[] = [];
-    let totalBytes = 0;
-    const maxBytes = 16_000;
-    for (const filePath of targetFiles.slice(0, 5)) {
-      try {
-        const content = candidate
-          ? candidate.files.find(file => file.path === filePath)?.content
-          : await this.execution.readFile(environmentId, filePath);
-        if (content === undefined) continue;
-        const remaining = maxBytes - totalBytes;
-        if (remaining <= 0) break;
-        const excerpt = buildRepairSourceExcerpt(filePath, content, normalizedOutput, remaining);
-        const size = Buffer.byteLength(excerpt);
-        totalBytes += size;
-        chunks.push(`--- ${filePath}\n${excerpt}`);
-      } catch {
-        // file may not exist
-      }
-    }
-    return chunks.join("\n");
+  async #extractRepairContext(environmentId: string, buildOutput: string, candidate?: SiteCoderFileBundle): Promise<BuildRepairSourceSnapshot> {
+    const textSource = (path: string) => /^src\/.+\.(?:tsx?|jsx?|css|svg|json)$/i.test(path) && isEditableSiteEditPath(path);
+    const files = candidate ? candidate.files.filter(file => textSource(file.path)) : await Promise.all(
+      (await this.execution.listFiles(environmentId)).filter(file => file.type === "FILE" && textSource(file.path))
+        .map(async file => ({ path: file.path, content: await this.execution.readFile(environmentId, file.path) })),
+    );
+    return createBuildRepairSourceSnapshot(files, buildOutput);
   }
 }
 
@@ -1435,31 +1542,4 @@ function logBuildFailure(
       "----------------------------------------",
     ].join("\n"),
   );
-}
-
-function buildRepairSourceExcerpt(
-  filePath: string,
-  content: string,
-  buildOutput: string,
-  maxBytes: number,
-): string {
-  if (Buffer.byteLength(content) <= maxBytes) return content;
-
-  const escapedPath = filePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const lineMatches = Array.from(
-    buildOutput.matchAll(new RegExp(`${escapedPath}[:(](\\d+)`, "g")),
-    (match) => Number(match[1]),
-  ).filter((line) => Number.isInteger(line) && line > 0);
-  const lines = content.split(/\r?\n/);
-  const targetLines = lineMatches.length > 0 ? lineMatches : [1];
-  const included = new Set<number>();
-  for (const target of targetLines.slice(0, 4)) {
-    for (let line = Math.max(1, target - 12); line <= Math.min(lines.length, target + 12); line += 1)
-      included.add(line);
-  }
-  const excerpt = Array.from(included)
-    .sort((left, right) => left - right)
-    .map((line) => `${line}: ${lines[line - 1]}`)
-    .join("\n");
-  return Buffer.from(excerpt).subarray(0, Math.max(0, maxBytes)).toString("utf8");
 }

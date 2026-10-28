@@ -224,7 +224,9 @@ describe("Live inert-control regression uses the existing shared repair allowanc
       const names=await readdir(h.diagnostics.root);expect(names).toHaveLength(1);
       const evidence=JSON.parse(await readFile(join(h.diagnostics.root,names[0]!),"utf8")) as {validation:{check:string};source:{files:Record<string,string>}};
       expect(evidence.validation.check).toBe("interaction.controls");
-      expect(evidence.source.files["src/App.tsx"]).toContain(kind==="disabled"||kind==="unresolved"?inertSupport:replacement);
+      // Build Repair diagnostics intentionally retain the immutable source
+      // snapshot supplied to repair, not the rejected partial/model mutation.
+      expect(evidence.source.files["src/App.tsx"]).toContain(inertSupport);
     }
   },180_000);
 });
@@ -257,13 +259,16 @@ describe("Real offline source → recovery → static validation → build → t
     const h=await harness(candidate,true),siteId=("adversarial-"+kind) as SiteId;
     await expect(h.api.pipeline.generate({userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt,planningMode:"deterministic",agentProvider:h.provider.id,browserQAEnabled:true,
       templateReference:{templateKey:"ecommerce-store",version:1},referenceGenerationSiteId:siteId})).rejects.toMatchObject({code:kind==="missing-state"?"REPAIR_LIMIT_REACHED":"VALIDATION_FAILED"});
-    expect(h.provider.callCount).toBe(kind==="missing-state"?2:1); expect(h.billing.finalizeSuccessfulJob).not.toHaveBeenCalled();
+    expect(h.provider.callCount).toBe(kind==="runtime-handler-error"?1:2); expect(h.billing.finalizeSuccessfulJob).not.toHaveBeenCalled();
     expect((await h.api.projects.listByOwner("offline-functional-owner")).items).toHaveLength(0); expect((await h.api.versions.listBySite(siteId)).items).toHaveLength(0);
-    const names=await readdir(h.diagnostics.root); expect(names).toHaveLength(1);
+    const names=await readdir(h.diagnostics.root); expect(names).toHaveLength(["fake-newsletter","no-effect-handler"].includes(kind)?2:1);
     const retained=await readFile(join(h.diagnostics.root,names[0]!),"utf8");
     expect(retained).toContain(kind==="missing-state"?"TS2304":kind==="fake-newsletter"?"honest mock confirmation":"no observable action");
-    if(kind==="runtime-handler-error") expect(retained).toContain("runtime.page-error");
-  },180_000);
+    if(kind==="runtime-handler-error") {
+      const evidence=JSON.parse(retained) as {qa:{checks:{checkId:string;status:string}[]}};
+      expect(evidence.qa.checks).toContainEqual(expect.objectContaining({checkId:"runtime.page-error",status:"FAIL"}));
+    }
+  },300_000);
   it.each([
     {kind:"ecommerce" as const,reference:true,prompt:ecommercePrompt},
     {kind:"ecommerce" as const,reference:false,prompt:ecommercePrompt},

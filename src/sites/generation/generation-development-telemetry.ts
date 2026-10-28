@@ -24,6 +24,13 @@ export interface GenerationDevelopmentEvent {
   readonly outputTokens?: number | undefined;
   readonly billingStatus?: string | undefined;
   readonly creditsCharged?: number | undefined;
+  readonly excludedOperationCount?: number | undefined;
+  readonly outcome?: "SUCCEEDED" | "FAILED" | undefined;
+  readonly logicalRequests?: number | undefined;
+  readonly physicalRequests?: number | undefined;
+  readonly routeCount?: number | undefined;
+  readonly requirementCount?: number | undefined;
+  readonly failedProbeCount?: number | undefined;
 }
 export interface GenerationDevelopmentTelemetry { record(event: GenerationDevelopmentEvent): void }
 
@@ -48,6 +55,9 @@ export function createDevelopmentGenerationTelemetry(nodeEnv = process.env.NODE_
       validationCategory: event.validationCategory, validationPath: event.validationPath,
       finishReason: event.finishReason, truncated: event.truncated, inputTokens: event.inputTokens, outputTokens: event.outputTokens,
       billingStatus: event.billingStatus, creditsCharged: event.creditsCharged,
+      excludedOperationCount: event.excludedOperationCount,
+      outcome: event.outcome, logicalRequests: event.logicalRequests, physicalRequests: event.physicalRequests,
+      routeCount: event.routeCount, requirementCount: event.requirementCount, failedProbeCount: event.failedProbeCount,
     };
     console.info("[sites][generation-context] " + JSON.stringify(metadata, (_key, value: unknown) => {
       if (typeof value !== "string") return value;
@@ -56,6 +66,22 @@ export function createDevelopmentGenerationTelemetry(nodeEnv = process.env.NODE_
       return safeRedactSecrets(text).replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED_JWT]").slice(0, 1000);
     }));
   } };
+}
+
+/** Read-only aggregate of existing metadata. Last terminal outcome per job wins;
+ * observations never submit work, charge credits or write project records. */
+export function summarizeGenerationReliability(events: readonly GenerationDevelopmentEvent[]) {
+  const terminal = new Map<string, GenerationDevelopmentEvent>();
+  for (const event of events) if (event.role === "generation" && event.outcome) terminal.set(event.jobId, event);
+  const jobs = [...terminal.values()], completed = jobs.filter(event => event.outcome === "SUCCEEDED").length;
+  const failures: Record<string, number> = {};
+  for (const event of jobs.filter(event => event.outcome === "FAILED")) {
+    const key = `${event.failureStage ?? "UNKNOWN"}:${event.validationCategory ?? "UNKNOWN"}`;
+    failures[key] = (failures[key] ?? 0) + 1;
+  }
+  return { jobs: jobs.length, completed, completionRate: jobs.length ? completed / jobs.length : 0, failures,
+    physicalRequests: jobs.reduce((sum, event) => sum + (event.physicalRequests ?? 0), 0),
+    successfulBilling: jobs.filter(event => event.outcome === "SUCCEEDED" && event.billingStatus === "CHARGED").length };
 }
 
 export function recordGenerationTelemetry(sink: GenerationDevelopmentTelemetry | undefined, event: GenerationDevelopmentEvent): void {

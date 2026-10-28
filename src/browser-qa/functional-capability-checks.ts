@@ -1,8 +1,14 @@
 import type { Locator, Page, Route } from "playwright";
 import { createBrowserQACheckResult } from "./browser-qa-domain.js";
-import type { BrowserQACheckExecutor } from "./browser-qa-runner.js";
-import type { FunctionalRequirements } from "../sites/generation/functional-capabilities.js";
+import type { BrowserQACheckExecutor, BrowserQAPageContext } from "./browser-qa-runner.js";
+import type { BrowserQACheckResult } from "./browser-qa-domain.js";
+import type { FunctionalCapability, FunctionalRequirements } from "../sites/generation/functional-capabilities.js";
+import type { FunctionalRequirement, ResolvedFunctionalContract } from "../sites/generation/functional-route-contract.js";
+import { functionalSectionSurface, probeCategoryFiltering, probeMobileNavigation, probeRequiredNavigation, runRouteRequirements } from "./functional-route-probes.js";
 import { closeControlledPanel, closeVisibleDialog, probeSizeSelection } from "./browser-qa-interaction-checks.js";
+import { probeAccordionBehavior } from "./accordion-behavior.js";
+import { probeTabs } from "./functional-surfaces.js";
+import { probeDialogBehavior } from "./dialog-behavior.js";
 
 async function requireVisible(locator: Locator, message: string): Promise<Locator> {
   const target = locator.first();
@@ -33,18 +39,28 @@ async function expectChange(page: Page, before: string, message: string) {
   }
   throw new Error(message);
 }
-async function demoForm(page: Page, capability: "newsletter" | "form") {
-  const managed = page.locator(`form[data-sites-capability="${capability}"]`);
-  const form = await requireVisible((await managed.count()) ? managed : page.locator("form").filter({ has: page.locator('input[type="email"]') }), `Missing ${capability} form`);
+async function demoForm(page: Page, capability: "newsletter" | "form", surface: Page | Locator = page) {
+  const managed = surface.locator(`form[data-sites-capability="${capability}"]`);
+  const form = await requireVisible((await managed.count()) ? managed : surface.locator("form").filter({ has: page.locator('input[type="email"]') }), `Missing ${capability} form`);
   const email = form.locator('input[type="email"]').first();
   if (!(await email.count())) throw new Error(`${capability} form has no email validation`);
   await email.fill("not-an-email");
   if (await form.evaluate(element => (element as HTMLFormElement).checkValidity())) throw new Error(`${capability} accepts invalid email`);
   for (const input of await form.locator("input:not([type=hidden]),textarea").all()) {
     const type = await input.getAttribute("type");
-    if (type === "checkbox" || type === "radio" || type === "submit") continue;
+    if (!(await input.isVisible()) || !(await input.isEnabled())) continue;
+    if (type === "checkbox" || type === "radio") { if (await input.getAttribute("required") !== null) await input.check({ timeout: 800 }); continue; }
+    if (["submit", "button", "reset", "image"].includes(type ?? "")) continue;
+    if (await input.getAttribute("readonly") !== null) continue;
     await input.fill(type === "email" ? "offline-qa@example.test" : "Offline demonstration");
   }
+  for (const select of await form.locator("select").all()) {
+    if (!(await select.isVisible()) || !(await select.isEnabled())) continue;
+    const option = await select.locator("option").evaluateAll(options => options.map(option => option as HTMLOptionElement).find(option => !option.disabled && !option.closest("optgroup[disabled]") && option.value.trim())?.value);
+    if (option) await select.selectOption(option);
+    else if (await select.getAttribute("required") !== null) throw new Error(`${capability} required select has no usable choice`);
+  }
+  if (!(await form.evaluate(element => (element as HTMLFormElement).checkValidity()))) throw new Error(`${capability} still has invalid required fields after safe local input`);
   const before = await page.locator("body").innerText();
   // Never allow the QA probe to send submissions, even if a generated mock lies.
   const blocked: string[] = [];
@@ -66,10 +82,11 @@ async function demoForm(page: Page, capability: "newsletter" | "form") {
 }
 
 /** Bounded observable probes. No extra AI role, no remote writes, no severity downgrade. */
-export function functionalBrowserChecks(requirements: FunctionalRequirements, routes: readonly string[], backendEnabled = false): BrowserQACheckExecutor[] {
+export function functionalBrowserChecks(requirements: FunctionalRequirements, routes: readonly string[], backendEnabled = false, contract?: ResolvedFunctionalContract): BrowserQACheckExecutor[] {
   const capabilities = new Set(requirements.capabilities);
   const productRoute = routes.find(route => /\/product(?:s)?(?:\/|$)/.test(route)) ?? "/";
-  return [{
+  type ScopedCheck = Omit<BrowserQACheckExecutor, "execute"> & { execute(context: BrowserQAPageContext, selected?: ReadonlySet<FunctionalCapability>, forceRoute?: boolean, section?: FunctionalRequirement["target"]): Promise<BrowserQACheckResult> };
+  const checks: ScopedCheck[] = [{
     definition: { checkId: "functional.controls", version: 1, category: "INTERACTION", defaultSeverity: "ERROR", scope: "INTERACTION", timeoutMs: 8_000 },
     async execute(context) {
       const initialUrl = context.page.url();
@@ -78,8 +95,10 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
         // Each independent probe starts from the same page, not a drawer/menu
         // left open by an earlier action. Observed runtime errors stay recorded.
         if (index > 0) {
-          await context.page.goto(initialUrl, { waitUntil: "load", timeout: 3_000 });
-          await context.page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done()))));
+          await context.page.goto(initialUrl, { waitUntil: "domcontentloaded", timeout: 3_000 });
+          // Wait for React's controls, not unrelated images and two extra frames
+          // on every reset. Hover/focus still settle before state comparison.
+          await context.page.getByRole("button").first().waitFor({ state: "attached", timeout: 1_000 });
         }
         if (!(await button.isVisible()) || !(await button.isEnabled())) continue;
         if (await button.getAttribute("aria-pressed") === "true" || await button.getAttribute("aria-selected") === "true") continue;
@@ -125,38 +144,40 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
     },
   }, {
     definition: { checkId: "functional.requirements", version: 1, category: "INTERACTION", defaultSeverity: "ERROR", scope: "INTERACTION", timeoutMs: 12_000 },
-    async execute(context) {
-      const page = context.page;
-      if (context.route === productRoute) {
-        if (capabilities.has("size")) await probeSizeSelection(page);
+    async execute(context, selected = capabilities, forceRoute = false, section) {
+      const page = context.page, capabilities = selected;
+      const scoped = section?.kind === "SECTION";
+      const surface = scoped ? await functionalSectionSurface(page, section) : page;
+      if (forceRoute || context.route === productRoute) {
+        if (capabilities.has("size")) await probeSizeSelection(surface);
         if (capabilities.has("quantity")) {
-          const quantity = page.getByRole("spinbutton", { name: /quantity/i }).first();
+          const quantity = surface.getByRole("spinbutton", { name: /quantity/i }).first();
           if (await quantity.count()) { await quantity.fill("2"); if (await quantity.inputValue() !== "2") throw new Error("Quantity does not update"); }
           else {
-            const increase = await requireVisible(page.getByRole("button", { name: /increase quantity/i }), "Requested quantity controls are absent");
+            const increase = await requireVisible(surface.getByRole("button", { name: /increase quantity/i }), "Requested quantity controls are absent");
             const before = await state(page); await increase.click({ timeout: 800 }); await expectChange(page, before, "Quantity increment has no effect");
           }
         }
         if (capabilities.has("gallery")) {
-          const image = page.locator('[data-sites-gallery-active],.gallery > img,.gallery-main img,.gallery .large-image img').first();
-          const thumbnail = page.getByRole("button", { name: /^view(?: image)? 2$/i }).first();
+          const image = surface.locator('[data-sites-gallery-active],.gallery > img,.gallery-main img,.gallery .large-image img').first();
+          const thumbnail = surface.getByRole("button", { name: /^view(?: image)? 2$/i }).first();
           await requireVisible(image, "Requested active gallery image is absent");
-          await page.getByRole("button", { name: /^view(?: image)? 1$/i }).first().click({ timeout: 800 });
+          await surface.getByRole("button", { name: /^view(?: image)? 1$/i }).first().click({ timeout: 800 });
           const before = JSON.stringify([await image.getAttribute("src"), await image.getAttribute("alt")]);
           await (await requireVisible(thumbnail, "Requested selectable gallery thumbnails are absent")).click({ timeout: 800 });
           if (JSON.stringify([await image.getAttribute("src"), await image.getAttribute("alt")]) === before) throw new Error("Gallery selection does not change the active image");
         }
         if (capabilities.has("cart")) {
-          const cart = await requireVisible(page.getByRole("button", { name: /^(?:open\s+)?(?:shopping\s+)?(?:cart|bag)(?:\s|\(|,|:|$)/i }), "Requested cart trigger is absent");
+          const cart = await requireVisible(surface.getByRole("button", { name: /^(?:open\s+)?(?:shopping\s+)?(?:cart|bag)(?:\s|\(|,|:|$)/i }), "Requested cart trigger is absent");
           const counter = page.getByRole("status", { name: /(?:cart|bag) count/i });
           const cartCount = async () => (await cart.innerText()) + ((await counter.count()) ? await counter.first().innerText() : "");
           const before = await cartCount();
-          const quantityInput = page.getByRole("spinbutton", { name: /quantity/i }).first();
-          const increment = page.getByRole("button", { name: /increase quantity/i }).first();
+          const quantityInput = surface.getByRole("spinbutton", { name: /quantity/i }).first();
+          const increment = surface.getByRole("button", { name: /increase quantity/i }).first();
           const quantityText = await increment.count() ? await increment.locator("..").innerText() : "1";
           const requestedQuantity = await quantityInput.count() ? Number(await quantityInput.inputValue()) : Number(quantityText.match(/\d+/)?.[0] ?? 1);
           const previousCount = Number(before.match(/\d+/g)?.at(-1) ?? 0);
-          await (await requireVisible(page.getByRole("button", { name: /add to (?:cart|bag)/i }), "Requested Add to Cart is absent")).click({ timeout: 800 });
+          await (await requireVisible(surface.getByRole("button", { name: /add to (?:cart|bag)/i }), "Requested Add to Cart is absent")).click({ timeout: 800 });
           const after = await cartCount();
           if (after === before || Number(after.match(/\d+/g)?.at(-1)) !== previousCount + requestedQuantity)
             throw new Error("Add to Cart does not update the actual cart count by the selected quantity");
@@ -179,65 +200,42 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
           if (await panel.isVisible()) throw new Error("Cart Close control does not close its panel");
         }
       }
-      if (context.route === "/") {
+      if (forceRoute || context.route === "/") {
         if (capabilities.has("category-filter")) {
-          const products = page.locator('main article,main [data-product-id],main [data-product]');
-          const snapshot = async () => JSON.stringify(await products.allTextContents());
-          const before = await snapshot();
-          const filter = page.getByRole("combobox", { name: /category/i }).first();
-          if (await filter.count()) await filter.selectOption({ index: 1 });
-          else {
-            const choices = page.locator('[data-sites-capability="category-filter"],.filters,[role="group"][aria-label*="categor" i]').getByRole("button");
-            let selected = false;
-            for (const choice of await choices.all()) {
-              if (!(await choice.isVisible()) || !(await choice.isEnabled()) || await choice.getAttribute("aria-pressed") === "true" || /^all$/i.test(await choice.innerText())) continue;
-              await choice.click({ timeout: 800 }); selected = true; break;
-            }
-            if (!selected) throw new Error("Requested category filter is absent");
-          }
-          if (!(await products.count()) || await snapshot() === before) throw new Error("Category filter does not update visible products");
+          await probeCategoryFiltering(page, scoped ? surface : undefined);
         }
         if (capabilities.has("search")) {
-          const searches = page.getByRole("searchbox").or(page.getByRole("textbox", { name: /search/i }));
+          const searches = surface.getByRole("searchbox").or(surface.getByRole("textbox", { name: /search/i }));
           const search = await requireVisible(searches, "Requested search is absent");
           const before = await page.locator("body").innerText(); await search.fill("__no_matching_demo_product__");
           if (await page.locator("body").innerText() === before) throw new Error("Search does not update visible results");
         }
-        if (capabilities.has("mobile-nav")) {
-          const toggles = page.getByRole("button", { name: /^(?:menu|(?:open |close )?(?:menu|navigation))$/i });
-          const toggle = toggles.first();
-          if (!(await toggle.count()) || !(await toggle.isVisible())) {
-            if (context.viewport.id === "MOBILE") throw new Error("Requested mobile menu is absent");
-          } else {
-          await toggle.click({ timeout: 800 });
-          if (await toggle.getAttribute("aria-expanded") !== "true") throw new Error("Mobile menu does not open");
-          const id = await toggle.getAttribute("aria-controls");
-          if (!id || !(await page.locator(`[id=${JSON.stringify(id)}]`).isVisible())) throw new Error("Mobile menu content is not visible");
-          await toggle.click({ timeout: 800 });
-          }
-        }
-        if (capabilities.has("tabs")) {
-          const tabs = page.getByRole("tab"); if (await tabs.count() < 2) throw new Error("Requested tabs are absent");
-          const before = await page.getByRole("tabpanel").innerText(); await tabs.nth(1).click({ timeout: 800 });
-          if (await tabs.nth(1).getAttribute("aria-selected") !== "true" || await page.getByRole("tabpanel").innerText() === before) throw new Error("Tabs do not switch visible content");
-        }
+        if (capabilities.has("mobile-nav") && (context.viewport.id === "MOBILE" || await page.getByRole("button", { name: /^(?:menu|(?:open |close )?(?:menu|navigation))$/i }).first().isVisible().catch(() => false))) await probeMobileNavigation(page);
+        if (capabilities.has("tabs")) await probeTabs(page, surface);
         if (capabilities.has("accordion")) {
-          const details = page.locator("details").first(); await requireVisible(details, "Requested accordion is absent");
-          const before = await details.getAttribute("open"); await details.locator("summary").click({ timeout: 800 });
-          if (await details.getAttribute("open") === before) throw new Error("Accordion does not expand/collapse");
+          await probeAccordionBehavior(page, surface);
         }
-        if (capabilities.has("dialog")) {
-          const trigger = await requireVisible(page.locator('[data-sites-capability="dialog"] > button'), "Requested dialog trigger is absent");
-          await trigger.click({ timeout: 800 }); await requireVisible(page.getByRole("dialog"), "Dialog does not open");
-          await page.getByRole("button", { name: "Close dialog", exact: true }).click({ timeout: 800 });
-          if (await page.getByRole("dialog").isVisible()) throw new Error("Dialog does not close");
-        }
+        if (capabilities.has("dialog")) await probeDialogBehavior(page, surface);
         if (!requirements.backendRequired && !backendEnabled) {
-          if (capabilities.has("newsletter")) await demoForm(page, "newsletter");
-          if (capabilities.has("form")) await demoForm(page, "form");
+          if (capabilities.has("newsletter")) await demoForm(page, "newsletter", surface);
+          if (capabilities.has("form")) await demoForm(page, "form", surface);
         }
       }
       return createBrowserQACheckResult({ checkId: "functional.requirements", category: "INTERACTION", status: "PASS", severity: "ERROR", route: context.route, viewport: context.viewport, message: "Requested scoped functional behavior passed observable probes" });
     },
   }];
+  if (contract) {
+    const probe = checks[1]!;
+    checks[1] = { ...probe, appliesTo: (route, viewport) => contract.requirements.some(requirement =>
+      (requirement.capability !== "mobile-nav" || viewport.id === "MOBILE") &&
+      (requirement.target.kind === "SITE" ? requirement.routes?.includes(route) : requirement.routes?.[0] === route)),
+      execute: context => runRouteRequirements(context, contract, async requirement => {
+      await probe.execute(context, new Set([requirement.capability]), true, requirement.target);
+    }) };
+    checks.push({ definition: { checkId: "functional.navigation", version: 1, category: "INTERACTION", defaultSeverity: "ERROR", scope: "PAGE", timeoutMs: 12_000 },
+      appliesTo: route => route === "/" && contract.pages.length > 0,
+      execute: context => context.route === "/" ? probeRequiredNavigation(context, contract) : Promise.resolve(createBrowserQACheckResult({ checkId: "functional.navigation", category: "ROUTING", status: "SKIPPED", severity: "ERROR", route: context.route, viewport: context.viewport, message: "Requested navigation is exercised from the site entry route" })),
+    });
+  }
+  return checks;
 }

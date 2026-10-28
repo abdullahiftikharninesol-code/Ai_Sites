@@ -63,9 +63,11 @@ export const browserQARuntimeChecks: readonly BrowserQACheckExecutor[] = [
         for (const element of document.querySelectorAll("button, [role=button]"))
           if (!accessibleName(element)) issues.push("unnamed button");
         for (const input of document.querySelectorAll("input, textarea, select")) {
-          const id = input.getAttribute("id");
-          const labelled = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
-          if (!labelled && !input.getAttribute("aria-label") && !input.getAttribute("aria-labelledby")) issues.push("unlabeled form control");
+          if (input instanceof HTMLInputElement && ["hidden", "submit", "button", "reset", "image"].includes(input.type)) continue;
+          const field = input as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+          const native = [...(field.labels ?? [])].some(label => !!label.textContent?.trim());
+          const labelled = (input.getAttribute("aria-labelledby") ?? "").split(/\s+/).some(id => !!document.getElementById(id)?.textContent?.trim());
+          if (!native && !labelled && !input.getAttribute("aria-label")?.trim()) issues.push("unlabeled form control");
         }
         for (const image of document.querySelectorAll("img"))
           if (!image.hasAttribute("alt") && image.getAttribute("role") !== "presentation" && image.getAttribute("aria-hidden") !== "true") issues.push("image without alt representation");

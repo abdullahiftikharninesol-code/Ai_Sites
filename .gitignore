@@ -26,6 +26,12 @@ tests/*
 !tests/targeted-edit-completeness.test.ts
 !tests/targeted-edit-reliability.test.ts
 !tests/targeted-edit-schema-reliability.test.ts
+!tests/targeted-edit-ambiguity.test.ts
+!tests/targeted-edit-scope.test.ts
+!tests/build-repair-reliability.test.ts
+!tests/build-repair-pipeline.test.ts
+!tests/phase-3a-6-build-repair-migration.test.ts
+!tests/phase-3f-production-simplification.test.ts
 !tests/openai-prompt-cache-key.test.ts
 !tests/browser-qa-fragment-navigation.test.ts
 !tests/site-templates-phase-7l.test.ts
@@ -42,6 +48,14 @@ tests/*
 tests/fixtures/*
 !tests/fixtures/functional-generation-sites.ts
 !tests/fixtures/repaired-template-controls.ts
+!tests/fixtures/build-repair-sites.ts
+!tests/fixtures/route-aware-sites.ts
+!tests/route-aware-functional-contract.test.ts
+!tests/route-aware-generation-pipeline.test.ts
+!tests/route-aware-behavior.test.ts
+!tests/accordion-reliability.test.ts
+!tests/production-functional-behavior.test.ts
+!tests/production-functional-pipeline.test.ts
 !tests/fixtures/template-publisher-valid/
 !tests/fixtures/template-publisher-valid/**
 !tests/sites-premerge-hardening.test.ts
@@ -56,3 +70,5 @@ docs/*
 !docs/template-reference-generation.md
 !docs/functional-generation-reliability.md
 !docs/exact-template-workflow.md
+!docs/route-aware-generation.md
+!docs/production-functional-reliability.md

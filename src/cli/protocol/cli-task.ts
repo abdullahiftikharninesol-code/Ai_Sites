@@ -5,6 +5,8 @@ import type { InferenceRunContext } from "../../agents/budget/inference-run-cont
 import type { InferenceStage } from "../../agents/budget/agent-run-budget.js";
 import type { ResolvedTemplateDesignReference } from "../../templates/application/template-design-context.js";
 export interface CliTask {
+  /** Server-created HTTP/polling job identity; diagnostics only, never model context. */
+  readonly outerRequestId?: string;
   readonly jobId: string;
   readonly siteId: string;
   readonly operation: "REPLACE_TEXT" | "GENERATE_SITE" | "EDIT_SITE";

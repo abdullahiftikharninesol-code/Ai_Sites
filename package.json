@@ -8,6 +8,9 @@
     "node": ">=22.0.0"
   },
   "scripts": {
+    "test:functional-production": "node scripts/run-functional-reliability-tests.mjs",
+    "test:accordion-reliability": "vitest run --maxWorkers=1 --testTimeout=300000 tests/accordion-reliability.test.ts tests/route-aware-functional-contract.test.ts tests/route-aware-behavior.test.ts tests/route-aware-generation-pipeline.test.ts",
+    "test:route-aware-generation": "vitest run --maxWorkers=1 --testTimeout=300000 tests/accordion-reliability.test.ts tests/route-aware-functional-contract.test.ts tests/route-aware-behavior.test.ts tests/route-aware-generation-pipeline.test.ts tests/functional-generation-reliability.test.ts tests/functional-qa-reliability.test.ts tests/targeted-edit-ambiguity.test.ts tests/targeted-edit-scope.test.ts tests/build-repair-reliability.test.ts tests/sites-edit-persistence.test.ts tests/exact-template-workflow.test.ts",
     "test:templates": "vitest run --testTimeout=300000 tests/site-templates-t1.test.ts",
     "test:templates:t2a": "vitest run --testTimeout=300000 tests/site-templates-t2a.test.ts",
     "test:templates:t2b": "vitest run --testTimeout=300000 tests/site-templates-t2b.test.ts",
