@@ -1,10 +1,12 @@
+import { FunctionalValidationError } from "./browser-qa-failure.js";
 import type { Locator, Page } from "playwright";
+import { mobileNavigationToggle } from "./mobile-navigation.js";
 
 const pause = () => new Promise<void>(resolve => setTimeout(resolve, 25));
 async function until(check: () => Promise<boolean>, message: string): Promise<void> {
   const end = Date.now() + 700;
   do { if (await check()) return; await pause(); } while (Date.now() < end);
-  throw new Error(message);
+  throw new FunctionalValidationError(message);
 }
 
 /** Read rendered answer text, excluding trigger labels, navigation and controls.
@@ -73,7 +75,7 @@ async function exercise(button: Locator, surfaces: readonly Locator[], expanded:
     return false;
   }, "Accordion changes no visible, meaningful local answer content");
   const surface = surfaces[chosen]!, original = before[chosen]!;
-  if (initial !== undefined && await expanded() !== !initial) throw new Error("Accordion expanded state does not follow its visible answer");
+  if (initial !== undefined && await expanded() !== !initial) throw new FunctionalValidationError("Accordion expanded state does not follow its visible answer");
   await button.click({ timeout: 1_200 });
   await until(async () => await answerText(surface) === original && (initial === undefined || await expanded() === initial),
     opening ? "Accordion does not hide its answer when closed" : "Accordion does not restore its answer when opened");
@@ -87,13 +89,16 @@ export async function probeAccordionBehavior(page: Page, surface: Page | Locator
   for (const details of (await surface.locator("details").all()).slice(0, 8)) {
     if (!(await details.isVisible())) continue;
     const summary = details.locator("summary").first();
-    if (!(await summary.isVisible().catch(() => false))) throw new Error("Accordion has no reachable summary control");
+    if (!(await summary.isVisible().catch(() => false))) throw new FunctionalValidationError("Accordion has no reachable summary control");
     await exercise(summary, [details], async () => await details.getAttribute("open") !== null); tested++;
   }
   const buttons = surface.getByRole("button");
+  const navigationToggle = await (await mobileNavigationToggle(page))?.elementHandle();
+  try {
   for (const button of await buttons.all()) {
     if (tested >= 8) break;
     if (!(await button.isVisible()) || !(await button.isEnabled())) continue;
+    if (navigationToggle && await button.evaluate((element, navigation) => element === navigation, navigationToggle)) continue;
     const eligible = await button.evaluate(element => {
       if (element.closest('details,nav,[role="navigation"],[role="menu"],[role="tablist"],[role="dialog"]')) return false;
       const name = element.getAttribute("aria-label") ?? element.textContent ?? "";
@@ -107,5 +112,6 @@ export async function probeAccordionBehavior(page: Page, surface: Page | Locator
       const value = await button.getAttribute("aria-expanded"); return value === null ? undefined : value === "true";
     }); tested++;
   }
-  if (!tested) throw new Error("Requested accordion has no reachable question/summary control");
+  } finally { await navigationToggle?.dispose(); }
+  if (!tested) throw new FunctionalValidationError("Requested accordion has no reachable question/summary control");
 }

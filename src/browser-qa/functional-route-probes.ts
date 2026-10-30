@@ -1,15 +1,18 @@
+import { FunctionalValidationError } from "./browser-qa-failure.js";
 import type { Locator, Page } from "playwright";
 import type { BrowserQAPageContext } from "./browser-qa-runner.js";
 import { createBrowserQACheckResult, type BrowserQACheckResult } from "./browser-qa-domain.js";
 import type { FunctionalRequirement, ResolvedFunctionalContract } from "../sites/generation/functional-route-contract.js";
 import { equivalentPage } from "../sites/generation/requested-pages.js";
 import { functionalPageSurface, meaningfulPageContent } from "./functional-surfaces.js";
+import { classifyBrowserQAFailure } from "./browser-qa-failure.js";
+import { mobileNavigationToggle } from "./mobile-navigation.js";
 
 /** Resolve real semantic sections; a descriptive name is never a guessed ID. */
 export async function functionalSectionSurface(page: Page, target: FunctionalRequirement["target"]): Promise<Locator> {
   if (target.sectionId) {
     const section = page.locator(`[id=${JSON.stringify(target.sectionId)}]`);
-    if (await section.count() !== 1) throw new Error(`Required explicit section ID ${target.sectionId} is missing or duplicated`);
+    if (await section.count() !== 1) throw new FunctionalValidationError(`Required explicit section ID ${target.sectionId} is missing or duplicated`);
     await section.waitFor({ state: "visible", timeout: 1_000 }); return section;
   }
   if (!target.sectionName) throw new Error("Section requirement has no explicit identity");
@@ -49,17 +52,8 @@ function subset(before: readonly string[], after: readonly string[]): boolean {
 /** Honor an explicit panel relation, or prove which semantic navigation opens.
  * Descriptive markup never implies a manufactured DOM ID. */
 export async function probeMobileNavigation(page: Page): Promise<void> {
-  let initial = page.getByRole("button", { name: /^(?:menu|(?:open |close )?(?:menu|navigation))$/i }).filter({ visible: true }).first();
-  // An initially expanded menu may legitimately call its toggle just "Close".
-  // Require its expanded state and associated links before treating it as nav.
-  if (!(await initial.isVisible().catch(() => false))) {
-    for (const close of await page.getByRole("button", { name: /^close$/i }).filter({ visible: true }).all()) {
-      const id = await close.getAttribute("aria-controls");
-      if (id && await close.getAttribute("aria-expanded") === "true" &&
-        await page.locator("[id=" + JSON.stringify(id) + "]").getByRole("link").filter({ visible: true }).count()) { initial = close; break; }
-    }
-  }
-  if (!(await initial.isVisible().catch(() => false))) throw new Error("Requested mobile menu is absent");
+  const initial = await mobileNavigationToggle(page);
+  if (!initial) throw new FunctionalValidationError("Requested mobile menu is absent");
   const pinned = await initial.elementHandle({ timeout: 800 });
   if (!pinned) throw new Error("Mobile menu control disappeared before activation");
   try {
@@ -80,11 +74,11 @@ export async function probeMobileNavigation(page: Page): Promise<void> {
   }));
   try {
   await toggle.click({ timeout: 800 }); await frame(page);
-  if (await toggle.getAttribute("aria-expanded") !== "true") throw new Error("Mobile menu does not open");
+  if (await toggle.getAttribute("aria-expanded") !== "true") throw new FunctionalValidationError("Mobile menu does not open");
   const id = await toggle.getAttribute("aria-controls");
   if (id) {
     const target = page.locator(`[id=${JSON.stringify(id)}]`);
-    if (await target.count() !== 1 || !await target.isVisible()) throw new Error("Mobile menu has a missing or hidden explicit navigation panel");
+    if (await target.count() !== 1 || !await target.isVisible()) throw new FunctionalValidationError("Mobile menu has a missing or hidden explicit navigation panel");
   }
   const revealed = await page.evaluateHandle(({ previous, id }) => {
     const root = id ? document.getElementById(id) : document;
@@ -97,11 +91,11 @@ export async function probeMobileNavigation(page: Page): Promise<void> {
   if (!await revealed.evaluate(elements => elements.length > 0 && elements.every(element => {
     const href = element.getAttribute("href")?.trim();
     return !!href && !/^(?:javascript:|#)$/i.test(href) && !!element.textContent?.trim();
-  }))) throw new Error("Mobile menu has no newly reachable navigation destinations");
+  }))) throw new FunctionalValidationError("Mobile menu has no newly reachable navigation destinations");
   await toggle.click({ timeout: 800 }); await frame(page);
   if (await toggle.getAttribute("aria-expanded") !== "false" || !await revealed.evaluate(elements => elements.every(element =>
     !element.isConnected || !element.getClientRects().length || ["hidden", "collapse"].includes(getComputedStyle(element).visibility))))
-    throw new Error("Mobile menu does not close its navigation content");
+    throw new FunctionalValidationError("Mobile menu does not close its navigation content");
   } finally { await revealed.dispose(); }
   } finally { await before.dispose(); }
   } finally { await pinned.dispose(); }
@@ -121,10 +115,10 @@ export async function probeCategoryFiltering(page: Page, surface?: Page | Locato
       await select.selectOption(category.value); await frame(page);
       const after = await visibleItems(surface), selected = await select.inputValue();
       await select.selectOption(all.value); await frame(page);
-      if (JSON.stringify(await visibleItems(surface)) !== JSON.stringify(before)) throw new Error("Category filter All does not restore the complete result set");
+      if (JSON.stringify(await visibleItems(surface)) !== JSON.stringify(before)) throw new FunctionalValidationError("Category filter All does not restore the complete result set");
       if (selected === category.value && subset(before, after)) return;
     }
-    throw new Error("Category selection does not filter visible results with observable selected state");
+    throw new FunctionalValidationError("Category selection does not filter visible results with observable selected state");
   }
   const allButtons = surface.getByRole("button", { name: allCategory }).or(surface.getByRole("tab", { name: allCategory }));
   for (const all of await allButtons.all()) {
@@ -144,12 +138,12 @@ export async function probeCategoryFiltering(page: Page, surface?: Page | Locato
       const semanticSelected = await choice.getAttribute("aria-pressed") === "true" || await choice.getAttribute("aria-selected") === "true";
       const visibleSelected = oldClass !== await choice.getAttribute("class") && allClass !== await all.getAttribute("class");
       await all.click({ timeout: 1_000 }); await frame(page);
-      if (JSON.stringify(await visibleItems(surface)) !== JSON.stringify(before)) throw new Error("Category filter All does not restore the complete result set");
+      if (JSON.stringify(await visibleItems(surface)) !== JSON.stringify(before)) throw new FunctionalValidationError("Category filter All does not restore the complete result set");
       if ((semanticSelected || visibleSelected) && subset(before, after)) return;
     }
-    throw new Error("Category buttons are decorative, or do not filter and restore visible results");
+    throw new FunctionalValidationError("Category buttons are decorative, or do not filter and restore visible results");
   }
-  throw new Error("Requested category filter is absent or has fewer than two reachable categories");
+  throw new FunctionalValidationError("Requested category filter is absent or has fewer than two reachable categories");
 }
 
 export interface FunctionalProbeResult {
@@ -192,8 +186,11 @@ export async function runRouteRequirements(
           result: "FAIL", sourceEvidence: requirement.sourceEvidence, sourceAssessment: requirement.sourceAssessment });
       }
     }
+    const detail = error instanceof Error ? error.message : "No implemented required route";
+    const boundedDetail = detail.length <= 1500 ? detail : detail.slice(0, 900) + "\n…\n" + detail.slice(-590);
     if (error || !candidates.length) return createBrowserQACheckResult({ checkId: "functional.requirements", category: "INTERACTION", status: "FAIL", severity: "ERROR",
-      route: context.route, viewport: context.viewport, message: `${requirement.id} on ${candidates.join(", ")}: ${error instanceof Error ? error.message.slice(0, 800) : "No implemented required route"}`,
+      failureKind: error ? classifyBrowserQAFailure(error, "functional.requirements") : "FUNCTIONAL_FAILURE",
+      route: context.route, viewport: context.viewport, message: `${requirement.id} on ${candidates.join(", ")}`.slice(0, 400) + ": " + boundedDetail,
       functionalProbes: observations });
   }
   return createBrowserQACheckResult({ checkId: "functional.requirements", category: "INTERACTION", status: applicable.length ? "PASS" : "SKIPPED", severity: "ERROR",
@@ -216,12 +213,12 @@ export async function probeRequiredNavigation(context: BrowserQAPageContext, con
     };
     let link = await find();
     if (!link) {
-      const menu = context.page.getByRole("button", { name: /^(?:(?:open|toggle) )?(?:menu|navigation)$/i }).first();
-      if (await menu.isVisible().catch(() => false)) { if (await menu.getAttribute("aria-expanded") !== "true") await menu.click(); link = await find(); }
+      const menu = await mobileNavigationToggle(context.page);
+      if (menu) { if (await menu.getAttribute("aria-expanded") !== "true") await menu.click({ timeout: 800 }); await frame(context.page); link = await find(); }
     }
-    if (!link) throw new Error(`Required page ${page.name} has no reachable navigation to ${page.route}`);
+    if (!link) throw new FunctionalValidationError(`Required page ${page.name} has no reachable navigation to ${page.route}`);
     await link.click({ timeout: 1_500 }); await frame(context.page);
-    if (new URL(context.page.url()).pathname !== page.route) throw new Error(`Navigation to ${page.name} did not reach ${page.route}`);
+    if (new URL(context.page.url()).pathname !== page.route) throw new FunctionalValidationError(`Navigation to ${page.name} did not reach ${page.route}`);
     await meaningful(page.name);
   }
   return createBrowserQACheckResult({ checkId: "functional.navigation", category: "ROUTING", status: "PASS", severity: "ERROR", route: context.route, viewport: context.viewport,

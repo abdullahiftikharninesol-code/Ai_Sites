@@ -1,3 +1,4 @@
+import { FunctionalValidationError } from "./browser-qa-failure.js";
 import type { Locator, Page, Route } from "playwright";
 import { createBrowserQACheckResult } from "./browser-qa-domain.js";
 import type { BrowserQACheckExecutor, BrowserQAPageContext } from "./browser-qa-runner.js";
@@ -12,7 +13,7 @@ import { probeDialogBehavior } from "./dialog-behavior.js";
 
 async function requireVisible(locator: Locator, message: string): Promise<Locator> {
   const target = locator.first();
-  if (!(await target.count()) || !(await target.isVisible())) throw new Error(message);
+  if (!(await target.count()) || !(await target.isVisible())) throw new FunctionalValidationError(message);
   return target;
 }
 const state = (page: Page) => page.evaluate(() => JSON.stringify({ text: document.body.innerText, url: location.href,
@@ -37,15 +38,15 @@ async function expectChange(page: Page, before: string, message: string) {
     if (await state(page) !== before) return;
     await page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => done())));
   }
-  throw new Error(message);
+  throw new FunctionalValidationError(message);
 }
 async function demoForm(page: Page, capability: "newsletter" | "form", surface: Page | Locator = page) {
   const managed = surface.locator(`form[data-sites-capability="${capability}"]`);
   const form = await requireVisible((await managed.count()) ? managed : surface.locator("form").filter({ has: page.locator('input[type="email"]') }), `Missing ${capability} form`);
   const email = form.locator('input[type="email"]').first();
-  if (!(await email.count())) throw new Error(`${capability} form has no email validation`);
+  if (!(await email.count())) throw new FunctionalValidationError(`${capability} form has no email validation`);
   await email.fill("not-an-email");
-  if (await form.evaluate(element => (element as HTMLFormElement).checkValidity())) throw new Error(`${capability} accepts invalid email`);
+  if (await form.evaluate(element => (element as HTMLFormElement).checkValidity())) throw new FunctionalValidationError(`${capability} accepts invalid email`);
   for (const input of await form.locator("input:not([type=hidden]),textarea").all()) {
     const type = await input.getAttribute("type");
     if (!(await input.isVisible()) || !(await input.isEnabled())) continue;
@@ -58,9 +59,9 @@ async function demoForm(page: Page, capability: "newsletter" | "form", surface: 
     if (!(await select.isVisible()) || !(await select.isEnabled())) continue;
     const option = await select.locator("option").evaluateAll(options => options.map(option => option as HTMLOptionElement).find(option => !option.disabled && !option.closest("optgroup[disabled]") && option.value.trim())?.value);
     if (option) await select.selectOption(option);
-    else if (await select.getAttribute("required") !== null) throw new Error(`${capability} required select has no usable choice`);
+    else if (await select.getAttribute("required") !== null) throw new FunctionalValidationError(`${capability} required select has no usable choice`);
   }
-  if (!(await form.evaluate(element => (element as HTMLFormElement).checkValidity()))) throw new Error(`${capability} still has invalid required fields after safe local input`);
+  if (!(await form.evaluate(element => (element as HTMLFormElement).checkValidity()))) throw new FunctionalValidationError(`${capability} still has invalid required fields after safe local input`);
   const before = await page.locator("body").innerText();
   // Never allow the QA probe to send submissions, even if a generated mock lies.
   const blocked: string[] = [];
@@ -71,13 +72,25 @@ async function demoForm(page: Page, capability: "newsletter" | "form", surface: 
   };
   await page.route("**/*", guard);
   try {
-    await form.locator('button[type="submit"],button:not([type]),input[type="submit"]').first().click({ timeout: 800 });
+    const submit = form.locator('button[type="submit"],button:not([type]),input[type="submit"]').first();
+    // Field filling leaves the last input focused and may leave the pointer on
+    // a translating hover boundary. Put the submit control in the viewport's
+    // centre before the normal actionability check, away from sticky headers.
+    // This scroll neither invokes the handler nor bypasses pointer interception.
+    await page.mouse.move(0, 0);
+    await submit.evaluate(element => element.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" }));
+    const handle = await submit.elementHandle();
+    try {
+      await page.waitForFunction(element => !!element && element.getAnimations().every(animation => animation.playState !== "running" ||
+        !(animation instanceof CSSTransition) || animation.transitionProperty !== "transform"), handle, { timeout: 800 });
+    } finally { await handle?.dispose(); }
+    await submit.click({ timeout: 800 });
     await page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => done())));
     const after = await page.locator("body").innerText();
     const feedback = await page.getByRole("status").allTextContents();
     feedback.push(...after.split("\n").filter(line => !before.split("\n").includes(line)));
     if (blocked.length || after === before || !feedback.some(text => /demo|mock|not (?:sent|subscribed)|in this view|local(?:ly)? only/i.test(text)))
-      throw new Error(`${capability} needs observable, honest mock confirmation without a network submission`);
+      throw new FunctionalValidationError(`${capability} needs observable, honest mock confirmation without a network submission`);
   } finally { await page.unroute("**/*", guard); }
 }
 
@@ -91,24 +104,31 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
     async execute(context) {
       const initialUrl = context.page.url();
       const buttons = await context.page.getByRole("button").all();
-      for (const [index, button] of buttons.slice(0, 12).entries()) {
+      let resetRequired = false;
+      for (const button of buttons.slice(0, 12)) {
         // Each independent probe starts from the same page, not a drawer/menu
         // left open by an earlier action. Observed runtime errors stay recorded.
-        if (index > 0) {
+        if (resetRequired) {
           await context.page.goto(initialUrl, { waitUntil: "domcontentloaded", timeout: 3_000 });
           // Wait for React's controls, not unrelated images and two extra frames
           // on every reset. Hover/focus still settle before state comparison.
           await context.page.getByRole("button").first().waitFor({ state: "attached", timeout: 1_000 });
+          resetRequired = false;
         }
-        if (!(await button.isVisible()) || !(await button.isEnabled())) continue;
-        if (await button.getAttribute("aria-pressed") === "true" || await button.getAttribute("aria-selected") === "true") continue;
-        if (await button.evaluate(element => (element as HTMLButtonElement).type === "submit" && !!element.closest("form"))) continue;
-        await button.scrollIntoViewIfNeeded({ timeout: 800 });
-        const label = await button.getAttribute("aria-label") || await button.innerText();
-        if (await button.getAttribute("aria-expanded") === "true") await closeControlledPanel(context.page, button);
+        const [visible, enabled, properties] = await Promise.all([button.isVisible(), button.isEnabled(), button.evaluate(element => ({
+          selected: element.getAttribute("aria-pressed") === "true" || element.getAttribute("aria-selected") === "true",
+          submit: (element as HTMLButtonElement).type === "submit" && !!element.closest("form"),
+          label: element.getAttribute("aria-label") || (element as HTMLElement).innerText,
+          expanded: element.getAttribute("aria-expanded"),
+        }))]);
+        if (!visible || !enabled || properties.selected || properties.submit) continue;
+        const label = properties.label;
+        resetRequired = true;
+        if (properties.expanded === "true") await closeControlledPanel(context.page, button);
         const expanded = await button.getAttribute("aria-expanded");
         // Hover/focus styling is not a click action. Settle it before recording
         // observable state so cosmetic rollover effects cannot satisfy QA.
+        // Normal hover already scrolls into view and checks actionability.
         await button.hover({ timeout: 800 });
         await button.focus({ timeout: 800 });
         await context.page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done()))));
@@ -126,7 +146,7 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
           if (dismiss && await dismiss.evaluate(region => !!region)) {
             for (let attempt = 0; attempt < 30; attempt++) {
               if (await dismiss.evaluate(region => !region?.isConnected || region.getClientRects().length === 0 || ["hidden", "collapse"].includes(getComputedStyle(region).visibility))) break;
-              if (attempt === 29) throw new Error(`Dismiss control leaves its content visible: ${label.slice(0, 80)}`);
+              if (attempt === 29) throw new FunctionalValidationError(`Dismiss control leaves its content visible: ${label.slice(0, 80)}`);
               await context.page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => done())));
             }
           }
@@ -152,7 +172,7 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
         if (capabilities.has("size")) await probeSizeSelection(surface);
         if (capabilities.has("quantity")) {
           const quantity = surface.getByRole("spinbutton", { name: /quantity/i }).first();
-          if (await quantity.count()) { await quantity.fill("2"); if (await quantity.inputValue() !== "2") throw new Error("Quantity does not update"); }
+          if (await quantity.count()) { await quantity.fill("2"); if (await quantity.inputValue() !== "2") throw new FunctionalValidationError("Quantity does not update"); }
           else {
             const increase = await requireVisible(surface.getByRole("button", { name: /increase quantity/i }), "Requested quantity controls are absent");
             const before = await state(page); await increase.click({ timeout: 800 }); await expectChange(page, before, "Quantity increment has no effect");
@@ -165,7 +185,7 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
           await surface.getByRole("button", { name: /^view(?: image)? 1$/i }).first().click({ timeout: 800 });
           const before = JSON.stringify([await image.getAttribute("src"), await image.getAttribute("alt")]);
           await (await requireVisible(thumbnail, "Requested selectable gallery thumbnails are absent")).click({ timeout: 800 });
-          if (JSON.stringify([await image.getAttribute("src"), await image.getAttribute("alt")]) === before) throw new Error("Gallery selection does not change the active image");
+          if (JSON.stringify([await image.getAttribute("src"), await image.getAttribute("alt")]) === before) throw new FunctionalValidationError("Gallery selection does not change the active image");
         }
         if (capabilities.has("cart")) {
           const cart = await requireVisible(surface.getByRole("button", { name: /^(?:open\s+)?(?:shopping\s+)?(?:cart|bag)(?:\s|\(|,|:|$)/i }), "Requested cart trigger is absent");
@@ -180,7 +200,7 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
           await (await requireVisible(surface.getByRole("button", { name: /add to (?:cart|bag)/i }), "Requested Add to Cart is absent")).click({ timeout: 800 });
           const after = await cartCount();
           if (after === before || Number(after.match(/\d+/g)?.at(-1)) !== previousCount + requestedQuantity)
-            throw new Error("Add to Cart does not update the actual cart count by the selected quantity");
+            throw new FunctionalValidationError("Add to Cart does not update the actual cart count by the selected quantity");
           // Add to Cart may legitimately open the drawer itself.
           const panel = page.locator('aside[aria-label*="cart" i],aside[aria-label*="bag" i],[role="dialog"][aria-label*="cart" i],[role="dialog"][aria-label*="bag" i]').first();
           if (!(await panel.count()) || !(await panel.isVisible())) await cart.click({ timeout: 800 });
@@ -195,9 +215,9 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
           const productHeading = await page.locator("main h1").first().innerText();
           const productWords = productHeading.toLowerCase().split(/\s+/).filter(word => word.length > 3);
           if (!quantities.some(value => value >= requestedQuantity) || /your cart is empty/i.test(content) ||
-            !productWords.some(word => content.toLowerCase().includes(word))) throw new Error("Cart does not show the added product and quantity");
+            !productWords.some(word => content.toLowerCase().includes(word))) throw new FunctionalValidationError("Cart does not show the added product and quantity");
           await (await requireVisible(panel.getByRole("button", { name: /close (?:cart|bag|shopping)/i }).last(), "Cart has no Close control")).click({ timeout: 800 });
-          if (await panel.isVisible()) throw new Error("Cart Close control does not close its panel");
+          if (await panel.isVisible()) throw new FunctionalValidationError("Cart Close control does not close its panel");
         }
       }
       if (forceRoute || context.route === "/") {
@@ -208,7 +228,7 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
           const searches = surface.getByRole("searchbox").or(surface.getByRole("textbox", { name: /search/i }));
           const search = await requireVisible(searches, "Requested search is absent");
           const before = await page.locator("body").innerText(); await search.fill("__no_matching_demo_product__");
-          if (await page.locator("body").innerText() === before) throw new Error("Search does not update visible results");
+          if (await page.locator("body").innerText() === before) throw new FunctionalValidationError("Search does not update visible results");
         }
         if (capabilities.has("mobile-nav") && (context.viewport.id === "MOBILE" || await page.getByRole("button", { name: /^(?:menu|(?:open |close )?(?:menu|navigation))$/i }).first().isVisible().catch(() => false))) await probeMobileNavigation(page);
         if (capabilities.has("tabs")) await probeTabs(page, surface);

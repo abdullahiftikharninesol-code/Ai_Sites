@@ -42,6 +42,7 @@ tests/*
 !tests/reference-generation-reliability.test.ts
 !tests/functional-generation-reliability.test.ts
 !tests/functional-qa-reliability.test.ts
+!tests/usable-generation-policy.test.ts
 !tests/exact-template-workflow.test.ts
 !tests/mongodb-persistence.test.ts
 !tests/fixtures/
@@ -56,6 +57,14 @@ tests/fixtures/*
 !tests/accordion-reliability.test.ts
 !tests/production-functional-behavior.test.ts
 !tests/production-functional-pipeline.test.ts
+!tests/universal-generation-reliability.test.ts
+!tests/complex-generation-reliability.test.ts
+!tests/complex-generation-pipeline.test.ts
+!tests/phase-3d-3-browser-qa-runner.test.ts
+!tests/fixtures/generation-prompt-corpus.ts
+!tests/fixtures/complex-generation-sites.ts
+!tests/fixtures/vertex-jsx-failure.ts
+!tests/fixtures/orbit-qa-failures.ts
 !tests/fixtures/template-publisher-valid/
 !tests/fixtures/template-publisher-valid/**
 !tests/sites-premerge-hardening.test.ts
@@ -72,3 +81,6 @@ docs/*
 !docs/exact-template-workflow.md
 !docs/route-aware-generation.md
 !docs/production-functional-reliability.md
+!docs/generation-acceptance-policy.md
+!docs/complex-generation-reliability.md
+!docs/vertex-jsx-build-repair.md

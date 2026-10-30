@@ -10,6 +10,8 @@ export const BROWSER_QA_CHECK_STATUSES = ["PASS", "FAIL", "WARNING", "SKIPPED"] 
 export type BrowserQACheckStatus = (typeof BROWSER_QA_CHECK_STATUSES)[number];
 export const BROWSER_QA_SEVERITIES = ["ERROR", "WARNING", "INFO"] as const;
 export type BrowserQASeverity = (typeof BROWSER_QA_SEVERITIES)[number];
+export const BROWSER_QA_FAILURE_KINDS = ["FUNCTIONAL_FAILURE", "NAVIGATION_FAILURE", "BROWSER_RUNTIME_ERROR", "QA_INFRASTRUCTURE_FAILURE", "CHECK_EXECUTION_ERROR", "ACTIONABILITY_TIMEOUT", "READINESS_TIMEOUT", "CHECK_TIMEOUT", "ROUTE_DEADLINE_EXCEEDED", "RUN_DEADLINE_EXCEEDED"] as const;
+export type BrowserQAFailureKind = (typeof BROWSER_QA_FAILURE_KINDS)[number];
 export const BROWSER_QA_CATEGORIES = [
   "RUNTIME",
   "CONSOLE",
@@ -59,6 +61,7 @@ export interface BrowserQADiagnostic {
 }
 
 export interface BrowserQACheckResult {
+  readonly failureKind?: BrowserQAFailureKind;
   readonly functionalProbes?: readonly FunctionalProbeResult[];
   readonly checkId: string;
   readonly category: BrowserQACategory;
@@ -167,6 +170,7 @@ export function createBrowserQACheckResult(input: BrowserQACheckResult): Browser
   if (!isIn(BROWSER_QA_CATEGORIES, input.category)) fail(`Unknown Browser QA category '${String(input.category)}'`);
   if (!isIn(BROWSER_QA_CHECK_STATUSES, input.status)) fail(`Unknown Browser QA check status '${String(input.status)}'`);
   if (!isIn(BROWSER_QA_SEVERITIES, input.severity)) fail(`Unknown Browser QA severity '${String(input.severity)}'`);
+  if (input.failureKind !== undefined && (!isIn(BROWSER_QA_FAILURE_KINDS, input.failureKind) || input.status !== "FAIL")) fail("Browser QA failure kind requires a recognized kind and FAIL status");
   if (input.status === "SKIPPED" && (!isString(input.message) || !input.message.trim())) fail("Skipped Browser QA checks require a reason");
   if (!isString(input.message) || input.message.length > 2_000) fail("Browser QA check message is invalid");
   if (input.route !== undefined && !isString(input.route)) fail("Browser QA route must be a non-empty string");
@@ -174,6 +178,8 @@ export function createBrowserQACheckResult(input: BrowserQACheckResult): Browser
   if (input.durationMs !== undefined && (!Number.isFinite(input.durationMs) || input.durationMs < 0)) fail("Browser QA durationMs is invalid");
   return Object.freeze({
     ...input,
+    ...(input.status === "FAIL" && input.failureKind === undefined && input.checkId === "runtime.page-error" ? { failureKind: "BROWSER_RUNTIME_ERROR" as const } : {}),
+    ...(input.status === "FAIL" && input.failureKind === undefined && ["internal-links", "route.load", "page-readiness"].includes(input.checkId) ? { failureKind: "NAVIGATION_FAILURE" as const } : {}),
     ...(input.viewport === undefined ? {} : { viewport: freezeViewport(input.viewport) }),
     ...(input.evidence === undefined ? {} : { evidence: freezeEvidence(input.evidence)! }),
   });

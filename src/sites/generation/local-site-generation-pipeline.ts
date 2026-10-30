@@ -6,7 +6,7 @@ import type {
 } from "../../cli/runtime/local-cli-agent-runtime.js";
 import { ApplicationError } from "../../app/errors/application-error.js";
 import { functionalBrowserChecks } from "../../browser-qa/functional-capability-checks.js";
-import { assertFunctionalRequestConsistency } from "./functional-capabilities.js";
+import { assertFunctionalRequestConsistency, assertFunctionalBackendSupport } from "./functional-capabilities.js";
 import type { LocalExecutionProvider } from "../../execution/local/local-execution.provider.js";
 import type { BuildResult, PreviewSession } from "../../execution/execution-types.js";
 import type { ArtifactStore } from "../../persistence/artifact-store.js";
@@ -65,17 +65,20 @@ import { loadAssetManifest, persistAssetManifest } from "../assets/asset-manifes
 import { validateRequiredUserAssetReferences } from "../assets/asset-reference-validator.js";
 import { resolveCapabilities, type ResolvedCapabilities } from "./capability-resolver.js";
 import { analyzeRequestProfile, type RequestProfile } from "./request-profile.js";
+import { generationAssetAdvisories } from "./generation-acceptance-policy.js";
 import { logSiteTokenUsage, siteFailureStage } from "./site-token-usage-log.js";
 import type { FailedCandidateEvidence, FailedCandidateEvidenceRequest } from "./failed-candidate-evidence.js";
 import { recordGenerationTelemetry, referenceContextTelemetry, type GenerationDevelopmentTelemetry } from "./generation-development-telemetry.js";
 import { createAssetIntent } from "../assets/asset-domain.js";
 import type { BrowserQAReport } from "../../browser-qa/browser-qa-domain.js";
 import { withFunctionalContract, functionalRouteGuidance } from "./functional-route-contract.js";
+import type { ResolvedFunctionalContract } from "./functional-route-contract.js";
 import { applyFunctionalSourceContract } from "./functional-source-contract.js";
 import type { BrowserQARunner, BrowserQACheckExecutor } from "../../browser-qa/browser-qa-runner.js";
 import { browserQACoreCheckExecutors } from "../../browser-qa/browser-qa-core-checks.js";
 import { browserQAResponsiveAndInteractionChecks } from "../../browser-qa/browser-qa-interaction-checks.js";
 import { browserQARuntimeChecks } from "../../browser-qa/browser-qa-runtime-checks.js";
+import { applyUsableGenerationReportPolicy, usableGenerationChecks } from "../../browser-qa/usable-generation-checks.js";
 import { persistBrowserQAReport } from "../../browser-qa/browser-qa-persistence.js";
 import type { VisualQAReport } from "../../visual-qa/visual-qa-types.js";
 import type { VisualRepairAttempt, VisualReview } from "../../visual-review/visual-review-domain.js";
@@ -87,6 +90,7 @@ import type {
   SiteCreditBillingService,
 } from "../../billing/credit-billing.js";
 export interface GenerateWebsiteRequest {
+  readonly outerRequestId?: string;
   readonly userId: UserId;
   readonly prompt: string;
   readonly projectName?: string;
@@ -194,6 +198,9 @@ export class LocalSiteGenerationPipeline {
   async generate(request: GenerateWebsiteRequest): Promise<SiteGenerationResult> {
     const requestProfile = analyzeRequestProfile(request.prompt);
     assertFunctionalRequestConsistency(requestProfile.functional);
+    // Known unavailable transactions cannot be enabled by planning. Reject
+    // before planner calls, runtime provisioning, or draft project creation.
+    if (requestProfile.functional.unsupportedTransactions) assertFunctionalBackendSupport(requestProfile.functional);
     const hasVisualReference = request.assetManifest?.assets.some(isVisualReferenceAsset) ?? false;
     const siteId = request.templateReference && request.referenceGenerationSiteId ? request.referenceGenerationSiteId : randomUUID() as SiteId;
     const jobId = randomUUID() as JobId;
@@ -346,6 +353,7 @@ export class LocalSiteGenerationPipeline {
           runtime: "LOCAL_CLI",
           agentProvider: request.agentProvider,
           generationMode: "FAST_GENERATION" as const,
+          ...(request.outerRequestId ? { outerRequestId: request.outerRequestId } : {}),
           userRequest: request.prompt,
           siteSpec,
           ...(templateReference ? { templateDesignReference: templateReference } : {}),
@@ -368,28 +376,31 @@ export class LocalSiteGenerationPipeline {
         undefined,
         async candidate => {
           behaviorAttempt += 1;
-          await validateRequiredUserAssetReferences(this.deps.execution, environment.id, assetManifest);
+          const assetAdvisories = await generationAssetAdvisories(this.deps.execution, environment.id, assetManifest);
           await this.#projectValidator.validate(this.deps.execution, environment.id);
           await this.#functional.validate(candidate.previewUrl, request.agentProvider === "mock" ? "AI Sites Generated Hero" : undefined);
-          const candidateSpec = candidate.functionalContract ? applyFunctionalSourceContract(siteSpec, candidate.functionalContract) : siteSpec;
+          const candidateContract = candidate.functionalContract ? { ...candidate.functionalContract, advisories: [...(candidate.functionalContract.advisories ?? []), ...assetAdvisories] } : undefined;
+          const candidateSpec = candidateContract ? applyFunctionalSourceContract(siteSpec, candidateContract) : siteSpec;
           validatedBrowserQARun = await this.#runBrowserQA(
-            request.browserQAEnabled || Boolean(templateReference) || Boolean(candidate.functionalContract?.requirements.length),
+            true,
             siteId, versionId, candidate.previewUrl, candidateSpec, assetManifest,
             [...(templateReference ? [templateReferenceBrowserCheck(templateReference, request.prompt)] : []),
-              ...functionalBrowserChecks(candidateSpec.requirements.functional ?? requestProfile.functional, candidateSpec.requirements.pages.map(page => page.path), Boolean(candidateSpec.runtime?.enabled), candidate.functionalContract)],
+              ...functionalBrowserChecks(candidateSpec.requirements.functional ?? requestProfile.functional, candidateSpec.requirements.pages.map(page => page.path), Boolean(candidateSpec.runtime?.enabled), candidateContract)],
             { execution: this.deps.execution, environmentId: environment.id, jobId, siteId, generationAttempt: behaviorAttempt > 1 ? 2 : 1,
+              ...(request.outerRequestId ? { outerRequestId: request.outerRequestId } : {}),
               ...(candidate.completion ? { completion: candidate.completion } : {}), functionalRequirements: candidateSpec.requirements.functional ?? requestProfile.functional,
               ...(candidate.buildRepair ? { buildRepair: candidate.buildRepair } : {}),
-              ...(candidate.functionalContract ? { functionalContract: candidate.functionalContract } : {}),
+              ...(candidateContract ? { functionalContract: candidateContract } : {}),
               accounting: { model: candidate.model, role: "sites.site-coder", logicalRequests: runContext.getSummary().logicalRequests,
                 physicalRequests: runContext.getSummary().physicalRequests, billingStatus: "NOT_FINALIZED" },
               referenceContext: referenceContextTelemetry(request.templateReference, templateReference ? templateDesignPrompt(templateReference.design) : undefined) },
+            "USABLE_GENERATION",
           );
           behaviorValidatedInRuntime = true;
         },
       );
       codeGenerationSession = session;
-      await validateRequiredUserAssetReferences(this.deps.execution, environment.id, assetManifest);
+      await generationAssetAdvisories(this.deps.execution, environment.id, assetManifest);
       const intelligenceTelemetry = [
         ...(sitePlanResult ? sitePlanResult.telemetry : []),
         this.#sessionTelemetry("CODE_GENERATION", session, "PASS"),
@@ -407,7 +418,7 @@ export class LocalSiteGenerationPipeline {
       );
       if (session.functionalContract) siteSpec = applyFunctionalSourceContract(siteSpec, session.functionalContract);
       const browserQARun = behaviorValidatedInRuntime ? validatedBrowserQARun : await this.#runBrowserQA(
-        request.browserQAEnabled || Boolean(templateReference) || Boolean(session.functionalContract?.requirements.length),
+        true,
         siteId,
         versionId,
         previewResult.url,
@@ -416,11 +427,13 @@ export class LocalSiteGenerationPipeline {
         [...(templateReference ? [templateReferenceBrowserCheck(templateReference, request.prompt)] : []),
           ...functionalBrowserChecks(siteSpec.requirements.functional ?? requestProfile.functional, siteSpec.requirements.pages.map(page => page.path), Boolean(siteSpec.runtime?.enabled), session.functionalContract)],
         { execution: this.deps.execution, environmentId: environment.id, jobId, siteId, completion: session.generationCompletion,
+          ...(request.outerRequestId ? { outerRequestId: request.outerRequestId } : {}),
           functionalRequirements: siteSpec.requirements.functional ?? requestProfile.functional,
           ...(session.functionalContract ? { functionalContract: session.functionalContract } : {}),
           accounting: { model: session.model, role: "sites.site-coder", logicalRequests: runContext.getSummary().logicalRequests,
             physicalRequests: runContext.getSummary().physicalRequests, billingStatus: "NOT_FINALIZED" },
           referenceContext: referenceContextTelemetry(request.templateReference, templateReference ? templateDesignPrompt(templateReference.design) : undefined) },
+        "USABLE_GENERATION",
       );
       // Browser QA is the sole default runtime QA system. Legacy screenshot
       // review/repair flags remain readable on old request objects but have no
@@ -905,12 +918,14 @@ export class LocalSiteGenerationPipeline {
     siteSpec: SiteSpec | undefined,
     assetManifest?: AssetManifest,
     additionalChecks: readonly BrowserQACheckExecutor[] = [],
-    failedCandidate?: Omit<FailedCandidateEvidenceRequest, "report">,
+    failedCandidate?: Omit<FailedCandidateEvidenceRequest, "report" | "functionalContract"> & { readonly functionalContract?: ResolvedFunctionalContract },
+    acceptance: "STRICT" | "USABLE_GENERATION" = "STRICT",
   ): Promise<{ readonly report: BrowserQAReport; readonly artifactRef: string } | undefined> {
     if (!enabled) return undefined;
     if (!this.deps.browserQA)
       throw new ApplicationError("VALIDATION_FAILED", "Browser QA is not configured");
-    const checks = [
+    const checks = acceptance === "USABLE_GENERATION" ? usableGenerationChecks(failedCandidate?.functionalContract, (assetManifest?.assets.length ?? 0) > 0,
+      additionalChecks.filter(check => !check.definition.checkId.startsWith("functional.") && check.definition.checkId !== "template-reference.requirements")) : [
       ...browserQACoreCheckExecutors,
       ...browserQAResponsiveAndInteractionChecks,
       ...additionalChecks,
@@ -918,17 +933,18 @@ export class LocalSiteGenerationPipeline {
         definition.checkId !== "broken-images" || (assetManifest?.assets.length ?? 0) > 0,
       ),
     ];
-    const report = await this.deps.browserQA.run({
+    const rawReport = await this.deps.browserQA.run({
       runId: `${siteId}-${versionId}`,
       target: {
         baseUrl: previewUrl,
         projectId: siteId,
         siteVersionId: versionId,
       },
-      routes: siteSpec?.requirements.pages.map(({ path }) => path) ?? ["/"],
+      routes: acceptance === "USABLE_GENERATION" ? [...new Set(["/", ...(siteSpec?.requirements.pages.map(({ path }) => path) ?? [])])] : siteSpec?.requirements.pages.map(({ path }) => path) ?? ["/"],
       checks,
       artifactPrefix: `sites/${siteId}/versions/${versionId}/qa/screenshots/browser`,
     });
+    const report = acceptance === "USABLE_GENERATION" ? applyUsableGenerationReportPolicy(rawReport) : rawReport;
     const artifactRef = await persistBrowserQAReport(this.deps.artifacts, siteId, versionId, report);
     if (report.status === "FAIL") {
       if (failedCandidate && this.deps.failedCandidateEvidence) {
@@ -954,7 +970,7 @@ export class LocalSiteGenerationPipeline {
             browserQAArtifactRef: artifactRef,
             failed: report.summary.failed,
             blockingChecks: blocking.map((check) => check.checkId),
-            blockingFindings: blocking.map(check => ({ checkId: check.checkId, route: check.route, viewport: check.viewport?.id, message: check.message })),
+            blockingFindings: blocking.map(check => ({ checkId: check.checkId, route: check.route, viewport: check.viewport?.id, message: check.message, ...(check.failureKind ? { failureKind: check.failureKind } : {}) })),
             failureStage: "BROWSER_QA",
           },
         },

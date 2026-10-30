@@ -1,5 +1,6 @@
 import type { SiteSpec } from "../domain/site-spec.js";
 import { functionalRequirements, type FunctionalRequirements } from "./functional-capabilities.js";
+import { functionalIntent } from "./functional-intent.js";
 
 export type RequestComplexity = "NORMAL" | "COMPLEX";
 
@@ -23,8 +24,9 @@ const COMPLEX_PATTERNS: readonly [RegExp, string][] = [
 ];
 
 export function analyzeRequestProfile(prompt: string): RequestProfile {
+  const affirmative = functionalIntent(prompt).affirmative;
   const reasons = COMPLEX_PATTERNS
-    .filter(([pattern]) => pattern.test(prompt))
+    .filter(([pattern]) => pattern.test(affirmative))
     .map(([, reason]) => reason);
   return Object.freeze({
     complexity: reasons.length > 0 ? "COMPLEX" : "NORMAL",

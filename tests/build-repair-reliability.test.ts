@@ -6,6 +6,9 @@ import { createBuildRepairSourceSnapshot } from "../src/cli/runtime/build-repair
 import { validateReferenceInteractions } from "../src/cli/runtime/reference-interaction-validator.js";
 import { siteFailureStage } from "../src/sites/generation/site-token-usage-log.js";
 import { retainedPattern } from "./fixtures/build-repair-sites.js";
+import { compilerRepairSourceIssue, redundantJsxClosingRepair } from "../src/cli/runtime/build-repair-source-safety.js";
+import { retainedVertexBundle, rejectedVertexRepair, retainedVertexSourceDigest } from "./fixtures/vertex-jsx-failure.js";
+import { repairDigest } from "../src/cli/runtime/build-repair-source.js";
 
 const path = "src/App.tsx";
 const digest: unknown = expect.stringMatching(/^[a-f0-9]{64}$/);
@@ -18,6 +21,73 @@ async function workspace(content: string, other: Record<string, string> = {}) {
   const apply = (patches: ReturnType<typeof patch>[]) => applyBuildRepairPatchBundle(execution, environment.id, { patches }, snapshot);
   return { execution, environmentId: environment.id, snapshot, apply, read: () => execution.readFile(environment.id, path) };
 }
+
+describe("Actual Vertex JSX failure and compiler-repair preservation", () => {
+  const original = retainedVertexBundle.files.find(file => file.path === path)!.content;
+  it("reproduces the exact retained source identity and repairs only its redundant closing token", () => {
+    expect(repairDigest(original)).toBe(retainedVertexSourceDigest);
+    const repaired = redundantJsxClosingRepair(path, original)!;
+    expect(repaired).toBeDefined();
+    expect(repaired.line).toBe(96);
+    expect(repaired.content).toBe(original.replace('</form>}</div></div></section></main>', '</form>}</div></section></main>'));
+    expect(compilerRepairSourceIssue(path, original, repaired.content)).toBeUndefined();
+    for (const name of ["name", "email", "company", "service", "budget", "message"]) expect(repaired.content).toContain(`name="${name}"`);
+    expect(redundantJsxClosingRepair(path, repaired.content)).toBeUndefined();
+  });
+  it.each(["div", "article", "aside"])("handles another container and CRLF without rewriting unrelated bytes: %s", tag => {
+    const source = `export function App(){\r\nreturn <main><section><${tag}><p>Keep this text.</p></${tag}></${tag}></section></main>;\r\n}`;
+    expect(redundantJsxClosingRepair(path, source)?.content).toBe(source.replace(`</${tag}></${tag}>`, `</${tag}>`));
+  });
+  it.each([
+    'export function App(){return <main><div><div>Valid nesting</div></div></main>}',
+    'export function App(){return <main><section>Wrong tag</div></main>}',
+    'export function App(){return <main><section><div>A</div></div></section><article><span>B</span></span></article></main>}',
+    'const text="</div></div>"; /* </div></div> */ export function App(){return <p>{text}</p>}',
+    'const broken = ; export function App(){return <main><section><div>A</div></div></section></main>}',
+  ])("leaves valid, ambiguous or unrelated syntax untouched: %s", source => {
+    expect(redundantJsxClosingRepair(path, source)).toBeUndefined();
+  });
+  it("rejects the exact invalid model repair atomically instead of calling it applied", async () => {
+    const h = await workspace(original, { "src/other.ts": "export const n=1;" });
+    const snapshot = createBuildRepairSourceSnapshot([{ path, content: original }, { path: "src/other.ts", content: "export const n=1;" }], "", Number.MAX_SAFE_INTEGER);
+    await expect(applyBuildRepairPatchBundle(h.execution, h.environmentId, { patches: [patch("n=1", "n=2", "src/other.ts"), ...rejectedVertexRepair.patches] }, snapshot, undefined, { compilerSafety: true }))
+      .rejects.toMatchObject({ metadata: { reason: "REPAIR_SOURCE_SYNTAX_INVALID", failureStage: "PATCH_APPLICATION" } });
+    expect(await h.read()).toBe(original); expect(await h.execution.readFile(h.environmentId, "src/other.ts")).toBe("export const n=1;");
+  });
+  it("rejects the same form simplification even if its JSX is corrected", async () => {
+    const modelPatch = rejectedVertexRepair.patches[0]!;
+    const after = original.replace(modelPatch.find, modelPatch.replace);
+    const corrected = redundantJsxClosingRepair(path, after)!.content;
+    expect(compilerRepairSourceIssue(path, original, corrected)?.reason).toBe("REPAIR_FORM_CONTROL_REMOVED");
+    const h = await workspace(original), snapshot = createBuildRepairSourceSnapshot([{ path, content: original }], "", Number.MAX_SAFE_INTEGER);
+    await expect(applyBuildRepairPatchBundle(h.execution, h.environmentId, { patches: [patch(original, corrected)] }, snapshot, undefined, { compilerSafety: true }))
+      .rejects.toMatchObject({ metadata: { reason: "REPAIR_FORM_CONTROL_REMOVED" } });
+    expect(await h.read()).toBe(original);
+  });
+  it.each([
+    ['required onChange={()=>{}}', 'onChange={()=>{}}'],
+    ['required onChange={()=>{}}', 'required'],
+    ['name="email" required', 'name="other" required'],
+    ['name="email"', 'name="email" disabled'],
+    ['name="email"', 'name="email" readOnly'],
+    ['name="email"', 'name="email" hidden'],
+    ['name="email"', 'name="email" aria-hidden="true"'],
+    ['name="email" value={"demo"}', 'name="email"'],
+  ])("rejects removal of validation, handlers or field identity", (before, after) => {
+    const source = `export function Contact(){return <form><input ${before}/></form>}`;
+    expect(compilerRepairSourceIssue(path, source, source.replace(before, after))?.reason).toBe("REPAIR_FORM_CONTROL_REMOVED");
+  });
+  it("handles repeated field names by a constraint-preserving multiset, independent of order", () => {
+    const before = 'function Contact(){return <form><input name="email" required/><input name="email" onChange={()=>{}}/></form>}';
+    const after = 'function Contact(){return <form><input name="email" required onChange={()=>{}}/><input name="email" required/></form>}';
+    expect(compilerRepairSourceIssue(path, before, after)).toBeUndefined();
+  });
+  it("does not treat explicitly false boolean attributes as lost validation or disabled fields", () => {
+    const before = 'function Contact(){return <form><input name="company" required={ false }/></form>}';
+    const after = 'function Contact(){return <form><input name="company" disabled={false}/></form>}';
+    expect(compilerRepairSourceIssue(path, before, after)).toBeUndefined();
+  });
+});
 
 describe("Snapshot-bound atomic Build Repair", () => {
   it("applies an exact unique compiler correction and preserves the rest", async () => {

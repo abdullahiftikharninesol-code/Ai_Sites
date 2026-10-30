@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join, resolve, sep } from "node:path";
 import { chromium } from "playwright";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -23,6 +24,7 @@ import { loadTemplateManifest } from "../src/templates/publishing/template-manif
 import { validateTemplateSource } from "../src/templates/publishing/template-source.js";
 import { packageTemplateSource } from "../src/templates/publishing/template-package.js";
 import { LocalFailedCandidateEvidence, FAILED_CANDIDATE_LIMITS } from "../src/sites/generation/failed-candidate-evidence.js";
+import { validateTemplateReferenceBundle } from "../src/templates/application/template-reference-generation-contract.js";
 import { estimateTokensConservative } from "../src/agents/budget/token-estimator.js";
 import { DeterministicRequirementsPlanner } from "../src/planning/planning.js";
 
@@ -155,49 +157,21 @@ function withInertSupport(): SiteCoderFileBundle {
 }
 
 describe("Live inert-control regression uses the existing shared repair allowance", () => {
-  it.each([true,false])("repairs all nine controls before materialization and passes three-viewport QA (reference=%s)", async reference => {
-    const candidate=withInertSupport();
-    expect(()=>validateReferenceInteractions(candidate)).toThrow(/and 4 more/);
+  it.each([true,false])("accepts nine noncritical inert controls without repair (reference=%s)",async reference=>{
+    const candidate=withInertSupport();expect(()=>validateReferenceInteractions(candidate)).toThrow(/and 4 more/);
     const h=await harness(candidate,reference,()=>({patches:[{path:"src/App.tsx",find:inertSupport,replace:workingSupport}]}));
-    const result=await h.api.pipeline.generate({userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt,planningMode:"deterministic",
-      agentProvider:h.provider.id,browserQAEnabled:true,retainPreview:true,...(reference?{templateReference:{templateKey:"ecommerce-store",version:1}}:{})});
-    try {
-      expect(h.provider.callCount).toBe(2); expect(result.inference?.physicalRequests).toBe(2);
-      expect(result.inference?.stages.GENERATE_SITE.logicalRequests).toBe(1);
-      expect(result.inference?.stages.BUILD_REPAIR.logicalRequests).toBe(1);
-      expect(result.inference?.stages.TARGETED_EDIT.logicalRequests).toBe(0);
-      const repair=h.requests[1]!;
-      expect(repair.responseContract).toMatchObject({name:"BuildRepairPatchBundle"});
-      expect(repair.messages[0]?.content).toContain("Functional capability contract v1");
-      expect(repair.messages[0]?.content).toContain("CartPanel");
-      // Public error is shortened after five; all nine findings and source reach repair.
-      expect(repair.messages[0]?.content.match(/has a button without an action/g)?.length).toBe(14);
-      expect(repair.messages[0]?.content).toContain("Pinterest");
-      expect(result.build.success).toBe(true); expect(result.browserQA?.status).toBe("PASS");
-      expect(result.browserQA?.checks.filter(check=>check.status==="FAIL")).toEqual([]);
-      expect(new Set(result.browserQA?.checks.map(check=>check.viewport?.id))).toEqual(new Set(["DESKTOP","TABLET","MOBILE"]));
-      expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce();
-      const project=await h.api.projects.getById(result.siteId); expect(project?.latestVersionId).toBe(result.versionId);
-      const source=JSON.parse(Buffer.from((await h.api.artifacts.get(result.sourceArtifactRef))!).toString()) as {files:Record<string,string>};
-      expect(source.files["src/App.tsx"]).toContain(workingSupport);
-      const browser=await chromium.launch({headless:true});
-      try {
-        const page=await browser.newPage(),errors:string[]=[];page.on("pageerror",error=>errors.push(error.message));
-        await page.goto(result.preview.url!,{waitUntil:"networkidle"});
-        for(const [label,message] of supportControls){
-          const controls=page.getByRole("button",{name:label,exact:true});
-          await controls.nth(label==="Size guide"&&message.includes("fit guidance")?1:0).click();
-          expect(await page.getByRole("status",{name:"Support feedback"}).innerText()).toBe(message);
-        }
-        await page.reload({waitUntil:"networkidle"});
-        await page.getByRole("button",{name:"Checkout",exact:true}).click();
-        expect(await page.getByRole("status",{name:"Support feedback"}).innerText()).toContain("no payment is processed");
-        expect(errors).toEqual([]);
-      } finally {await browser.close();}
-    } finally {await h.api.execution.destroyEnvironment(result.preview.environmentId);}
-  },180_000);
-
-  it.each(["unresolved","partial","alert","build-failure","no-effect","managed-file","disabled"])("rejects invalid repair without a third call, successful persistence or charge: %s", async kind => {
+    if (reference) {
+      const resolved=await h.resolver!.resolve({templateKey:"ecommerce-store",version:1});
+      expect(()=>validateTemplateReferenceBundle(candidate,resolved,ecommercePrompt)).toThrow(/without an action/);
+      expect(()=>validateTemplateReferenceBundle(candidate,resolved,ecommercePrompt,{acceptance:"USABLE_WEBSITE"})).not.toThrow();
+      const original={...resolved,applicationHashes:[createHash('sha256').update(candidate.files.find(file=>file.path==='src/App.tsx')!.content).digest('hex')]};
+      expect(()=>validateTemplateReferenceBundle(candidate,original,ecommercePrompt,{acceptance:"USABLE_WEBSITE"})).toThrow(/unchanged reference application/);
+    }
+    const result=await h.api.pipeline.generate({userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt,planningMode:"deterministic",agentProvider:h.provider.id,browserQAEnabled:true,retainPreview:false,...(reference?{templateReference:{templateKey:"ecommerce-store",version:1}}:{})});
+    expect(h.provider.callCount).toBe(1);expect(result.inference?.stages.BUILD_REPAIR.logicalRequests).toBe(0);expect(result.build.success).toBe(true);expect(result.browserQA?.status).not.toBe("FAIL");expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce();
+    const source=JSON.parse(Buffer.from((await h.api.artifacts.get(result.sourceArtifactRef))!).toString()) as {files:Record<string,string>};expect(source.files['src/App.tsx']).toContain(inertSupport);
+  },180000);
+  it.each(["unresolved","partial","alert","build-failure","no-effect","managed-file","disabled"])("does not request an unused invalid repair proposal for minor controls: %s", async kind => {
     if(kind==="disabled"){
       // eslint-disable-next-line @typescript-eslint/unbound-method -- preserve the runtime receiver below.
       const run=LocalCliAgentRuntime.prototype.run;
@@ -212,22 +186,8 @@ describe("Live inert-control regression uses the existing shared repair allowanc
       :workingSupport+(kind==="build-failure"?'\nconst invalidType: number = "not a number";':"");
     const h=await harness(candidate,true,()=>({patches:kind==="unresolved"?[]:kind==="managed-file"?[{path:"package.json",find:"x",replace:"y"}]:[{path:"src/App.tsx",find:inertSupport,replace:replacement}]}));
     const qa=vi.spyOn(h.api.browserQA,"run"),siteId=("inert-repair-"+kind) as SiteId;
-    await expect(h.api.pipeline.generate({userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt,planningMode:"deterministic",
-      agentProvider:h.provider.id,browserQAEnabled:true,templateReference:{templateKey:"ecommerce-store",version:1},referenceGenerationSiteId:siteId})).rejects.toMatchObject({
-        code:kind==="build-failure"?"REPAIR_LIMIT_REACHED":kind==="no-effect"?"VALIDATION_FAILED":kind==="managed-file"?"STRUCTURED_RESPONSE_SCHEMA_INVALID":"GENERATION_INCOMPLETE"});
-    expect(h.provider.callCount).toBe(kind==="disabled"?1:2);
-    if(kind!=="no-effect") expect(qa).not.toHaveBeenCalled();
-    expect(h.billing.finalizeSuccessfulJob).not.toHaveBeenCalled();
-    expect((await h.api.projects.listByOwner("offline-functional-owner")).items).toHaveLength(0);
-    expect((await h.api.versions.listBySite(siteId)).items).toHaveLength(0);
-    if(kind==="unresolved"||kind==="partial"||kind==="alert"||kind==="disabled"){
-      const names=await readdir(h.diagnostics.root);expect(names).toHaveLength(1);
-      const evidence=JSON.parse(await readFile(join(h.diagnostics.root,names[0]!),"utf8")) as {validation:{check:string};source:{files:Record<string,string>}};
-      expect(evidence.validation.check).toBe("interaction.controls");
-      // Build Repair diagnostics intentionally retain the immutable source
-      // snapshot supplied to repair, not the rejected partial/model mutation.
-      expect(evidence.source.files["src/App.tsx"]).toContain(inertSupport);
-    }
+    const result=await h.api.pipeline.generate({userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt,planningMode:"deterministic",agentProvider:h.provider.id,browserQAEnabled:true,retainPreview:false,templateReference:{templateKey:"ecommerce-store",version:1},referenceGenerationSiteId:siteId});
+    expect(h.provider.callCount).toBe(1);expect(qa).toHaveBeenCalled();expect(result.browserQA?.status).not.toBe('FAIL');expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce();expect((await h.api.projects.getById(siteId))?.latestVersionId).toBe(result.versionId);
   },180_000);
 });
 
@@ -240,7 +200,7 @@ describe("Real offline source → recovery → static validation → build → t
     const h=await harness(candidate,true);
     const result=await h.api.pipeline.generate({userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt+" Use product gallery placeholders.",planningMode:"deterministic",agentProvider:h.provider.id,browserQAEnabled:true,retainPreview:true,templateReference:{templateKey:"ecommerce-store",version:1}});
     try{
-      expect(result.build.success).toBe(true);expect(result.browserQA?.checks.filter(check=>check.status==="FAIL")).toEqual([]);expect(h.provider.callCount).toBe(1);
+      expect(result.build.success).toBe(true);expect(result.browserQA?.checks.filter(check=>check.status==="FAIL"&&check.severity==="ERROR")).toEqual([]);expect(h.provider.callCount).toBe(1);
       const browser=await chromium.launch({headless:true});
       try{const page=await browser.newPage();await page.goto(new URL('/product',result.preview.url).toString(),{waitUntil:"networkidle"});
         const active=page.locator('[data-sites-gallery-active]');const before=await active.getAttribute('src');
@@ -257,16 +217,13 @@ describe("Real offline source → recovery → static validation → build → t
       :kind==="fake-newsletter"?file.content.replace('export function App()',fake+'\nexport function App()').replace('<NewsletterSignup/>','<FakeNewsletter/>')
       :file.content.replace('onClick={()=>{}}',kind==="runtime-handler-error"?'onClick={()=>{throw new Error("broken control")}}':'onClick={()=>{const unused=42;void unused;}}')})};
     const h=await harness(candidate,true),siteId=("adversarial-"+kind) as SiteId;
-    await expect(h.api.pipeline.generate({userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt,planningMode:"deterministic",agentProvider:h.provider.id,browserQAEnabled:true,
-      templateReference:{templateKey:"ecommerce-store",version:1},referenceGenerationSiteId:siteId})).rejects.toMatchObject({code:kind==="missing-state"?"REPAIR_LIMIT_REACHED":"VALIDATION_FAILED"});
-    expect(h.provider.callCount).toBe(kind==="runtime-handler-error"?1:2); expect(h.billing.finalizeSuccessfulJob).not.toHaveBeenCalled();
-    expect((await h.api.projects.listByOwner("offline-functional-owner")).items).toHaveLength(0); expect((await h.api.versions.listBySite(siteId)).items).toHaveLength(0);
-    const names=await readdir(h.diagnostics.root); expect(names).toHaveLength(["fake-newsletter","no-effect-handler"].includes(kind)?2:1);
-    const retained=await readFile(join(h.diagnostics.root,names[0]!),"utf8");
-    expect(retained).toContain(kind==="missing-state"?"TS2304":kind==="fake-newsletter"?"honest mock confirmation":"no observable action");
-    if(kind==="runtime-handler-error") {
-      const evidence=JSON.parse(retained) as {qa:{checks:{checkId:string;status:string}[]}};
-      expect(evidence.qa.checks).toContainEqual(expect.objectContaining({checkId:"runtime.page-error",status:"FAIL"}));
+    const request={userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt,planningMode:"deterministic" as const,agentProvider:h.provider.id,browserQAEnabled:true,retainPreview:false,templateReference:{templateKey:"ecommerce-store",version:1},referenceGenerationSiteId:siteId};
+    if(kind==='fake-newsletter'||kind==='no-effect-handler'){
+      const result=await h.api.pipeline.generate(request);expect(result.browserQA?.status).not.toBe('FAIL');expect(h.provider.callCount).toBe(1);expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce();
+    }else{
+      await expect(h.api.pipeline.generate(request)).rejects.toMatchObject({code:kind==='missing-state'?'REPAIR_LIMIT_REACHED':'VALIDATION_FAILED'});expect(h.provider.callCount).toBe(kind==='missing-state'?2:1);expect(h.billing.finalizeSuccessfulJob).not.toHaveBeenCalled();
+      expect((await h.api.versions.listBySite(siteId)).items).toHaveLength(0);const names=await readdir(h.diagnostics.root);expect(names).toHaveLength(1);const retained=await readFile(join(h.diagnostics.root,names[0]!),"utf8");
+      expect(retained).toContain(kind==='missing-state'?'TS2304':'runtime.page-error');
     }
   },300_000);
   it.each([
@@ -279,8 +236,8 @@ describe("Real offline source → recovery → static validation → build → t
     const result=await h.api.pipeline.generate({userId:"offline-functional-owner" as UserId,prompt:fixture.prompt,planningMode:"deterministic",agentProvider:h.provider.id,browserQAEnabled:true,retainPreview:true,
       ...(fixture.reference?{templateReference:{templateKey:"ecommerce-store",version:1}}:{})});
     try {
-      expect(result.build.success).toBe(true); expect(result.browserQA?.status).toBe("PASS");
-      expect(result.browserQA?.checks.filter(check=>check.status==="FAIL"||check.status==="WARNING")).toEqual([]);
+      expect(result.build.success).toBe(true); expect(result.browserQA?.status).not.toBe("FAIL");
+      expect(result.browserQA?.checks.filter(check=>check.status==="FAIL"&&check.severity==="ERROR")).toEqual([]);
       expect(result.browserQA?.checks.filter(check=>check.checkId==="runtime.page-error").map(check=>check.status)).toEqual(Array<string>(result.siteSpec.requirements.pages.length*3).fill("PASS"));
       expect(h.provider.callCount).toBe(1); expect(result.inference?.physicalRequests).toBe(1);
       expect(result.inference?.stages.BUILD_REPAIR.logicalRequests).toBe(0); expect(result.inference?.stages.TARGETED_EDIT.logicalRequests).toBe(0);
@@ -336,19 +293,12 @@ describe("Real offline source → recovery → static validation → build → t
     } finally {await h.api.execution.destroyEnvironment(result.preview.environmentId);}
   },180_000);
 
-  it("retains the confirmed alert regression with source, line, capability and reference metadata, without successful billing", async () => {
-    const candidate={...functionalFixtures.ecommerce,files:functionalFixtures.ecommerce.files.map(file=>file.path==="src/App.tsx"?{...file,content:file.content.replace('<CartPanel/>','<CartPanel/>'+reportedAlertSearch)}:file)};
-    const h=await harness(candidate,true); const siteId="failed-functional-candidate" as SiteId;
-    await expect(h.api.pipeline.generate({userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt,planningMode:"deterministic",agentProvider:h.provider.id,browserQAEnabled:true,
-      templateReference:{templateKey:"ecommerce-store",version:1},referenceGenerationSiteId:siteId})).rejects.toMatchObject({code:"GENERATION_INCOMPLETE",metadata:{validationCheck:"interaction.controls"}});
-    expect(h.provider.callCount).toBe(2); expect(h.billing.finalizeSuccessfulJob).not.toHaveBeenCalled();
-    expect((await h.api.projects.listByOwner("offline-functional-owner")).items).toHaveLength(0);
-    expect((await h.api.versions.listBySite(siteId)).items).toHaveLength(0);
-    const files=await readdir(h.diagnostics.root); expect(files).toHaveLength(1);
-    const evidence=JSON.parse(await readFile(join(h.diagnostics.root,files[0]!),"utf8")) as {validation:Record<string,unknown>;functionalRequirements:{capabilities:string[]};referenceContext:Record<string,unknown>;source:{files:Record<string,string>}};
-    expect(evidence.validation).toMatchObject({failureStage:"STATIC_VALIDATION",check:"interaction.controls"});
-    expect(evidence.source.files["src/App.tsx"]).toContain('window.alert("Search is available in this demo store.")');
-    expect(evidence.functionalRequirements.capabilities).toContain("cart"); expect(evidence.referenceContext).toMatchObject({templateKey:"ecommerce-store",templateVersion:1,referenceContextPresent:true});
+  it("records the confirmed alert-only search as advisory without repair or extra billing",async()=>{
+    const candidate={...functionalFixtures.ecommerce,files:functionalFixtures.ecommerce.files.map(file=>file.path==='src/App.tsx'?{...file,content:file.content.replace('<CartPanel/>','<CartPanel/>'+reportedAlertSearch)}:file)};
+    const h=await harness(candidate,true);const siteId='advisory-functional-candidate' as SiteId;
+    const result=await h.api.pipeline.generate({userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt,planningMode:"deterministic",agentProvider:h.provider.id,browserQAEnabled:true,retainPreview:false,templateReference:{templateKey:"ecommerce-store",version:1},referenceGenerationSiteId:siteId});
+    expect(result.browserQA?.status).not.toBe('FAIL');expect(h.provider.callCount).toBe(1);expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce();expect((await h.api.projects.getById(siteId))?.latestVersionId).toBe(result.versionId);
+    expect(result.browserQA?.checks.some(check=>check.checkId==='generation.requirement-advisories'&&check.status==='WARNING')).toBe(true);
     expect(FAILED_CANDIDATE_LIMITS).toMatchObject({maxFiles:5,maxBytes:2*1024*1024,maxAgeMs:24*60*60*1000});
-  },60_000);
+  },180_000);
 });

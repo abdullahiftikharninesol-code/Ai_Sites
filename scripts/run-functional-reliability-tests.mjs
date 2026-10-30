@@ -13,6 +13,7 @@ const suites = supplied.length ? supplied : [
   "tests/production-functional-behavior.test.ts", "tests/production-functional-pipeline.test.ts",
   "tests/route-aware-functional-contract.test.ts", "tests/route-aware-behavior.test.ts",
   "tests/accordion-reliability.test.ts", "tests/build-repair-reliability.test.ts",
+  "tests/universal-generation-reliability.test.ts", "tests/phase-3d-3-browser-qa-runner.test.ts",
 ];
 const result = spawnSync(process.execPath, [join(root, "node_modules/vitest/vitest.mjs"), "run", ...suites, "--maxWorkers=1", "--testTimeout=300000"], {
   cwd: root, stdio: "inherit", env: { ...process.env,

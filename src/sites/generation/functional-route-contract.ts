@@ -18,6 +18,8 @@ export interface FunctionalRequirement {
 }
 export interface ResolvedFunctionalContract {
   readonly version: 1;
+  readonly acceptancePolicy?: "USABLE_WEBSITE";
+  readonly advisories?: readonly { readonly check: string; readonly message: string }[];
   readonly pages: readonly { readonly id: string; readonly name: string; readonly route: string; readonly sourceEvidence: readonly FunctionalSourceReference[] }[];
   readonly actualRoutes: readonly string[];
   readonly requirements: readonly FunctionalRequirement[];
@@ -81,7 +83,13 @@ export function assignFunctionalRequirements(prompt: string, capabilities: reado
   };
   const result: FunctionalRequirement[] = [];
   for (const capability of capabilities) {
-    const owners = pages.filter(page => page.start >= 0 && capabilityPattern[capability].test(functionalIntent(prompt.slice(page.start, page.end)).affirmative));
+    const owners = pages.filter(page => {
+      if (page.start < 0) return false;
+      const intent = functionalIntent(prompt.slice(page.start, page.end));
+      // Reuse the same vocabulary as requirement extraction (e.g. expandable
+      // questions), rather than losing ownership through a narrower regex.
+      return intent.capabilities.includes(capability) || capabilityPattern[capability].test(intent.affirmative);
+    });
     const defaultFamily = capability === "form" ? "contact" : capability === "tabs" ? "services" : capability === "category-filter" || capability === "dialog" ? "portfolio"
       : ["size", "quantity", "gallery", "cart", "product-navigation"].includes(capability) ? "product" : capability === "accordion" ? "faq" : "home";
     const preferred = pages.find(page => pageFamily(page.name) === defaultFamily) ?? (["accordion", "category-filter"].includes(capability) ? pages.find(page => pageFamily(page.name) === "home") : undefined);

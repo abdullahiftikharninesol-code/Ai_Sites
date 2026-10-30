@@ -256,8 +256,9 @@ export class PlaygroundService {
         this.#referenceGenerations.set(key, attempt);
       }
     }
-    const job = this.jobs.start("GENERATE", async (onIntelligence) => {
+    const job = this.jobs.start("GENERATE", async (onIntelligence, outerRequestId) => {
       const result = attempt?.result ?? await this.product.orchestrator.generateWebsite({
+        outerRequestId,
         userId: owner as UserId,
         prompt,
         // Planning is deterministic by default so one click spends provider

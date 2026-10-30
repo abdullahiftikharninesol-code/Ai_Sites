@@ -98,7 +98,8 @@ function ThemeToggle() {
 
   return (
     <button
-      className="theme-toggle"
+      className="sites-managed-theme-toggle"
+      data-sites-managed="theme-toggle"
       type="button"
       aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
       onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
@@ -517,7 +518,7 @@ pre {
   opacity: calc(var(--splash-strength) * 0.3);
   filter: none;
 }
-.theme-toggle {
+[data-sites-managed="theme-toggle"] {
   position: fixed;
   right: max(1rem, env(safe-area-inset-right, 0px));
   bottom: max(1rem, env(safe-area-inset-bottom, 0px));
@@ -533,11 +534,11 @@ pre {
   box-shadow: var(--shadow);
   transition: color 150ms ease, border-color 150ms ease;
 }
-.theme-toggle:hover {
+[data-sites-managed="theme-toggle"]:hover {
   color: var(--ink);
   border-color: var(--ink-faint);
 }
-.theme-toggle svg {
+[data-sites-managed="theme-toggle"] svg {
   width: 1.05rem;
   height: 1.05rem;
 }

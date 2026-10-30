@@ -7,7 +7,7 @@ import { editTextDigest, exactMatchOffsets, explicitlyAuthorizedGlobalRename, pa
   type SiteEditPatchContext, type SiteEditPatchDiagnostic } from "./site-edit-patch-resolver.js";
 import { parseEditRequirements, validateEditRequirements } from "./edit-requirements.js";
 import { explicitlyAuthorizedProtectedPatch, independentScopedPatches, protectedEditValues, scopeError, validateEditScopeCompletion, validateProtectedEditValues } from "./edit-scope.js";
-import { applyValidatedBuildRepairPatches, type BuildRepairPatchDiagnostic } from "./build-repair-patch-resolver.js";
+import { applyValidatedBuildRepairPatches, type BuildRepairPatchDiagnostic, type BuildRepairPreflightOptions } from "./build-repair-patch-resolver.js";
 import type { BuildRepairSourceSnapshot } from "./build-repair-source.js";
 
 export interface SiteCoderFileBundleFile {
@@ -242,8 +242,9 @@ export async function applyBuildRepairPatchBundle(
   bundle: BuildRepairPatchBundle,
   snapshot?: BuildRepairSourceSnapshot,
   onDiagnostics?: (diagnostics: readonly BuildRepairPatchDiagnostic[]) => void,
+  options?: BuildRepairPreflightOptions,
 ): Promise<void> {
-  await applyValidatedBuildRepairPatches(execution, environmentId, validateBuildRepairPatchBundle(bundle), snapshot, onDiagnostics);
+  await applyValidatedBuildRepairPatches(execution, environmentId, validateBuildRepairPatchBundle(bundle), snapshot, onDiagnostics, options);
 }
 
 export const SITE_CODER_FILE_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unknown>> = Object.freeze({

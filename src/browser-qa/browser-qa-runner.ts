@@ -12,6 +12,7 @@ import {
   type BrowserQAViewport,
 } from "./browser-qa-domain.js";
 import type { BrowserQACheckDefinition } from "./browser-qa-check-registry.js";
+import { classifyBrowserQAFailure } from "./browser-qa-failure.js";
 
 export interface BrowserQAPreviewTarget {
   readonly baseUrl: string;
@@ -58,6 +59,7 @@ export interface BrowserQACheckExecutor {
   readonly definition: BrowserQACheckDefinition;
   /** Deterministic route/viewport scope; an excluded check is recorded SKIPPED. */
   readonly appliesTo?: (route: string, viewport: BrowserQAViewport) => boolean;
+  readonly afterInteractions?: boolean;
   execute(context: BrowserQAPageContext): Promise<BrowserQACheckResult>;
 }
 
@@ -119,6 +121,7 @@ export class BrowserQARunner {
 
   async run(request: BrowserQARunRequest): Promise<BrowserQAReport> {
     const started = this.#now();
+    const wallStarted = Date.now();
     const policy = { ...DEFAULT_BROWSER_QA_RUNNER_POLICY, ...request.policy };
     const baseUrl = validatePreviewUrl(request.target.baseUrl);
     const allowedOrigins = new Set([
@@ -130,17 +133,29 @@ export class BrowserQARunner {
     const checks: BrowserQACheckResult[] = [];
     const screenshotRefs: string[] = [];
     const screenshots: BrowserQAScreenshotDescriptor[] = [];
-    const browser = await this.#launchWithRetry(policy);
+    let browser: Browser;
+    try { browser = await this.#launchWithRetry(policy); }
+    catch (error) {
+      const completed = this.#now();
+      return createBrowserQAReport({ runId: request.runId, ...request.target,
+        browser: { name: "chromium" }, viewports, routes,
+        checks: [createBrowserQACheckResult({ checkId: "qa.infrastructure", category: "RUNTIME", status: "FAIL", severity: "ERROR", failureKind: "QA_INFRASTRUCTURE_FAILURE",
+          message: `Browser QA could not launch its browser: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2000) })],
+        startedAt: started.toISOString(), completedAt: completed.toISOString(), durationMs: completed.getTime() - started.getTime() });
+    }
     this.#activeBrowsers++;
     try {
       routeRuns: for (const viewport of viewports) {
         for (const route of routes) {
-          if (this.#now().getTime() - started.getTime() > policy.totalTimeoutMs) {
+          const remainingMs = policy.totalTimeoutMs - Math.max(this.#now().getTime() - started.getTime(), Date.now() - wallStarted);
+          if (remainingMs <= 0) {
             checks.push(createBrowserQACheckResult({ checkId: "qa.run-budget", category: "RUNTIME", status: "FAIL", severity: "ERROR", route, viewport,
+              failureKind: "RUN_DEADLINE_EXCEEDED",
               message: "Browser QA total run timeout exceeded; remaining routes were not validated" }));
             break routeRuns;
           }
-          const pageResult = await this.#runPage({
+          let pageResult: { readonly checks: readonly BrowserQACheckResult[] };
+          try { pageResult = await this.#runPage({
             browser,
             baseUrl,
             allowedOrigins,
@@ -151,13 +166,19 @@ export class BrowserQARunner {
             policy,
             screenshotRefs,
             screenshots,
-          });
+            budgetMs: Math.min(policy.perPageTimeoutMs, remainingMs),
+            runBudget: remainingMs <= policy.perPageTimeoutMs,
+          }); } catch (error) {
+            checks.push(createBrowserQACheckResult({ checkId: "qa.infrastructure", category: "RUNTIME", status: "FAIL", severity: "ERROR", route, viewport,
+              failureKind: "QA_INFRASTRUCTURE_FAILURE", message: `Browser QA route execution failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2000) }));
+            break routeRuns;
+          }
           checks.push(...pageResult.checks);
+          if (pageResult.checks.some(check => check.failureKind === "RUN_DEADLINE_EXCEEDED")) break routeRuns;
         }
       }
     } finally {
-      await browser.close();
-      this.#activeBrowsers--;
+      try { await browser.close(); } finally { this.#activeBrowsers--; }
     }
     const completed = this.#now();
     return createBrowserQAReport({
@@ -199,6 +220,8 @@ export class BrowserQARunner {
     readonly policy: BrowserQARunnerPolicy;
     readonly screenshotRefs: string[];
     readonly screenshots: BrowserQAScreenshotDescriptor[];
+    readonly budgetMs: number;
+    readonly runBudget: boolean;
   }): Promise<{ readonly checks: readonly BrowserQACheckResult[] }> {
     const events: MutableBrowserQAObservedEvents = {
       pageErrors: [],
@@ -211,6 +234,7 @@ export class BrowserQARunner {
       popups: [],
       downloads: [],
     };
+    const pageStarted = Date.now();
     const context = await input.browser.newContext({
       viewport: { width: input.viewport.width, height: input.viewport.height },
       permissions: [...input.policy.permissions],
@@ -218,6 +242,15 @@ export class BrowserQARunner {
       serviceWorkers: "block",
     });
     let page: Page | undefined;
+    const pageChecks: BrowserQACheckResult[] = [];
+    let expired = false;
+    // Cancel outstanding browser actions, not just the Promise awaiting them.
+    const deadline = setTimeout(() => { expired = true; void context.close().catch(() => undefined); }, Math.max(1, input.budgetMs - (Date.now() - pageStarted)));
+    const deadlineResult = () => ({ checks: [...pageChecks, createBrowserQACheckResult({
+      checkId: input.runBudget ? "qa.run-budget" : "qa.page-budget", category: "RUNTIME", status: "FAIL", severity: "ERROR",
+      failureKind: input.runBudget ? "RUN_DEADLINE_EXCEEDED" : "ROUTE_DEADLINE_EXCEEDED", route: input.route, viewport: input.viewport,
+      message: input.runBudget ? "Browser QA total run timeout exceeded; remaining work was not validated" : "Browser QA route deadline exceeded; this route was not completely validated",
+    })] });
     let openingProbe = false;
     try {
       await context.route("**/*", async (route) => {
@@ -259,7 +292,6 @@ export class BrowserQARunner {
       await page.emulateMedia({ reducedMotion: input.policy.reducedMotion ? "reduce" : "no-preference" });
       const destination = new URL(input.route, input.baseUrl);
       if (destination.origin !== input.baseUrl.origin) throw new BrowserQAPolicyError("Browser QA routes must remain on the preview origin");
-      const pageChecks: BrowserQACheckResult[] = [];
       try {
         const response = await page.goto(destination.toString(), { waitUntil: "domcontentloaded", timeout: input.policy.navigationTimeoutMs });
         if (!response || !response.ok())
@@ -291,6 +323,7 @@ export class BrowserQARunner {
           severity: "ERROR",
           route: input.route,
           viewport: input.viewport,
+          failureKind: "NAVIGATION_FAILURE",
           message: `Preview route navigation failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2_000),
         }));
       }
@@ -314,10 +347,14 @@ export class BrowserQARunner {
       // startup errors before interactions would permanently record PASS even
       // when a later required control throws an uncaught exception.
       const finalEventChecks = new Set(["runtime.page-error", "runtime.console-error"]);
-      const orderedChecks = [...input.checks.filter(check => !finalEventChecks.has(check.definition.checkId)),
+      const finalCheck = (check: BrowserQACheckExecutor) => check.afterInteractions || finalEventChecks.has(check.definition.checkId);
+      const orderedChecks = [...input.checks.filter(check => !finalCheck(check)),
+        ...input.checks.filter(check => check.afterInteractions && !finalEventChecks.has(check.definition.checkId)),
         ...input.checks.filter(check => finalEventChecks.has(check.definition.checkId))];
       for (const check of orderedChecks) {
+        if (expired) return deadlineResult();
         let probe: Page | undefined;
+        let routeLimitedCheck = false;
         try {
           if (check.appliesTo && !check.appliesTo(input.route, input.viewport)) {
             pageChecks.push(createBrowserQACheckResult({ checkId: check.definition.checkId, category: check.definition.category, status: "SKIPPED",
@@ -336,13 +373,18 @@ export class BrowserQARunner {
             if (!response?.ok()) throw new Error(`Interaction route failed to load (${response?.status() ?? "no response"})`);
             await probe.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done()))));
           }
-          pageChecks.push(await withTimeout(check.execute(probe ? { ...pageContext, page: probe, get events() { return freezeEvents(events); } } : pageContext), check.definition.timeoutMs, check.definition.checkId));
+          const remainingMs = input.budgetMs - (Date.now() - pageStarted) - Math.min(250, input.budgetMs / 10);
+          if (remainingMs <= 0) { expired = true; return deadlineResult(); }
+          routeLimitedCheck = remainingMs < check.definition.timeoutMs;
+          pageChecks.push(await withTimeout(check.execute(probe ? { ...pageContext, page: probe, get events() { return freezeEvents(events); } } : pageContext), Math.min(check.definition.timeoutMs, remainingMs), check.definition.checkId));
         } catch (error) {
+          if (routeLimitedCheck && error instanceof BrowserQATimeoutError) expired = true;
           pageChecks.push(createBrowserQACheckResult({
             checkId: check.definition.checkId,
             category: check.definition.category,
             status: "FAIL",
             severity: "ERROR",
+            failureKind: classifyBrowserQAFailure(error, check.definition.checkId),
             route: input.route,
             viewport: input.viewport,
             message: `Browser QA check failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2_000),
@@ -351,8 +393,12 @@ export class BrowserQARunner {
           await probe?.close();
         }
       }
-      return { checks: pageChecks };
+      return expired ? deadlineResult() : { checks: pageChecks };
+    } catch (error) {
+      if (expired) return deadlineResult();
+      throw error;
     } finally {
+      clearTimeout(deadline);
       await context.close();
     }
   }

@@ -3,11 +3,15 @@ import { chromium, type Browser, type Page } from "playwright";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { functionalRequirements, assertFunctionalBackendSupport, functionalGenerationContract } from "../src/sites/generation/functional-capabilities.js";
 import { functionalPageSurface, meaningfulPageContent, probeTabs } from "../src/browser-qa/functional-surfaces.js";
-import { probeCategoryFiltering, probeMobileNavigation } from "../src/browser-qa/functional-route-probes.js";
+import { probeCategoryFiltering, probeMobileNavigation, probeRequiredNavigation } from "../src/browser-qa/functional-route-probes.js";
+import type { ResolvedFunctionalContract } from "../src/sites/generation/functional-route-contract.js";
 import { BrowserQARunner } from "../src/browser-qa/browser-qa-runner.js";
 import { browserQACoreCheckExecutors } from "../src/browser-qa/browser-qa-core-checks.js";
 import { BROWSER_QA_VIEWPORTS, createBrowserQACheckResult } from "../src/browser-qa/browser-qa-domain.js";
 import { probeDialogBehavior } from "../src/browser-qa/dialog-behavior.js";
+import { probeAccordionBehavior } from "../src/browser-qa/accordion-behavior.js";
+import { DEFAULT_MAIN_TSX, DEFAULT_STYLES_CSS } from "../src/sites/scaffold/react-vite-scaffold.js";
+import { browserQARuntimeChecks } from "../src/browser-qa/browser-qa-runtime-checks.js";
 
 let browser: Browser;
 const servers: Server[] = [];
@@ -15,6 +19,59 @@ beforeAll(async () => { browser = await chromium.launch({ headless: true }); });
 afterAll(async () => {
   await browser?.close();
   await Promise.all(servers.map(server => new Promise<void>(done => { server.closeAllConnections(); server.close(() => done()); })));
+});
+
+describe("Actual OrbitDesk QA recognition failures", () => {
+  it("does not test a decorated mobile menu as an accordion alongside real FAQ answers",async()=>{
+    const page=await pageFor('<header><button aria-expanded="false" aria-controls="mobile-menu" onclick="this.setAttribute(\'aria-expanded\',\'true\')">Menu ＋</button></header><main><h1>Home</h1><details><summary>Can teams collaborate?</summary><p>Teams share milestones and decisions in one workspace.</p></details></main>',390);
+    try{await probeAccordionBehavior(page);expect(await page.locator('button').getAttribute('aria-expanded')).toBe('false');expect(await page.locator('details').getAttribute('open')).toBeNull();}finally{await page.close();}
+  });
+  it.each(["Menu ＋", "Open navigation menu", "Toggle main menu", "☰ Navigation"])("proves a real conditional menu with accessible name %s", async label => {
+    const page = await pageFor(`<header><button aria-expanded="false" aria-controls="navigation" onclick="const open=this.getAttribute('aria-expanded')!=='true';this.setAttribute('aria-expanded',String(open));const slot=document.getElementById('slot');if(open){const nav=document.createElement('nav');nav.id='navigation';nav.innerHTML='<a href=/features>Features</a><a href=/contact>Contact</a>';slot.replaceChildren(nav);}else slot.replaceChildren();">${label}</button><div id="slot"></div></header><main><h1>Home</h1><p>Useful product information.</p></main>`,390);
+    try { await probeMobileNavigation(page); expect(await page.locator("button").getAttribute("aria-expanded")).toBe("false"); expect(await page.locator("nav").count()).toBe(0); } finally { await page.close(); }
+  });
+  it.each(["h2", "h3"])("accepts meaningful visible page content titled with %s", async tag => {
+    const page = await pageFor(`<main><${tag}>Features</${tag}><p>Practical planning, collaboration and reporting for busy teams.</p></main>`);
+    try { await expect(meaningfulPageContent(page,"Features")).resolves.toBeUndefined(); } finally { await page.close(); }
+  });
+  it("follows real navigation with decorated menu labels and h2 page titles", async () => {
+    const page = await pageFor(`<header><button aria-expanded="false" aria-controls="navigation" onclick="this.setAttribute('aria-expanded','true');document.querySelector('nav').hidden=false">Menu ＋</button><nav id="navigation" hidden><a href="/features">Features</a><a href="/pricing">Pricing</a></nav></header><main><h2 id="title"></h2><p>Useful, route-specific product content with meaningful explanations.</p></main><script>document.getElementById('title').textContent=location.pathname==='/'?'Home':location.pathname.slice(1);</script>`,390);
+    const contract: ResolvedFunctionalContract = { version:1,actualRoutes:["/","/features","/pricing"],requirements:[],pages: [{ id:"home",name:"Home",route:"/",sourceEvidence:[] },{id:"features",name:"Features",route:"/features",sourceEvidence:[]},{id:"pricing",name:"Pricing",route:"/pricing",sourceEvidence:[]}] };
+    try { expect((await probeRequiredNavigation({page,route:"/",viewport:{id:"MOBILE",width:390,height:1000}} as Parameters<typeof probeRequiredNavigation>[0],contract)).status).toBe("PASS"); } finally { await page.close(); }
+  });
+  it.each([false,true])("discovers a menu from its navigation relation without English naming, conditional=%s",async conditional=>{
+    const nav='<nav id="navigation"><a href="/features">Features</a></nav>';
+    const page=await pageFor(`<header><button aria-label="Browse pages" aria-expanded="false" aria-controls="navigation" onclick="const open=this.getAttribute('aria-expanded')!=='true';this.setAttribute('aria-expanded',String(open));${conditional?"const slot=document.getElementById('slot');if(open){const nav=document.createElement('nav');nav.id='navigation';nav.innerHTML='<a href=/features>Features</a>';slot.replaceChildren(nav);}else slot.replaceChildren();":"document.querySelector('nav').hidden=!open;"}">☰</button><div id="slot">${conditional?'':nav.replace('<nav ','<nav hidden ')}</div></header>`,390);
+    try {await probeMobileNavigation(page);}finally{await page.close();}
+  });
+  it("does not mistake an expanded FAQ with navigation links for a mobile menu",async()=>{
+    const page=await pageFor('<main><h2>FAQ</h2><button aria-expanded="true" aria-controls="answer">How does navigation work?</button><p id="answer">Read our <a href="/features">features</a>.</p></main>');
+    try {await expect(probeMobileNavigation(page)).rejects.toThrow(/mobile menu is absent/);expect(await page.locator('#answer').isVisible()).toBe(true);}finally{await page.close();}
+  });
+  it("ignores a hidden h1 when the current page has visible semantic headings and real content",async()=>{
+    const page=await pageFor('<main><h1 hidden>Old page</h1><div role="heading" aria-level="2">Features</div><p>Useful information about planning and collaboration.</p></main>');
+    try {await meaningfulPageContent(page,'Features');}finally{await page.close();}
+  });
+  it.each(['<div id="root"><header hidden>Hidden shell</header><main><h2>Features</h2><p>Real feature information.</p></main></div>','<div id="root"></div><main><h2>Features</h2><p>Real feature information.</p></main>'])("does not mistake an empty root or hidden first child for an unloaded page",async html=>{
+    const page=await pageFor(html);try{await meaningfulPageContent(page,'Features');}finally{await page.close();}
+  });
+  it.each(['unreachable','wrong-route'])("keeps %s required navigation blocking",async kind=>{
+    const link=kind==='unreachable'?'':'<a href="/features" onclick="event.preventDefault();history.pushState({},\'\',\'/wrong\')">Features</a>';
+    const page=await pageFor(`<header>${link}</header><main><h2>Home</h2><p>Useful, visible product information.</p></main>`);
+    const contract:ResolvedFunctionalContract={version:1,pages:[{id:'features',name:'Features',route:'/features',sourceEvidence:[]}],actualRoutes:['/','/features'],requirements:[]};
+    try{await expect(probeRequiredNavigation({page,route:'/',viewport:{id:'DESKTOP',width:1440,height:1000}} as Parameters<typeof probeRequiredNavigation>[0],contract)).rejects.toThrow(/no reachable navigation|did not reach/);}finally{await page.close();}
+  });
+  it.each(['<h2>Features</h2>','<h2>Features</h2><p hidden>Hidden description</p>','<h2>Features</h2><nav><a href="/">Home</a></nav>'])("still rejects heading-only pages and hidden/boilerplate content: %s",async body=>{
+    const page=await pageFor('<main>'+body+'</main>');try{await expect(meaningfulPageContent(page,'Features')).rejects.toThrow(/empty content/);}finally{await page.close();}
+  });
+  it.each(['h1','h2'])("keeps heading hierarchy visible in the advisory accessibility check: %s",async tag=>{
+    const page=await pageFor(`<main><${tag}>Features</${tag}><p>Meaningful page content.</p></main>`);
+    try {
+      const check=browserQARuntimeChecks.find(check=>check.definition.checkId==='accessibility-smoke')!;
+      const result=await check.execute({page,context:page.context(),route:'/',viewport:{id:'DESKTOP',width:1440,height:1000},events:{pageErrors:[],consoleErrors:[],consoleWarnings:[],failedRequests:[],badResponses:[],blockedRequests:[],dialogs:[],popups:[],downloads:[]}});
+      expect(result.status).toBe(tag==='h1'?'PASS':'WARNING');expect(result.severity).toBe('WARNING');
+    }finally{await page.close();}
+  });
 });
 async function pageFor(html: string, width = 1440): Promise<Page> {
   const server = createServer((_request, response) => { response.writeHead(200, { "content-type": "text/html" }); response.end(html); });
@@ -51,6 +108,21 @@ describe("Prompt requirements without prefix truncation or Markdown-negation mis
 });
 
 describe("Behavioral equivalence for the retained live markup pattern", () => {
+  it.each([1440, 768, 390])("keeps the managed theme control separate from a generated theme-toggle at width %i", async width => {
+    // Exact collision pattern from pipeline f5a347bc: generated CSS plus the
+    // scaffold's own button/CSS, not a guessed overlap or a forced click.
+    const managedClass = /className="([^"]+)"/.exec(DEFAULT_MAIN_TSX)![1]!;
+    const managedMarker = DEFAULT_MAIN_TSX.includes('data-sites-managed="theme-toggle"') ? 'data-sites-managed="theme-toggle"' : "";
+    const page = await pageFor(`<html><head><style>${DEFAULT_STYLES_CSS}\n.portfolio-nav{position:relative;z-index:2;padding:1.4rem}.nav-inner{display:flex;justify-content:space-between}.theme-toggle{border:1px solid;padding:.5rem .85rem}</style></head><body><header class="portfolio-nav"><div class="nav-inner"><a href="/">Portfolio</a><button class="theme-toggle" aria-pressed="false" onclick="this.setAttribute('aria-pressed','true');this.textContent='Light mode'">Dark mode</button></div></header><main><h1>Portfolio</h1></main><button class="${managedClass}" ${managedMarker} aria-label="Switch to dark theme" onclick="document.documentElement.dataset.theme='dark'"><svg viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg></button></body></html>`, width);
+    try {
+      const generated = page.getByRole("button", { name: "Dark mode", exact: true });
+      await generated.hover({ timeout: 800 });
+      await generated.click({ timeout: 800 });
+      expect(await page.getByRole("button", { name: "Light mode", exact: true }).getAttribute("aria-pressed", { timeout: 800 })).toBe("true");
+      await page.getByRole("button", { name: "Switch to dark theme", exact: true }).click({ timeout: 800 });
+      expect(await page.locator("html").getAttribute("data-theme")).toBe("dark");
+    } finally { await page.close(); }
+  });
   it.each([1440, 768, 390])("pins the Menu-to-Close toggle across React-style replacement at width %i", async width => {
     const page = await pageFor(`<html><body><div id="slot"></div><script>let menuOpen=false;function renderMenu(){document.getElementById('slot').innerHTML='<button aria-expanded="'+menuOpen+'" aria-controls="mobile-navigation" onclick="menuOpen=!menuOpen;renderMenu()">'+(menuOpen?'Close':'Menu')+'</button>'+(menuOpen?'<nav id="mobile-navigation"><a href="/services">Services</a><a href="/work">Work</a></nav>':'')}renderMenu()</script></body></html>`, width);
     try { await probeMobileNavigation(page); expect(await page.getByRole("button").innerText()).toBe("Menu"); } finally { await page.close(); }
@@ -112,6 +184,14 @@ describe("Behavioral equivalence for the retained live markup pattern", () => {
   });
   it.each(["missing", "decorative", "wrong-panel", "never-restore"])("rejects %s tabs", async kind => {
     const page = await pageFor(`<html><body><main><h1>Services</h1><section><div role="tablist">${kind === "missing" ? "" : `<button role="tab" aria-selected="true" onclick="choose(this,0)">Strategy</button><button role="tab" aria-selected="false" ${kind === "wrong-panel" ? 'aria-controls="invented"' : ""} onclick="choose(this,1)">Design</button>`}</div><div id="content">A meaningful strategy and discovery workshop.</div></section></main><script>function choose(button,index){button.parentElement.querySelectorAll('button').forEach(item=>item.setAttribute('aria-selected',String(item===button)));${kind === "decorative" ? "" : "document.getElementById('content').textContent=" + (kind === "never-restore" ? "'Accessible digital design with working prototypes.'" : "index?'Accessible digital design with working prototypes.':'A meaningful strategy and discovery workshop.'")}}</script></body></html>`);
+    try { await expect(probeTabs(page, page.locator("main"))).rejects.toThrow(); } finally { await page.close(); }
+  });
+  it.each(["Accessible digital experiences.", "£29/month"])("accepts short meaningful tab content without a word-count requirement: %s", async content => {
+    const page = await pageFor(`<main><h1>Services</h1><div role="tablist"><button role="tab" aria-selected="true" aria-controls="panel" onclick="choose(this,false)">Strategy</button><button role="tab" aria-selected="false" aria-controls="panel" onclick="choose(this,true)">Design</button></div><div role="tabpanel" id="panel">Practical strategy and clear delivery planning.</div></main><script>function choose(button,other){document.querySelectorAll('[role=tab]').forEach(tab=>tab.setAttribute('aria-selected',String(tab===button)));document.getElementById('panel').textContent=other?${JSON.stringify(content)}:'Practical strategy and clear delivery planning.'}</script>`);
+    try { await probeTabs(page, page.locator("main")); } finally { await page.close(); }
+  });
+  it.each(["Design", "", "...", "Practical strategy and clear delivery planning."])("rejects empty, label-only or unchanged tab content: %s", async content => {
+    const page = await pageFor(`<main><h1>Services</h1><div role="tablist"><button role="tab" aria-selected="true" aria-controls="panel" onclick="choose(this,false)">Strategy</button><button role="tab" aria-selected="false" aria-controls="panel" onclick="choose(this,true)">Design</button></div><div role="tabpanel" id="panel">Practical strategy and clear delivery planning.</div></main><script>function choose(button,other){document.querySelectorAll('[role=tab]').forEach(tab=>tab.setAttribute('aria-selected',String(tab===button)));document.getElementById('panel').textContent=other?${JSON.stringify(content)}:'Practical strategy and clear delivery planning.'}</script>`);
     try { await expect(probeTabs(page, page.locator("main"))).rejects.toThrow(); } finally { await page.close(); }
   });
   it.each([false, true])("requires meaningful local panel changes from custom button tabs (decorative=%s)", async decorative => {

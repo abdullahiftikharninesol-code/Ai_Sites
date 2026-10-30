@@ -4,6 +4,9 @@ import type { ExecutionProvider } from "../../execution/execution-provider.js";
 import type { BuildRepairPatchBundle } from "./site-coder-file-bundle.js";
 import { exactMatchOffsets, patchLocations, type PatchLocation } from "./site-edit-patch-resolver.js";
 import { createBuildRepairSourceSnapshot, repairDigest, repairSourceRevision, type BuildRepairSourceSnapshot } from "./build-repair-source.js";
+import { compilerRepairSourceIssue } from "./build-repair-source-safety.js";
+
+export interface BuildRepairPreflightOptions { readonly compilerSafety?: boolean }
 
 export interface BuildRepairPatchDiagnostic {
   readonly path: string;
@@ -15,6 +18,9 @@ export interface BuildRepairPatchDiagnostic {
   readonly resolution: string;
 }
 export interface BuildRepairEvidence {
+  /** Private development capture only; never attach proposal/source to public error metadata. */
+  readonly requestSnapshot?: BuildRepairSourceSnapshot;
+  readonly proposal?: BuildRepairPatchBundle;
   readonly attempt: number;
   readonly kind: "build" | "navigation" | "interaction" | "functional";
   readonly sourceRevision: string;
@@ -90,6 +96,7 @@ export async function applyValidatedBuildRepairPatches(
   bundle: BuildRepairPatchBundle,
   suppliedSnapshot?: BuildRepairSourceSnapshot,
   onDiagnostics?: (diagnostics: readonly BuildRepairPatchDiagnostic[]) => void,
+  options: BuildRepairPreflightOptions = {},
 ): Promise<void> {
   const diagnostics: BuildRepairPatchDiagnostic[] = [];
   const current: { path: string; content: string }[] = [];
@@ -137,6 +144,10 @@ export async function applyValidatedBuildRepairPatches(
     let content = snapshot.files.find(file => file.path === path)!.content;
     for (const patch of [...patches].sort((a, b) => b.start - a.start)) content = content.slice(0, patch.start) + patch.replace + content.slice(patch.end);
     staged.set(path, content);
+  }
+  if (options.compilerSafety) for (const [path, content] of staged) {
+    const issue = compilerRepairSourceIssue(path, snapshot.files.find(file => file.path === path)!.content, content);
+    if (issue) reject(issue.message, issue.reason, path);
   }
   // Catch asynchronous changes during matching/preflight as well as provider time.
   for (const file of snapshot.files) {

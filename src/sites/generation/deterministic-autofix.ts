@@ -1,6 +1,8 @@
 import type { ExecutionProvider } from "../../execution/execution-provider.js";
 import { posix } from "node:path";
 import { resolveLocalImportPath } from "./import-validator.js";
+import { isEditableSiteEditPath } from "../../cli/runtime/site-coder-file-bundle.js";
+import { redundantJsxClosingRepair } from "../../cli/runtime/build-repair-source-safety.js";
 
 export interface DeterministicAutofixEvidence {
   readonly id: string;
@@ -169,6 +171,19 @@ img, video, canvas, iframe { display: block; max-width: 100%; height: auto; }
 export async function applyDeterministicBuildRepair(
   execution: Pick<ExecutionProvider, "listFiles" | "readFile" | "writeFile">,
   environmentId: string,
+  options: { readonly repairRedundantJsxClosings?: boolean } = {},
 ): Promise<DeterministicAutofixResult> {
-  return applyDeterministicAutofix(execution, environmentId);
+  const result = await applyDeterministicAutofix(execution, environmentId);
+  if (!options.repairRedundantJsxClosings) return result;
+  const fixes = [...result.fixes];
+  for (const entry of await execution.listFiles(environmentId)) {
+    if (entry.type !== "FILE" || !isEditableSiteEditPath(entry.path) || !/^src\/.+\.[jt]sx?$/.test(entry.path)) continue;
+    const source = await execution.readFile(environmentId, entry.path), repaired = redundantJsxClosingRepair(entry.path, source);
+    if (!repaired || await execution.readFile(environmentId, entry.path) !== source) continue;
+    await execution.writeFile(environmentId, entry.path, repaired.content);
+    fixes.push(Object.freeze({ id: "REDUNDANT_JSX_CLOSING_TAG", filesChanged: Object.freeze([entry.path]),
+      reason: "Removed one redundant consecutive JSX closing tag after proving zero syntax errors and preserving every other source byte and form control",
+      before: Object.freeze([`${entry.path}:${repaired.line}:${repaired.column}:TS17002`]), after: Object.freeze([`${entry.path}:jsx-syntax-valid`]) }));
+  }
+  return Object.freeze({ changed: result.changed || fixes.length > result.fixes.length, fixes: Object.freeze(fixes) });
 }

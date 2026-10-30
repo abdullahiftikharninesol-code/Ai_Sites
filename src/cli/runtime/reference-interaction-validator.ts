@@ -114,8 +114,8 @@ export function validateStaticFragmentNavigation(bundle: SiteCoderFileBundle): v
 }
 
 /** Rejects obvious screenshot-only controls before a reference-based site is saved. */
-export function validateReferenceInteractions(bundle: SiteCoderFileBundle): void {
-  validateStaticFragmentNavigation(bundle);
+export function validateReferenceInteractions(bundle: SiteCoderFileBundle, options: { readonly fragments?: boolean } = {}): void {
+  if (options.fragments !== false) validateStaticFragmentNavigation(bundle);
   const issues: string[] = [];
   for (const file of bundle.files) {
     if (!/\.(?:tsx|jsx)$/i.test(file.path)) continue;

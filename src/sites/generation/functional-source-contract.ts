@@ -96,7 +96,15 @@ export function functionalSourceManifest(bundle: SiteCoderFileBundle): Functiona
   for (const file of files.values()) {
     const routeVariables = new Set<string>(), conditions = new Map<string, string>(), routerObjects = new Set<ts.Node>();
     const locations = new Set(["location", "window.location", "document.location"]);
-    const isPathValue = (node: ts.Node): boolean => ts.isIdentifier(node) && routeVariables.has(node.text) || ts.isPropertyAccessExpression(node) && node.name.text === "pathname" && locations.has(node.expression.getText(file));
+    const isPathValue = (node: ts.Node): boolean => {
+      if (ts.isParenthesizedExpression(node)) return isPathValue(node.expression);
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.BarBarToken && text(node.right) === "/") return isPathValue(node.left);
+      // Recognize only the proved trailing-slash normalization. Arbitrary
+      // replace calls or values named pathname cannot establish routing.
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "replace" && node.arguments.length === 2 &&
+        ["/\\/$/", "/\\/+$/"].includes(node.arguments[0]!.getText(file)) && text(node.arguments[1]) === "") return isPathValue(node.expression.expression);
+      return ts.isIdentifier(node) && routeVariables.has(node.text) || ts.isPropertyAccessExpression(node) && node.name.text === "pathname" && locations.has(node.expression.getText(file));
+    };
     const comparison = (node: ts.Expression): string | undefined => {
       if (ts.isParenthesizedExpression(node)) return comparison(node.expression);
       if (ts.isIdentifier(node)) return conditions.get(node.text);
@@ -280,11 +288,39 @@ export function resolveFunctionalSourceContract(spec: SiteSpec, bundle: SiteCode
   return { version: 1, pages, actualRoutes: manifest.routes.map(route => route.path), requirements };
 }
 export function applyFunctionalSourceContract(spec: SiteSpec, contract: ResolvedFunctionalContract): SiteSpec {
-  const pages = spec.requirements.pages.map(page => {
+  const pages = (contract.acceptancePolicy === "USABLE_WEBSITE" ? spec.requirements.pages.filter(page => contract.pages.some(item => equivalentPage(item.name, page.name))) : spec.requirements.pages).map(page => {
     const resolved = contract.pages.find(item => equivalentPage(item.name, page.name));
     return resolved ? { ...page, path: resolved.route } : page;
   });
   for (const route of contract.actualRoutes) if (!pages.some(page => page.path === route)) pages.push({ name: route === "/" ? "Home" : route.split("/").filter(Boolean).at(-1)!, path: route });
   const functional: FunctionalRequirements | undefined = spec.requirements.functional ? { ...spec.requirements.functional, requirements: contract.requirements } : undefined;
   return { ...spec, requirements: { ...spec.requirements, pages, ...(functional ? { functional } : {}) } };
+}
+
+/** Initial generation accepts a usable implementation, not a complete prompt checklist.
+ * Strict resolution above remains available to template/edit tooling and tests. */
+export function resolveUsableGenerationSourceContract(spec: SiteSpec, bundle: SiteCoderFileBundle): ResolvedFunctionalContract {
+  const manifest = functionalSourceManifest(bundle);
+  const advisories: { check: string; message: string }[] = [];
+  const pages: ResolvedFunctionalContract["pages"][number][] = [];
+  for (const page of requestedPages(spec.project.description ?? "")) {
+    const candidates = manifest.routes.filter(route => route.labels.some(label => equivalentPage(label, page.name)));
+    const route = candidates.find(route => route.path === page.path) ?? (candidates.length === 1 ? candidates[0] : undefined);
+    if (!route || pages.some(item => item.route === route.path)) {
+      advisories.push({ check: "functional.completion", message: `Requested page ${page.name} has no uniquely recognized implementation` });
+    } else pages.push({ id: page.id, name: page.name, route: route.path, sourceEvidence: route.sourceEvidence });
+  }
+  const requirements = (spec.requirements.functional?.requirements ?? []).flatMap(requirement => {
+    const page = pages.find(page => page.id === requirement.target.pageId);
+    let candidates = manifest.routes.filter(route => !requirement.target.pageId || (page ? route.path === page.route : route.labels.some(label => equivalentPage(label, requirement.target.pageName ?? requirement.target.pageId!))));
+    if (requirement.target.sectionId) candidates = candidates.filter(route => !route.sectionIdsComplete || route.sections.includes(requirement.target.sectionId!));
+    if (!candidates.length || candidates.every(route => route.capabilityAssessments[requirement.capability].state === "PROVEN_MISSING")) {
+      advisories.push({ check: "functional.completion", message: `Requested ${requirement.capability} has no recognized control on ${requirement.target.pageName ?? "its assigned surface"}` });
+      return [];
+    }
+    if (candidates.every(route => route.capabilityAssessments[requirement.capability].state !== "RECOGNIZED"))
+      advisories.push({ check: "functional.completion", message: `Requested ${requirement.capability} uses an uncertain implementation; full requirement behavior is not an acceptance gate` });
+    return [{ ...requirement, routes: candidates.map(route => route.path), sourceEvidence: candidates.flatMap(route => route.sourceEvidence).slice(0, 8) }];
+  });
+  return { version: 1, acceptancePolicy: "USABLE_WEBSITE", pages, actualRoutes: manifest.routes.map(route => route.path), requirements, advisories };
 }

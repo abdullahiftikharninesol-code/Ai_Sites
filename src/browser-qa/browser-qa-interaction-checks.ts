@@ -1,3 +1,4 @@
+import { FunctionalValidationError } from "./browser-qa-failure.js";
 import {
   createBrowserQACheckResult,
   type BrowserQACheckResult,
@@ -25,8 +26,8 @@ export async function closeVisibleDialog(page: Page): Promise<boolean> {
     const close = dialog.getByRole("button", { name: /^close(?:\s|$)/i }).last();
     if (await close.count() && await close.isVisible()) await close.click({ timeout: 800 });
     else if (await dialog.evaluate(element => element.tagName === "DIALOG")) await page.keyboard.press("Escape");
-    else throw new Error("Opened dialog has no usable Close control");
-    if (await dialog.isVisible()) throw new Error("Dialog Close control does not close its panel");
+    else throw new FunctionalValidationError("Opened dialog has no usable Close control");
+    if (await dialog.isVisible()) throw new FunctionalValidationError("Dialog Close control does not close its panel");
     return true;
   }
   return false;
@@ -38,26 +39,26 @@ export async function probeSizeSelection(page: Page | Locator): Promise<void> {
     const current = await select.inputValue();
     const options = await select.locator("option").evaluateAll(items => items.filter(item => !(item as HTMLOptionElement).disabled).map(item => (item as HTMLOptionElement).value));
     const alternative = options.find(value => value && value !== current);
-    if (!alternative) throw new Error("Size selector has no alternative usable option");
+    if (!alternative) throw new FunctionalValidationError("Size selector has no alternative usable option");
     await select.selectOption(alternative);
-    if (await select.inputValue() !== alternative) throw new Error("Size selection does not change");
+    if (await select.inputValue() !== alternative) throw new FunctionalValidationError("Size selection does not change");
     return;
   }
   const sizes = page.getByRole("button", { name: /^(?:(?:select\s+)?size\s+)?(?:XS|S|M|L|XL|XXL)$/i });
   for (const size of await sizes.all()) {
     if (!(await size.isVisible()) || !(await size.isEnabled()) || await size.getAttribute("aria-pressed") === "true") continue;
     await size.click({ timeout: 800 });
-    if (await size.getAttribute("aria-pressed") !== "true") throw new Error("Size selection exposes no accessible selected state");
+    if (await size.getAttribute("aria-pressed") !== "true") throw new FunctionalValidationError("Size selection exposes no accessible selected state");
     return;
   }
   const group = page.getByRole("radiogroup", { name: /size/i });
   for (const radio of await group.getByRole("radio").all()) {
     if (await radio.isChecked() || !(await radio.isEnabled())) continue;
     await radio.check({ timeout: 800 });
-    if (!(await radio.isChecked())) throw new Error("Size selection does not change");
+    if (!(await radio.isChecked())) throw new FunctionalValidationError("Size selection does not change");
     return;
   }
-  throw new Error("Requested accessible size control is missing");
+  throw new FunctionalValidationError("Requested accessible size control is missing");
 }
 async function restoreExpansion(page: Page, control: Locator, before: string | null): Promise<void> {
   if (await control.getAttribute("aria-expanded") === before) return;

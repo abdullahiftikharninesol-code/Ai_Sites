@@ -53,6 +53,10 @@ export const browserQARuntimeChecks: readonly BrowserQACheckExecutor[] = [
     async execute(context) {
       const findings = await context.page.evaluate(() => {
         const issues: string[] = [];
+        const visible = (element: Element) => !!element.getClientRects().length && !["hidden", "collapse"].includes(getComputedStyle(element).visibility) && !element.closest('[hidden],[aria-hidden="true"]');
+        const content = document.querySelector('main,[role="main"]') ?? document.querySelector("#root,#app") ?? document.body;
+        if ([...content.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')].some(visible) && ![...content.querySelectorAll('h1,[role="heading"][aria-level="1"]')].some(visible))
+          issues.push("Page has visible headings but no primary level-one heading");
         const accessibleName = (element: Element): string => {
           const aria = element.getAttribute("aria-label")?.trim();
           if (aria) return aria;

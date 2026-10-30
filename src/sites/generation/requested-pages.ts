@@ -38,7 +38,7 @@ export function requestedPages(prompt: string): readonly RequestedPage[] {
     }
   }
   const lines = [...prompt.matchAll(/[^\n]*\n|[^\n]+$/g)];
-  let active: typeof found[number] | undefined, pagesBlock = false;
+  let active: typeof found[number] | undefined, pagesBlock = false, activeHeadingLevel = 0;
   for (const line of lines) {
     const raw = line[0].trim();
     const text = raw.replace(/^#{1,6}\s*/, "").replace(/^[*-]\s+|^\d+[.)]\s+/, "").replace(/\*\*|__|`/g, "").trim();
@@ -47,14 +47,18 @@ export function requestedPages(prompt: string): readonly RequestedPage[] {
       if (active) active.end = line.index;
       active = undefined; pagesBlock = false; continue;
     }
-    const name = text.replace(/\s*\(\/[^)]*\)/, "").replace(/\s+(?:page|screen|view)\s*:?$/i, "").replace(/:$/, "");
+    const numbered = /^(?:page|screen|view)\s+\d+\s*(?:[—–:-]\s*|\.\s+)(.+)$/i.exec(text);
+    const headingLevel = /^#+/.exec(raw)?.[0].length ?? 0;
+    if (active && activeHeadingLevel && headingLevel > activeHeadingLevel && !numbered) continue;
+    const name = (numbered?.[1] ?? text).replace(/\s*\(\/[^)]*\)/, "").replace(/\s+(?:page|screen|view)\s*:?$/i, "").replace(/:$/, "").trim();
     const known = Object.values(families).flat().includes(pageId(name));
     const decorated = /^#{1,6}\s|^\*\*[^*]+\*\*\s*:?$|^\d+[.)]\s/.test(raw);
-    const header = known && !/^[-*]\s/.test(raw) || pagesBlock && decorated && !/^#{1,2}\s/.test(raw) && /^[A-Z][\w &'-]{1,50}$/.test(name);
+    const header = !!numbered || known && !/^[-*]\s/.test(raw) || pagesBlock && decorated && !/^#{1,2}\s/.test(raw) && /^[A-Z][\w &'-]{1,50}$/.test(name);
     if (header) {
       if (active) active.end = line.index;
       add(name, line.index, prompt.length, /\((\/[^\s)]+)\)/.exec(text)?.[1]);
       active = found.find(page => page.id === pageId(name));
+      activeHeadingLevel = headingLevel;
     } else if (/^#{1,3}\s/.test(raw) || /^(?:global|shared|site-wide|interactive functionality|functional requirements)\b/i.test(text)) {
       if (active) active.end = line.index;
       active = undefined; pagesBlock = false;

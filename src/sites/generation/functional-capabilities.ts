@@ -11,6 +11,8 @@ export type FunctionalCapability = "cart" | "quantity" | "size" | "gallery" | "c
 export interface FunctionalRequirements {
   readonly version: 1;
   readonly capabilities: readonly FunctionalCapability[];
+  readonly optionalCapabilities?: readonly FunctionalCapability[];
+  readonly excludedCapabilities?: readonly FunctionalCapability[];
   readonly backendRequired: boolean;
   readonly unsupportedTransactions: boolean;
   readonly requirements?: readonly FunctionalRequirement[];
@@ -18,11 +20,14 @@ export interface FunctionalRequirements {
 }
 /** Explicit behavior only; visual adjectives/template controls never add requirements. */
 export function functionalRequirements(prompt: string): FunctionalRequirements {
-  const { affirmative, capabilities, conflicts } = functionalIntent(prompt);
+  const { affirmative, capabilities, optionalCapabilities, excludedCapabilities, conflicts } = functionalIntent(prompt);
+  const unsupportedTransactions = /\b(?:(?:real|live)\s+(?:payments?|payment processing|checkout|bookings?|reservations?)|process\s+(?:(?:live|real)\s+)?payments|charge\s+(?:credit\s+)?cards|persistent bookings|send (?:actual|real) emails)\b/i.test(affirmative);
   return Object.freeze({ version: 1, capabilities: Object.freeze(capabilities), requirements: Object.freeze(assignFunctionalRequirements(prompt, capabilities)),
     ...(conflicts.length ? { conflictingCapabilities: Object.freeze(conflicts) } : {}),
-    backendRequired: /\b(?:real backend|persistent submissions|send (?:actual|real) emails|real account creation|real payments|process payments|charge cards|persistent bookings)\b/i.test(affirmative),
-    unsupportedTransactions: /\b(?:real payments|process payments|charge cards|persistent bookings|send (?:actual|real) emails)\b/i.test(affirmative) });
+    ...(optionalCapabilities.length ? { optionalCapabilities: Object.freeze(optionalCapabilities) } : {}),
+    ...(excludedCapabilities.length ? { excludedCapabilities: Object.freeze(excludedCapabilities) } : {}),
+    backendRequired: unsupportedTransactions || /\b(?:real backend|persistent submissions|real account creation)\b/i.test(affirmative),
+    unsupportedTransactions });
 }
 export function assertFunctionalRequestConsistency(requirements: FunctionalRequirements): void {
   if (requirements.conflictingCapabilities?.length)
@@ -79,8 +84,10 @@ const contracts: Record<FunctionalCapability, string> = {
   newsletter: 'NewsletterSignup: className?; required valid email and visible demo-only confirmation. Never claim actual subscription, email delivery, account creation or payment.',
 };
 export function functionalGenerationContract(requirements: FunctionalRequirements): string {
-  if (!requirements.capabilities.length) return "";
-  return ["Functional capability contract v1 (mandatory requested behavior):",
+  const boundaries = [requirements.optionalCapabilities?.length ? `Optional suggestions, not mandatory completion gates: ${requirements.optionalCapabilities.join(", ")}. If shown, controls must work.` : "",
+    requirements.excludedCapabilities?.length ? `Explicitly excluded capabilities: ${requirements.excludedCapabilities.join(", ")}. Do not add them.` : ""].filter(Boolean);
+  if (!requirements.capabilities.length) return boundaries.join("\n");
+  return ["Functional capability contract v1 (mandatory requested behavior):", ...boundaries,
     "Prefer verified named imports from ./sites-ui/functional; style with className/CSS. Equivalent custom behavior is allowed. No empty/alert-only callbacks or fake destinations.",
     "PageContent({children,className?}) renders main; SiteLink accepts standard anchor props including onClick. Use useEffect with cleanup for listeners. Custom tabs: aria-selected, aria-controls, real tabpanel. Mobile menus: aria-expanded, linked navigation panel. Never add empty semantic markers.",
     ...requirements.capabilities.map(id => `${id}: ${contracts[id]}`),

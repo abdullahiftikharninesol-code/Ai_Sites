@@ -54,6 +54,14 @@ async function noticeReport(markup: string, viewport = BROWSER_QA_VIEWPORTS[0]!)
 }
 
 describe("Observable visibility and meaningful dismissals", () => {
+  it.each([false,true])("keeps independent resets and all twelve control positions after batching metadata, brokenLast=%s",async brokenLast=>{
+    const buttons=Array.from({length:10},(_,index)=>`<button onclick="if(!window.alreadyTested){window.alreadyTested=true;${brokenLast&&index===9?'':`document.getElementById('result').textContent='Action ${index}'`}}">Action ${index}</button>`).join('');
+    const report=await noticeReport('<button aria-pressed="true">Selected</button><button disabled>Disabled</button>'+buttons+'<p id="result">Initial state</p>');
+    expect(controlCheck.definition.timeoutMs).toBe(8000);
+    const check=report.checks.find(check=>check.checkId==='functional.controls');
+    expect(check).toMatchObject({status:brokenLast?'FAIL':'PASS',severity:'ERROR'});
+    if(brokenLast)expect(check?.message).toContain('Button has no observable action: Action 9');
+  });
   it.each(["Build a simple landing page", "Clothing store with Add to Cart and size selection"])("supplies whole-region dismissal guidance without adding unrelated capabilities: %s", requestText => {
     const context = buildCapabilityAwareGenerationContext({ profile: SITE_V1_TECHNICAL_PROFILE, requestText });
     expect(context).toContain("Dismiss/close controls must hide or remove the associated content");

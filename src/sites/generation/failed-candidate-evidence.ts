@@ -63,16 +63,34 @@ function functionalContractSummary(value: unknown) {
   };
 }
 
-function buildRepairSummary(value: BuildRepairEvidence | undefined) {
+function buildRepairSummary(value: BuildRepairEvidence | undefined, clean: (value: string) => string) {
   if (!value) return undefined;
   const digest = (input: string | undefined) => input && /^[a-f0-9]{64}$/.test(input) ? input : undefined;
   const code = (input: string) => /^[A-Z_]{1,64}$/.test(input) ? input : undefined;
+  const scanner = new SiteArtifactSecurityScanner();
+  const sourceText = (path: string, content: string): string | undefined => {
+    if (Buffer.byteLength(content) > 32_000 || content.includes("\0")) return undefined;
+    try { scanner.scan([{ path, content }]); } catch { return undefined; }
+    return clean(content);
+  };
   return {
     attempt: Number.isSafeInteger(value.attempt) && value.attempt > 0 ? value.attempt : undefined,
     kind: ["build", "navigation", "interaction", "functional"].includes(value.kind) ? value.kind : undefined,
     sourceRevision: digest(value.sourceRevision), currentSourceRevision: digest(value.currentSourceRevision), contextDigest: digest(value.contextDigest),
     initialDiagnostics: value.initialDiagnostics.slice(0, 8_000), billingState: value.billingState === "NOT_FINALIZED" ? value.billingState : undefined,
     result: code(value.result),
+    requestSnapshot: value.requestSnapshot ? {
+      revision: digest(value.requestSnapshot.revision), contextDigest: digest(value.requestSnapshot.contextDigest),
+      context: sourceText("src/repair-context.ts", value.requestSnapshot.context),
+      files: value.requestSnapshot.files.slice(0, 64).filter(file => sourcePath.test(file.path) && !file.path.split("/").includes("..")).map(file => ({
+        path: file.path, digest: digest(file.digest), bytes: Buffer.byteLength(file.content),
+        excerpts: file.excerpts.slice(0, 128).map(range => ({ start: range.start, end: range.end })),
+      })),
+    } : undefined,
+    proposal: value.proposal ? { patches: value.proposal.patches.slice(0, 8).filter(patch => sourcePath.test(patch.path) && !patch.path.split("/").includes("..")).map(patch => ({
+      path: patch.path, findDigest: createHash("sha256").update(patch.find).digest("hex"), replacementDigest: createHash("sha256").update(patch.replace).digest("hex"),
+      find: sourceText(patch.path, patch.find), replace: sourceText(patch.path, patch.replace),
+    })) } : undefined,
     patches: value.patches.slice(0, 8).map(patch => ({
       path: sourcePath.test(patch.path) && !patch.path.split("/").includes("..") ? patch.path : undefined,
       findDigest: digest(patch.findDigest), sourceDigest: digest(patch.sourceDigest), currentSourceDigest: digest(patch.currentSourceDigest),
@@ -184,13 +202,13 @@ export class LocalFailedCandidateEvidence implements FailedCandidateEvidence {
       functionalRequirements: request.functionalRequirements, referenceContext: request.referenceContext,
       validation: request.validationFailure ?? { failureStage: "BROWSER_QA", buildPassed: true, reportStatus: report?.status },
       patchDiagnostics: patchDiagnosticSummary(request.patchDiagnostics),
-      buildRepair: buildRepairSummary(request.buildRepair),
+      buildRepair: buildRepairSummary(request.buildRepair, clean),
       functionalContract: functionalContractSummary(request.functionalContract),
       accounting: request.accounting ? { model: clean(request.accounting.model).slice(0, 80), role: request.accounting.role,
         logicalRequests: request.accounting.logicalRequests, physicalRequests: request.accounting.physicalRequests, billingStatus: request.accounting.billingStatus } : undefined,
       qa: report ? { summary: report.summary, routes: report.routes.slice(0, 50), viewports: report.viewports,
         checks: [...report.checks.filter(check => check.status === "FAIL"), ...report.checks.filter(check => check.status !== "FAIL")].slice(0, 256).map(check => ({ checkId: check.checkId, route: check.route, viewport: check.viewport,
-          status: check.status, severity: check.severity, message: clean(check.message).slice(0, 1000),
+          status: check.status, severity: check.severity, failureKind: check.failureKind, message: clean(check.message).slice(0, 2000),
           functionalProbes: check.functionalProbes?.slice(0, 64).map(probe => ({ requirementId: probe.requirementId, capability: probe.capability,
             expectedRoute: probe.expectedRoute, actualRoute: probe.actualRoute, result: probe.result, sourceAssessment: probe.sourceAssessment })),
           evidence: check.evidence?.filter(item => item.type === "element").slice(0, 30).map(item => ({

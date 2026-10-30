@@ -14,6 +14,8 @@ import type { UserId } from "../src/shared/types.js";
 import type { BuildRepairEvidence } from "../src/cli/runtime/build-repair-patch-resolver.js";
 import type { SiteCoderFileBundle } from "../src/cli/runtime/site-coder-file-bundle.js";
 import { compilerFind, compilerReplacement, vertexBundle, vertexPages, vertexPrompt } from "./fixtures/build-repair-sites.js";
+import { retainedVertexBundle, retainedVertexPrompt, rejectedVertexRepair } from "./fixtures/vertex-jsx-failure.js";
+import { redundantJsxClosingRepair } from "../src/cli/runtime/build-repair-source-safety.js";
 
 const parent = resolve(".sites-runtime/build-repair-offline-tests"), roots: string[] = [];
 const fixtureProviderId = "offline-build-repair-fixture";
@@ -26,7 +28,7 @@ afterEach(async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
-async function harness(candidate = vertexBundle, repair: (request: AgentRequest) => unknown = () => ({ patches: [{ path: "src/App.tsx", find: compilerFind, replace: compilerReplacement }] })) {
+async function harness(candidate = vertexBundle, repair: (request: AgentRequest) => unknown = () => ({ patches: [{ path: "src/App.tsx", find: compilerFind, replace: compilerReplacement }] }), options: { readonly prompt?: string; readonly useRealPlanner?: boolean } = {}) {
   vi.stubEnv("npm_config_offline", "true");
   await mkdir(parent, { recursive: true }); const root = await mkdtemp(join(parent, "case-")); roots.push(root);
   const requests: AgentRequest[] = [];
@@ -52,14 +54,47 @@ async function harness(candidate = vertexBundle, repair: (request: AgentRequest)
     orchestrationAgent: provider, billing: billing as unknown as SiteCreditBillingService, failedCandidateEvidence: diagnostics });
   // Supply the test's explicit five-page deterministic plan. The production
   // planning/classification rules, agents, inference limits and QA are unchanged.
-  const requirements = await new DeterministicRequirementsPlanner().plan(vertexPrompt);
-  vi.spyOn(DeterministicRequirementsPlanner.prototype, "plan").mockResolvedValue({ ...requirements, pages: vertexPages });
+  if (!options.useRealPlanner) {
+    const requirements = await new DeterministicRequirementsPlanner().plan(options.prompt ?? vertexPrompt);
+    vi.spyOn(DeterministicRequirementsPlanner.prototype, "plan").mockResolvedValue({ ...requirements, pages: vertexPages });
+  }
   return { product, provider, requests, billing, diagnostics, root };
 }
 const request = { userId: "offline-vertex-owner" as UserId, prompt: vertexPrompt, planningMode: "deterministic" as const,
   agentProvider: fixtureProviderId, browserQAEnabled: true, retainPreview: true };
 
 describe("Real scratch pipeline, compiler repair and unchanged QA gates", () => {
+  it("replays the exact failed Vertex request/source, preserves six fields and passes real five-page responsive QA without a model repair", async () => {
+    const h = await harness(retainedVertexBundle, () => rejectedVertexRepair, { prompt: retainedVertexPrompt, useRealPlanner: true });
+    const result = await h.product.pipeline.generate({ ...request, prompt: retainedVertexPrompt, retainPreview: false });
+    expect(result.build.success).toBe(true); expect(result.browserQA?.status).toBe("PASS");
+    expect(result.browserQA?.checks.filter(check => check.status === "FAIL")).toEqual([]);
+    expect(result.browserQA?.checks.filter(check => check.checkId === "runtime.page-error" && check.status !== "PASS")).toEqual([]);
+    expect(new Set(result.browserQA?.routes)).toEqual(new Set(["/", "/services", "/work", "/about", "/contact"]));
+    expect(new Set(result.browserQA?.viewports.map(viewport => viewport.id))).toEqual(new Set(["DESKTOP", "MOBILE", "TABLET"]));
+    expect(h.requests).toHaveLength(1); expect(result.inference?.stages.BUILD_REPAIR.logicalRequests).toBe(0);
+    const source = JSON.parse(Buffer.from((await h.product.artifacts.get(result.sourceArtifactRef))!).toString()) as { files: Record<string, string> };
+    expect(source.files["src/App.tsx"]).toBe(redundantJsxClosingRepair("src/App.tsx", retainedVertexBundle.files.find(file => file.path === "src/App.tsx")!.content)!.content);
+    for (const name of ["name", "email", "company", "service", "budget", "message"]) expect(source.files["src/App.tsx"]).toContain(`name="${name}"`);
+    expect((await h.product.projects.getById(result.siteId))?.latestVersionId).toBe(result.versionId);
+    expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce(); expect(h.product.browserQA.activeBrowserCount).toBe(0);
+    await writeFile(join(parent, "vertex-live-jsx-regression.json"), JSON.stringify({ kind: "OFFLINE_RETAINED_SOURCE_REAL_BUILD_QA", build: result.build, inference: result.inference, report: result.browserQA }, null, 2));
+  }, 240_000);
+  it("rejects a compiling model repair that deletes requested form fields, with no source commit or successful billing", async () => {
+    const path = "src/App.tsx", original = retainedVertexBundle.files.find(file => file.path === path)!.content;
+    const fixed = redundantJsxClosingRepair(path, original)!.content;
+    const badType = 'export const repairBudget: number = "4";';
+    const candidate = { ...retainedVertexBundle, files: retainedVertexBundle.files.map(file => file.path === path ? { ...file, content: fixed.replace("export function App()", badType + "\nexport function App()") } : file) };
+    const recorded = rejectedVertexRepair.patches[0]!;
+    const close = (source: string) => source.replace('</form>}</div></div></section></main>', '</form>}</div></section></main>');
+    const h = await harness(candidate, () => ({ patches: [{ path, find: badType, replace: "export const repairBudget: number = 4;" }, { path, find: close(recorded.find), replace: close(recorded.replace) }] }), { prompt: retainedVertexPrompt, useRealPlanner: true });
+    await expect(h.product.pipeline.generate({ ...request, prompt: retainedVertexPrompt, retainPreview: false }))
+      .rejects.toMatchObject({ code: "VALIDATION_FAILED", metadata: { failureStage: "PATCH_APPLICATION", reason: "REPAIR_FORM_CONTROL_REMOVED" } });
+    expect(h.requests).toHaveLength(2); expect(h.billing.finalizeSuccessfulJob).not.toHaveBeenCalled();
+    expect((await h.product.projects.listByOwner(request.userId)).items.every(project => !project.latestVersionId)).toBe(true);
+    const reports = await Promise.all((await readdir(h.diagnostics.root)).map(async name => JSON.parse(await readFile(join(h.diagnostics.root, name), "utf8")) as { source: { files: Record<string, string> } }));
+    for (const report of reports) for (const name of ["company", "service", "budget"]) expect(report.source.files[path]).toContain(`name="${name}"`);
+  }, 150_000);
   it("repairs an actual TS2322 failure after deterministic autofixes, builds and passes all five routes at all three viewports", async () => {
     const candidate = { ...vertexBundle, files: vertexBundle.files.map(file => file.path === "src/App.tsx"
       ? { ...file, content: file.content.replace('"./StudioFooter"', '"./StudioFooter.js"').replaceAll("\n", "\r\n") } : file) };

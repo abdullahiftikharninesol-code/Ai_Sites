@@ -41,8 +41,13 @@ export function templateReferenceSiteSpec(spec: SiteSpec, prompt: string): SiteS
 }
 
 /** Fail closed before materialization; no extra inference or repair loop is introduced. */
-export function validateTemplateReferenceBundle(bundle: SiteCoderFileBundle, reference: ResolvedTemplateDesignReference, prompt: string): void {
-  validateReferenceInteractions(bundle);
+export function validateTemplateReferenceBundle(bundle: SiteCoderFileBundle, reference: ResolvedTemplateDesignReference, prompt: string, options: { readonly acceptance?: "USABLE_WEBSITE" } = {}): readonly { readonly check: string; readonly message: string }[] {
+  if (options.acceptance !== "USABLE_WEBSITE") validateReferenceInteractions(bundle);
+  const advisories: { check: string; message: string }[] = [];
+  const incompleteIdentity = (message: string) => {
+    if (options.acceptance !== "USABLE_WEBSITE") throw new ApplicationError("GENERATION_INCOMPLETE", message);
+    advisories.push({ check: "template-reference.identity", message });
+  };
   const requested = requestedTemplateReferenceIdentity(prompt);
   const literals: string[] = [];
   for (const file of bundle.files) {
@@ -58,11 +63,12 @@ export function validateTemplateReferenceBundle(bundle: SiteCoderFileBundle, ref
   }
   const visibleCandidates = identity(literals.join(" "));
   if (requested && !visibleCandidates.includes(identity(requested)))
-    throw new ApplicationError("GENERATION_INCOMPLETE", "The generated application does not implement the requested business identity");
+    incompleteIdentity("The generated application does not implement the requested business identity");
   const forbidden = [...reference.originalBrands, ...(requested ? reference.originalProductNames : [])]
     .filter((value) => identity(value) !== identity(requested ?? ""));
   if (forbidden.some((value) => visibleCandidates.includes(identity(value)) || identity(bundle.siteName ?? "").includes(identity(value))))
-    throw new ApplicationError("GENERATION_INCOMPLETE", "Original template branding or placeholder products remain in the generated application");
+    incompleteIdentity("Original template branding or placeholder products remain in the generated application");
+  return advisories;
 }
 
 /** Browser-level identity/content and requested mock-commerce checks supplement, never replace, shared QA. */
