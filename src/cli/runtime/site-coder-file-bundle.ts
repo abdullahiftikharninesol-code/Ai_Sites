@@ -25,7 +25,7 @@ export interface BuildRepairPatchBundle {
 }
 
 /** "unique" must match exactly once; "all" replaces every exact occurrence. */
-export type SiteEditPatchMode = "unique" | "all";
+export type SiteEditPatchMode = "unique" | "all" | "create";
 
 export interface SiteEditPatch {
   readonly path: string;
@@ -44,13 +44,13 @@ export const SITE_EDIT_PATCH_BUNDLE_JSON_SCHEMA: Readonly<Record<string, unknown
     type: "object", additionalProperties: false, required: ["path", "find", "replace", "mode"],
     properties: {
       path: { type: "string" },
-      find: { type: "string", minLength: 1 },
+      find: { type: "string" },
       replace: { type: "string" },
       mode: {
         type: "string",
-        enum: ["unique", "all"],
+        enum: ["unique", "all", "create"],
         description:
-          "unique: 'find' must occur exactly once, so include surrounding source context. all: replace every exact occurrence, for deliberate repeated renames.",
+          "unique: exact anchored edit. all: deliberate repeated replacements. create: new editable src module only, with empty find and complete new source in replace; never overwrite an existing file.",
       },
     },
   } } },
@@ -75,32 +75,50 @@ export function validateSiteEditPatchBundle(value: unknown): SiteEditPatchBundle
     if (Object.keys(item).some(key => !["path", "find", "replace", "mode"].includes(key))) invalid(at, "unexpected patch fields");
     const patch = item as { path?: unknown; find?: unknown; replace?: unknown; mode?: unknown };
     if (typeof patch.path !== "string") invalid(`${at}.path`, "required string is missing or invalid");
-    if (typeof patch.find !== "string" || !patch.find) invalid(`${at}.find`, "required non-empty string is missing or invalid");
+    if (typeof patch.find !== "string" || (!patch.find && patch.mode !== "create")) invalid(`${at}.find`, "required non-empty string is missing or invalid");
     if (typeof patch.replace !== "string") invalid(`${at}.replace`, "required string is missing or invalid");
     if (!isEditableSiteEditPath(patch.path)) invalid(`${at}.path`, "disallowed path", true);
-    if (patch.mode !== undefined && patch.mode !== "unique" && patch.mode !== "all")
-      invalid(`${at}.mode`, 'mode must be "unique" or "all"');
+    if (patch.mode !== undefined && patch.mode !== "unique" && patch.mode !== "all" && patch.mode !== "create")
+      invalid(`${at}.mode`, 'mode must be "unique" or "all", or "create" for a new src module');
+    if (patch.mode === "create" && (patch.find !== "" || !patch.replace || !patch.path.startsWith("src/")))
+      invalid(at, "create requires a new editable src path, empty find and non-empty source");
     // Providers without strict schema support may omit the mode; unique is the safe default.
-    const mode: SiteEditPatchMode = patch.mode === "all" ? "all" : "unique";
+    const mode: SiteEditPatchMode = patch.mode === "create" ? "create" : patch.mode === "all" ? "all" : "unique";
     return Object.freeze({ path: patch.path, find: patch.find, replace: patch.replace, mode });
   })) });
 }
 
 export async function applySiteEditPatchBundle(
-  execution: Pick<ExecutionProvider, "readFile" | "writeFile">,
+  execution: Pick<ExecutionProvider, "readFile" | "writeFile"> & { fileExists?: (environmentId: string, path: string) => Promise<boolean> },
   environmentId: string,
   bundle: SiteEditPatchBundle,
   context?: SiteEditPatchContext & {
     readonly requirementSource?: ReadonlyMap<string, string> | undefined;
+    readonly sourceSnapshot?: ReadonlyMap<string, string>;
     readonly onScopeExclusion?: (count: number) => void;
   },
 ): Promise<readonly string[]> {
   const changed: string[] = [];
   const requirements = context ? parseEditRequirements(context.instruction) : undefined;
   const scope = requirements?.scope;
-  const original = new Map<string, string>();
-  for (const path of new Set([...bundle.patches.map(patch => patch.path), ...(context?.requirementSource?.keys() ?? [])]))
-    original.set(path, await execution.readFile(environmentId, path));
+  const snapshot = context?.sourceSnapshot ?? context?.requirementSource;
+  const original = new Map<string, string>(snapshot);
+  const creates = new Set(bundle.patches.filter(patch => patch.mode === "create").map(patch => patch.path));
+  for (const path of new Set(bundle.patches.map(patch => patch.path))) {
+    if (creates.has(path) && context?.requirementSource && !context.requirementSource.has(path)) {
+      if (!execution.fileExists || await execution.fileExists(environmentId, path))
+        throw new ApplicationError("VALIDATION_FAILED", `New-module target already exists or cannot be verified: ${path}`);
+      original.set(path, ""); continue;
+    }
+    const content = await execution.readFile(environmentId, path);
+    if (snapshot?.has(path) && snapshot.get(path) !== content)
+      throw new ApplicationError("VALIDATION_FAILED", `Edit source changed after context selection: ${path}`, {
+        metadata: { failureStage: "PATCH_APPLICATION", validationCheck: "edit.context", reason: "SOURCE_REVISION_CHANGED", path },
+      });
+    original.set(path, content);
+  }
+  for (const path of creates) if (!context?.requirementSource || context.requirementSource.has(path))
+    throw new ApplicationError("VALIDATION_FAILED", `New-module patch cannot overwrite existing or unverified source: ${path}`);
   const scoped = scope ? independentScopedPatches(bundle.patches, original, scope) : { patches: bundle.patches, excluded: [] };
   // Every find is written against the source the model was shown, but patches
   // apply in order. A later find overlapping text an earlier patch to the same
@@ -114,6 +132,18 @@ export async function applySiteEditPatchBundle(
   const applied: SiteEditPatch[] = [];
   for (const patch of scoped.patches) {
     const source = staged.get(patch.path) ?? original.get(patch.path)!;
+    if (patch.mode === "create") {
+      if (staged.has(patch.path)) throw new ApplicationError("VALIDATION_FAILED", `Duplicate new-module patch: ${patch.path}`);
+      staged.set(patch.path, patch.replace); changed.push(patch.path); continue;
+    }
+    if (context?.sourceRanges) {
+      const ranges = context.sourceRanges.get(patch.path), shownSource = original.get(patch.path)!;
+      const matches = exactMatchOffsets(shownSource, patch.find);
+      if (!ranges || !matches.length || matches.some(start => !ranges.some(range => range.start <= start && range.end >= start + patch.find.length)))
+        throw new ApplicationError("VALIDATION_FAILED", `Patch targets source outside supplied edit context: ${patch.path}`, {
+          metadata: { failureStage: "PATCH_APPLICATION", validationCheck: "edit.context", reason: "PATCH_OUTSIDE_SUPPLIED_REGIONS", path: patch.path },
+        });
+    }
     if (!shown.has(patch.path)) shown.set(patch.path, source);
     let find = patch.find;
     let offsets = exactMatchOffsets(source, find);
@@ -199,6 +229,10 @@ export async function applySiteEditPatchBundle(
       validateEditRequirements(requirements, context?.requirementSource ?? original, candidate);
       validateEditScopeCompletion(scope, context?.requirementSource ?? original, candidate);
     }
+  }
+  for (const path of staged.keys()) {
+    if (creates.has(path) ? await execution.fileExists!(environmentId, path) : await execution.readFile(environmentId, path) !== original.get(path))
+      throw new ApplicationError("VALIDATION_FAILED", `Edit source changed during patch preflight: ${path}`);
   }
   for (const [path, content] of staged) await execution.writeFile(environmentId, path, content);
   if (scoped.excluded.length) context?.onScopeExclusion?.(scoped.excluded.length);

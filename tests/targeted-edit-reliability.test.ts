@@ -7,6 +7,10 @@ import { AgentProviderRegistry } from "../src/agents/registry/agent-provider-reg
 import { MockAgentProvider } from "../src/agents/mock-agent-provider.js";
 import { createLocalSitesProduct } from "../src/sites/generation/create-local-sites-product.js";
 import { MockExecutionProvider } from "../src/execution/mock-execution-provider.js";
+import { InProcessAgentGateway } from "../src/agents/gateway/in-process-agent-gateway.js";
+import { LocalCliAgentRuntime } from "../src/cli/runtime/local-cli-agent-runtime.js";
+import type { AgentRequest } from "../src/agents/agent-types.js";
+import type { CliTask } from "../src/cli/protocol/cli-task.js";
 import {
   validateSiteEditPatchBundle,
   applySiteEditPatchBundle,
@@ -257,6 +261,130 @@ describe("Targeted Edit context selection", () => {
   });
 });
 
+describe("Targeted Edit large application context", () => {
+  const sizedSource = (bytes: number) => {
+    const source = 'export const eventTitle = "Original event";\n/*';
+    return source + "x".repeat(bytes - Buffer.byteLength(source) - 2) + "*/";
+  };
+  const indivisibleSource = (bytes: number) => 'export const eventTitle = "' + "x".repeat(bytes) + '";';
+
+  // Exercise the actual runtime request boundary without commands, browsers,
+  // disk workspaces or inference. The mock stops after capturing its input.
+  async function captureContext(
+    files: readonly { path: string; content: string }[],
+    instruction = "Change the event title",
+    limits: CliTask["limits"] = {},
+  ) {
+    const { execution, environmentId } = await workspaceWith(files);
+    const requests: AgentRequest[] = [];
+    const stop = new Error("Offline context captured");
+    const provider = new MockAgentProvider({ customResponse: request => {
+      requests.push(request);
+      throw stop;
+    } });
+    const capabilities = provider.getCapabilities();
+    provider.getCapabilities = () => ({ ...capabilities, maxInputTokens: 128_000 });
+    const registry = new AgentProviderRegistry();
+    registry.register(provider);
+    const runtime = new LocalCliAgentRuntime(new InProcessAgentGateway(registry), registry, execution as never);
+    let failure: unknown;
+    try {
+      await runtime.run(environmentId, { jobId: "large-context-test", siteId: "local-site", runtime: "LOCAL_CLI",
+        operation: "EDIT_SITE", agentProvider: "mock", userRequest: instruction, limits });
+    } catch (error) { failure = error; }
+    finally {
+      for (const file of files) expect(await execution.readFile(environmentId, file.path)).toBe(file.content);
+      expect(execution.getUsageMetrics(environmentId).commandsExecuted).toBe(0);
+      await execution.destroyEnvironment(environmentId);
+    }
+    return { requests, failure };
+  }
+
+  it.each([
+    ["src/App.tsx", 21_572],
+    ["src/App.jsx", 24_001],
+    ["src/pages/Explore.tsx", 32_000],
+    ["src/data/events.ts", 18_000],
+    ["src/data/events.json", 18_000],
+  ])("supplies all bytes of %s above the old 16,000-byte cutoff", async (path, bytes) => {
+    const content = path.endsWith(".json") ? JSON.stringify({ eventTitle: "x".repeat(bytes) }) : sizedSource(bytes);
+    const { requests } = await captureContext([{ path, content }]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.messages.map(message => message.content).join("\n")).toContain(`--- ${path}\n${content}`);
+  });
+
+  it("supplies the large application and shared module for a broad functionality edit", async () => {
+    const app = sizedSource(30_000), data = sizedSource(18_000);
+    const { requests } = await captureContext([
+      { path: "src/App.tsx", content: app }, { path: "src/data/events.ts", content: data },
+    ], "Make all event pages functional, including comparison");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.responseContract).toMatchObject({ name: "SiteCoderFileBundle" });
+    const content = requests[0]!.messages.map(message => message.content).join("\n");
+    expect(content).toContain(`--- src/App.tsx\n${app}`);
+    expect(content).toContain(`--- src/data/events.ts\n${data}`);
+  });
+
+  it("counts UTF-8 bytes while retaining complete source", async () => {
+    const app = 'export const eventTitle = "Original event";\n/*' + "界".repeat(6_000) + "*/";
+    expect(app.length).toBeLessThan(16_000);
+    expect(Buffer.byteLength(app)).toBeGreaterThan(16_000);
+    const { requests } = await captureContext([{ path: "src/App.tsx", content: app }]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.messages.map(message => message.content).join("\n")).toContain(app);
+  });
+
+  it("preserves the compact stylesheet excerpt while sending the complete large app", async () => {
+    const app = sizedSource(21_572), css = ":root { --accent: #2563eb; }\n/*" + "stylesheet-padding".repeat(1_100) + "*/";
+    const { requests } = await captureContext([
+      { path: "src/App.tsx", content: app }, { path: "src/site.css", content: css },
+    ], "Change the accent color to green");
+    expect(requests).toHaveLength(1);
+    const content = requests[0]!.messages.map(message => message.content).join("\n");
+    expect(content).toContain(app);
+    expect(content).toContain("src/site.css\nEXACT PATCHABLE EXCERPT");
+    expect(content).toContain(":root { --accent: #2563eb; }");
+    expect(content).not.toContain("stylesheet-padding");
+  });
+
+  it.each([
+    [{ path: "src/App.tsx", content: indivisibleSource(65_000) }],
+    [{ path: "src/App.tsx", content: indivisibleSource(40_000) }, { path: "src/data/events.ts", content: indivisibleSource(30_000) }],
+  ])("rejects required source exceeding the total budget before any provider request", async (...files) => {
+    const { requests, failure } = await captureContext(files, "Make all event pages functional");
+    expect(requests).toHaveLength(0);
+    expect(failure).toMatchObject({ code: "AGENT_RUN_BUDGET_EXCEEDED", metadata: {
+      validationCheck: "edit.context", reason: "REQUIRED_SOURCE_EXCEEDS_CONTEXT_LIMIT",
+    } });
+    expect((failure as { metadata: { maxContextBytes: number } }).metadata.maxContextBytes).toBeLessThanOrEqual(64_000);
+  });
+
+  it("does not bypass the total budget for a rename", async () => {
+    const content = 'export const eventTitle = "Original event ' + "x".repeat(65_000) + '";';
+    const { requests, failure } = await captureContext([{ path: "src/App.tsx", content }], 'Rename "Original event" to "New event"');
+    expect(requests).toHaveLength(0);
+    expect(failure).toMatchObject({ code: "AGENT_RUN_BUDGET_EXCEEDED", metadata: { validationCheck: "edit.context" } });
+  });
+
+  it("honors an explicitly supplied per-file limit without silently omitting source", async () => {
+    const { requests, failure } = await captureContext([{ path: "src/App.tsx", content: indivisibleSource(18_000) }],
+      "Change the event title", { maxFileBytes: 12_000 });
+    expect(requests).toHaveLength(0);
+    expect(failure).toMatchObject({ code: "AGENT_RUN_BUDGET_EXCEEDED", metadata: {
+      validationCheck: "edit.context", reason: "REQUIRED_SOURCE_EXCEEDS_FILE_LIMIT", path: "src/App.tsx",
+    } });
+  });
+
+  it("includes manifest and labels in the context bound", async () => {
+    const { requests, failure } = await captureContext([{ path: "src/App.tsx", content: indivisibleSource(16_000) }],
+      "Change the event title", { maxContextBytes: 16_001 });
+    expect(requests).toHaveLength(0);
+    expect(failure).toMatchObject({ code: "AGENT_RUN_BUDGET_EXCEEDED", metadata: {
+      validationCheck: "edit.context",
+    } });
+  });
+});
+
 describe("Targeted Edit design tokens", () => {
   it("treats a visual-direction request as style work", () => {
     const files = [
@@ -320,12 +448,16 @@ describe("Targeted Edit prompt caching", () => {
       customResponse: async (request) => {
         const content = request.messages.map((message) => message.content).join("\n");
         const isEdit = content.includes("SiteEditPatchBundle");
-        if (isEdit)
+        if (isEdit) {
           prompts.push({
             system: request.systemInstructions ?? "",
             content,
             boundary: request.cachePrefixChars ?? 0,
           });
+          // Inspect two requests against unchanged source; a no-op response is
+          // no longer a successful edit and must not be used as a cache fixture.
+          throw new Error("OFFLINE_CACHE_CONTEXT_CAPTURED");
+        }
         return {
           id: "r",
           model: request.model,
@@ -369,13 +501,13 @@ describe("Targeted Edit prompt caching", () => {
         // variable tail so the reusable prefix stays byte-identical.
         "Make the website dark",
       ])
-        await product.orchestrator.editWebsite({
+        await expect(product.orchestrator.editWebsite({
           userId: "u" as UserId,
           siteId: generated.siteId,
           instruction,
           agentProvider: "mock-agent",
           browserQAEnabled: false,
-        });
+        })).rejects.toThrow("OFFLINE_CACHE_CONTEXT_CAPTURED");
 
       expect(prompts).toHaveLength(2);
       const [first, second] = prompts;
@@ -400,11 +532,19 @@ describe("Targeted Edit prompt caching", () => {
 describe("Targeted Edit end to end", () => {
   it("uses a complete editable file bundle for a whole-site functionality request", async () => {
     const root = await mkdtemp(join(tmpdir(), "broad-functional-edit-"));
-    const entry = EMBER_GRAIN_FILES.find((file) => file.path === "src/App.tsx")!;
+    const originalEntry = EMBER_GRAIN_FILES.find((file) => file.path === "src/App.tsx")!;
+    // Match the live EventSphere application's size, retaining valid source.
+    const entry = { ...originalEntry, content: originalEntry.content + "\n/*" +
+      "x".repeat(21_572 - Buffer.byteLength(originalEntry.content) - 5) + "*/" };
+    const files = EMBER_GRAIN_FILES.map(file => file.path === entry.path ? entry : file);
     let broadSchema = "";
+    let broadContext = "";
     const provider = new MockAgentProvider({ customResponse: async (request) => {
       const broad = request.messages.some((message) => message.content.includes("make the pages functional as well"));
-      if (broad) broadSchema = request.responseContract?.type === "JSON_SCHEMA" ? request.responseContract.name : "";
+      if (broad) {
+        broadSchema = request.responseContract?.type === "JSON_SCHEMA" ? request.responseContract.name : "";
+        broadContext = request.messages.map(message => message.content).join("\n");
+      }
       return {
         id: "broad-edit-response", model: request.model,
         message: { role: "assistant", content: JSON.stringify({ files: broad
@@ -413,11 +553,13 @@ describe("Targeted Edit end to end", () => {
               { path: "src/site.css", content: "body { background: red; }" },
               { path: "src/styles.css", content: "body { background: red; }" },
             ]
-          : EMBER_GRAIN_FILES }) },
+          : files }) },
         toolCalls: [], usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 10, totalTokens: 20 },
         latencyMs: 1, finishReason: "stop" as const,
       };
     } });
+    const capabilities = provider.getCapabilities();
+    provider.getCapabilities = () => ({ ...capabilities, maxInputTokens: 128_000 });
     const registry = new AgentProviderRegistry();
     registry.register(provider);
     const product = createLocalSitesProduct({ executionRoot: join(root, "execution"), artifactRoot: join(root, "artifacts"), agentRegistry: registry, orchestrationAgent: provider, keepWorkspace: false });
@@ -425,6 +567,8 @@ describe("Targeted Edit end to end", () => {
       const generated = await product.orchestrator.generateWebsite({ userId: "u" as UserId, prompt: "Create a website for a neighborhood restaurant called Ember & Grain", planningMode: "deterministic", agentProvider: "mock", browserQAEnabled: false });
       const edited = await product.orchestrator.editWebsite({ userId: "u" as UserId, siteId: generated.siteId, instruction: "make the pages functional as well", agentProvider: "mock-agent", browserQAEnabled: false });
       expect(broadSchema).toBe("SiteCoderFileBundle");
+      expect(Buffer.byteLength(entry.content)).toBe(21_572);
+      expect(broadContext).toContain(`--- src/App.tsx\n${entry.content}`);
       expect(edited.build.success).toBe(true);
       const version = await product.versions.getById(edited.newVersionId);
       const snapshot = JSON.parse(Buffer.from((await product.artifacts.get(version!.sourceArtifactRef))!).toString("utf8")) as { files: Record<string, string> };

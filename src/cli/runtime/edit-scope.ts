@@ -75,6 +75,44 @@ export function targetedEditScopeGuidance(scope: DeterministicEditScope): string
   ].join("\n");
 }
 
+// Attributes/keys whose values are geometry or presentation, never a contact
+// destination: SVG viewBox/path/points data, inline styles and form examples.
+const NON_CONTACT_ATTRIBUTES = new Set(["placeholder", "viewbox", "d", "points", "transform", "style", "classname", "class",
+  "x", "y", "x1", "x2", "y1", "y2", "cx", "cy", "r", "rx", "ry", "width", "height", "stroke-dasharray", "strokedasharray",
+  "gradienttransform", "pattern", "inputmode", "autocomplete", "pathlength", "offset", "values", "keytimes", "keysplines"]);
+const NON_CONTACT_KEYS = new Set(["d", "points", "viewbox", "transform", "path", "placeholder", "pattern"]);
+const digitCount = (value: string) => value.replace(/\D/g, "").length;
+
+/** The enclosing quoted attribute or object-key name, judged from a bounded local prefix. */
+function enclosingName(source: string, start: number): string | undefined {
+  const prefix = source.slice(Math.max(0, start - 400), start);
+  const attribute = /([A-Za-z_:][\w:.-]*)\s*=\s*\{?\s*(["'`])[^"'`]*$/.exec(prefix);
+  if (attribute) return attribute[1]!.toLowerCase();
+  const key = /([A-Za-z_$][\w$]*)\s*:\s*(["'`])[^"'`]*$/.exec(prefix);
+  return key && NON_CONTACT_KEYS.has(key[1]!.toLowerCase()) ? key[1]!.toLowerCase() : undefined;
+}
+
+/** Excludes look-alikes that cannot be contact details (SVG/CSS numbers, dates, card numbers, form examples). */
+function contactCandidate(source: string, value: ProtectedValue, path?: string): boolean {
+  const name = enclosingName(source, value.start);
+  if (name && NON_CONTACT_ATTRIBUTES.has(name)) return false;
+  if (value.kind !== "phone") return true;
+  // Phone numbers are 7–15 digits (E.164); CSS never carries a contact phone.
+  const digits = digitCount(value.value);
+  if (digits < 7 || digits > 15 || path?.endsWith(".css")) return false;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value.value)) return false;
+  // Unseparated digit runs inside identifiers/hex/data are not displayed phone numbers.
+  if (/[\w#$.]$/.test(source.slice(Math.max(0, value.start - 1), value.start)) && !/[+(]$/.test(source.slice(Math.max(0, value.start - 1), value.start))) return false;
+  return true;
+}
+
+/** Same number written differently: "(512) 555-0147", "512-555-0147", "tel:+15125550147". */
+function samePhoneNumber(a: string, b: string): boolean {
+  const x = a.replace(/\D/g, ""), y = b.replace(/\D/g, "");
+  if (x.length < 7 || y.length < 7) return false;
+  return x === y || (x.endsWith(y) && x.length - y.length <= 3) || (y.endsWith(x) && y.length - x.length <= 3);
+}
+
 /** Non-overlapping protected literals, including tokens inside a larger exact anchor. */
 export function protectedEditValues(source: string, path?: string): ProtectedValue[] {
   const patterns: readonly [ProtectedKind, RegExp][] = [
@@ -99,6 +137,7 @@ export function protectedEditValues(source: string, path?: string): ProtectedVal
       !/\.(?:[jt]sx?|css|json|html?|svg|png|jpe?g|webp|gif|woff2?|mjs|cjs)$/i.test(value.value) &&
       (!parsed && !path?.endsWith('.css') || value.start === 0 && value.end === source.length || textRanges.some(range => range.start <= value.start && range.end >= value.end)));
   }
+  candidates = candidates.filter(value => contactCandidate(source, value, path));
   // Prefer the containing URL (e.g. mailto:) over the nested email/domain.
   candidates.sort((a, b) => a.start - b.start || b.end - a.end);
   const values: ProtectedValue[] = [];
@@ -113,8 +152,10 @@ export function maskProtectedEditValues(source: string): string {
 }
 
 function authorized(value: ProtectedValue, scope: DeterministicEditScope): boolean {
+  const phoneLike = value.kind === "phone" || value.value.startsWith("tel:");
   return scope.contactClauses.some(clause => {
-    if (!clause.includes(value.value) && !(value.value.startsWith("mailto:") && clause.includes(value.value.slice(7))) &&
+    const suppliedPhone = phoneLike && protectedEditValues(clause).some(supplied => supplied.kind === "phone" && samePhoneNumber(supplied.value, value.value));
+    if (!suppliedPhone && !clause.includes(value.value) && !(value.value.startsWith("mailto:") && clause.includes(value.value.slice(7))) &&
         !(value.value.startsWith("tel:") && clause.includes(value.value.slice(4)))) return false;
     return value.kind === "email" || value.value.startsWith("mailto:") ? /\b(?:email|e-mail|mailto|replace|change|set)\b/i.test(clause)
       : value.kind === "phone" || value.value.startsWith("tel:") ? /\b(?:phone|telephone|tel|replace|change|set)\b/i.test(clause)
@@ -311,7 +352,8 @@ export function validateEditScopeCompletion(scope: DeterministicEditScope, befor
       const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
       const visit = (node: ts.Node): void => {
         if ((ts.isStringLiteralLike(node) || ts.isJsxText(node)) && protectedEditValues(ts.isJsxText(node) ? node.getText(file) : node.text)
-          .some(value => value.value === requested || value.value === `mailto:${requested}` || value.value === `tel:${requested}`)) found = true;
+          .some(value => value.value === requested || value.value === `mailto:${requested}` || value.value === `tel:${requested}` ||
+            !/[@a-z]/i.test(requested) && (value.kind === "phone" || value.value.startsWith("tel:")) && samePhoneNumber(value.value, requested))) found = true;
         ts.forEachChild(node, visit);
       };
       visit(file);

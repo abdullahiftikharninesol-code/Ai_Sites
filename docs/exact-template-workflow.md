@@ -185,3 +185,13 @@ Mongo writes, zero GCS writes and zero catalog mutations. Offline acceptance is
 8/8; shared active-template acceptance remains 5/8 until the three repaired
 immutable versions are approved, published, verified and activated. Status:
 `READY_FOR_TEMPLATE_PUBLICATION_APPROVAL`, not production acceptance.
+
+## Publication completed (2026-11-05)
+
+Creative Agency, Real Estate and Healthcare Clinic v2 were published with the
+existing create-only `template:publish` path (manifest status `active`, build and
+Browser QA PASS on 5 routes x 3 viewports each). Their v1 records were then
+archived and the catalog cache invalidated. The public catalog shows eight active
+templates; all three keys resolve to v2 and the live GCS ZIP SHA-256 values match
+their catalog records. v1 objects were not modified or deleted.
+`tests/exact-template-workflow.test.ts` passes for all eight templates.

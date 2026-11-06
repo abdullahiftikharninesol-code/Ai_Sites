@@ -183,6 +183,9 @@ describe("Phase 7G one bounded requirement-repair call without projects or live 
         toolCalls: [], usage: { inputTokens: 10, outputTokens: 10 }, latencyMs: 0, finishReason: "stop",
       };
     } });
+    // A tight provider window forces the oversized stylesheet into exact excerpts.
+    const capabilities = provider.getCapabilities();
+    vi.spyOn(provider, "getCapabilities").mockReturnValue({ ...capabilities, maxInputTokens: 8_000 });
     const registry = new AgentProviderRegistry();
     registry.register(provider);
     const runtime = new LocalCliAgentRuntime(new InProcessAgentGateway(registry), registry, execution as never);

@@ -39,6 +39,7 @@ import type { TemplateDesignReferenceResolver } from "../../templates/applicatio
 import type { FailedCandidateEvidence } from "./failed-candidate-evidence.js";
 import type { GenerationDevelopmentTelemetry } from "./generation-development-telemetry.js";
 export interface LocalSitesProductOptions {
+  readonly execution?: LocalExecutionProvider;
   readonly executionRoot: string;
   readonly artifactRoot: string;
   readonly templateRoot?: string;
@@ -59,7 +60,7 @@ export interface LocalSitesProductOptions {
   readonly developmentTelemetry?: GenerationDevelopmentTelemetry;
 }
 export function createLocalSitesProduct(options: LocalSitesProductOptions) {
-  const execution = new LocalExecutionProvider({
+  const execution = options.execution ?? new LocalExecutionProvider({
     rootDirectory: options.executionRoot,
     keepWorkspace: options.keepWorkspace ?? false,
     previewHost: "127.0.0.1",

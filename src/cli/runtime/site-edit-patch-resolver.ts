@@ -7,6 +7,7 @@ export interface SiteEditPatchContext {
   readonly instruction: string;
   /** Only files actually supplied as relevant source, not the entire workspace. */
   readonly relevantPaths: readonly string[];
+  readonly sourceRanges?: ReadonlyMap<string, readonly { start: number; end: number }[]>;
   readonly rename?: { readonly oldLiteral: string; readonly newLiteral: string } | undefined;
 }
 export interface PatchLocation { readonly offset: number; readonly line: number; readonly column: number }

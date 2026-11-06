@@ -16,12 +16,9 @@ import {
   summarizeDesignSystem,
 } from "../../sites/scaffold/react-vite-scaffold.js";
 import {
-  selectEditContextFiles,
   isBroadFunctionalEdit,
   broadFunctionalEditChangesStyle,
   BASELINE_STYLESHEET,
-  designTokenExcerpt,
-  patchableStyleExcerpt,
   selectEditRepairContext,
   type EditContextFile,
 } from "./edit-context-selection.js";
@@ -94,7 +91,6 @@ import type { FailedCandidateEvidence } from "../../sites/generation/failed-cand
 import { recordGenerationTelemetry, referenceContextTelemetry, type GenerationDevelopmentTelemetry } from "../../sites/generation/generation-development-telemetry.js";
 import {
   parseEditRequirements,
-  containsRenameLiteral,
   readEditRequirementFiles,
   validateEditRequirements,
   suppliedEditRequirementContext,
@@ -115,12 +111,15 @@ import { recoverFunctionalPlaceholders } from "../../sites/generation/functional
 import { resolveUsableGenerationSourceContract } from "../../sites/generation/functional-source-contract.js";
 import { generationInteractionAdvisories, USABLE_GENERATION_GUIDANCE } from "../../sites/generation/generation-acceptance-policy.js";
 import type { ResolvedFunctionalContract } from "../../sites/generation/functional-route-contract.js";
+import { EDIT_CONTEXT_POLICY, selectAdaptiveEditContext } from "./adaptive-edit-context.js";
+import { assessEditOutcome, type EditOutcome } from "./edit-outcome.js";
 import {
   getDefaultProfile,
   getProfile,
   type GeneratedAppProfile,
 } from "./site-technical-profile.js";
 export interface CliAgentSessionReport {
+  readonly editOutcome?: EditOutcome;
   readonly success: boolean;
   readonly provider: string;
   readonly model: string;
@@ -290,7 +289,7 @@ export class LocalCliAgentRuntime {
     const requirementSource = operation === "EDIT_SITE"
       ? await readEditRequirementFiles(this.execution, environmentId)
       : undefined;
-    const broadFunctionalEdit = operation === "EDIT_SITE" && isBroadFunctionalEdit(task.userRequest);
+    let broadFunctionalEdit = operation === "EDIT_SITE" && isBroadFunctionalEdit(task.userRequest);
     const generationStage: InferenceStage =
       task.stage ?? (operation === "EDIT_SITE" ? "TARGETED_EDIT" : "GENERATE_SITE");
     // Resolve the active execution contract and exact prompt before dispatch.
@@ -371,8 +370,8 @@ export class LocalCliAgentRuntime {
     for (const entry of (await this.execution.listFiles(environmentId)).filter(
       (item) => item.type === "FILE",
     )) {
-      if ((entry.sizeBytes ?? 0) <= (task.limits?.maxFileBytes ?? 64_000)) {
-        const content = await this.execution.readFile(environmentId, entry.path);
+      if (requirementSource?.has(entry.path) || (entry.sizeBytes ?? 0) <= (task.limits?.maxFileBytes ?? 64_000)) {
+        const content = requirementSource?.get(entry.path) ?? await this.execution.readFile(environmentId, entry.path);
         before.set(entry.path, content);
         const normalizedPath = entry.path.replace(/\\/g, "/");
         const hash = createHash("sha256").update(content).digest("hex");
@@ -404,7 +403,15 @@ export class LocalCliAgentRuntime {
       resolvedCapabilities,
       dependencyManifest,
       task.assetManifest,
+      requirementSource,
+      Math.max(0, Math.min(task.limits?.maxContextBytes ? EDIT_CONTEXT_POLICY.maximumInputTokens : EDIT_CONTEXT_POLICY.defaultInputTokens,
+        capabilities.maxInputTokens ?? Infinity,
+        Math.floor((effectiveContext.budget.limits.maxContextBytes ?? 128_000) / 3),
+        effectiveContext.budget.limits.maxTotalTokens - effectiveContext.budget.usage.totalTokens - stagePolicy.outputPolicy.defaultMaxOutputTokens - 1_024 - stagePolicy.outputPolicy.safetyMarginTokens)
+        - estimateTokensConservative(runtimePrompt.prompt.systemPrompt + task.userRequest + JSON.stringify(stagePolicy.tools)) - 1_000),
     );
+    // Partial source can only authorize exact patches, never a full-file rewrite.
+    if (discovered.editUsesRegions) broadFunctionalEdit = false;
     const context = discovered.text;
     const functionalGuidance = operation === "GENERATE_SITE" ? functionalGenerationContract(functional) : "";
 
@@ -413,12 +420,17 @@ export class LocalCliAgentRuntime {
       JSON.stringify(stagePolicy.tools),
       `Operation: ${operation === "EDIT_SITE" ? "EDIT" : "GENERATE"}`,
       `User request: ${task.userRequest}`,
-      projectedSiteSpec ? `SiteSpec: ${JSON.stringify(projectedSiteSpec)}` : "",
+      projectedSiteSpec && operation === "GENERATE_SITE" ? `SiteSpec: ${JSON.stringify(projectedSiteSpec)}` : "",
       context,
       functionalGuidance,
     ].join("\n");
 
     const conservativeEstimatedInput = estimateTokensConservative(promptForEstimation);
+    if (operation === "EDIT_SITE" && capabilities.maxInputTokens !== undefined && conservativeEstimatedInput > capabilities.maxInputTokens)
+      throw new ApplicationError("AGENT_RUN_BUDGET_EXCEEDED", "The selected model cannot fit the required edit input; no AI request was sent", {
+        metadata: { failureStage: "REQUEST_VALIDATION", validationCheck: "edit.context", reason: "MODEL_INPUT_LIMIT", estimatedInputTokens: conservativeEstimatedInput,
+          maxInputTokens: capabilities.maxInputTokens },
+      });
     const requestedOutputAllowance = stagePolicy.outputPolicy.defaultMaxOutputTokens;
     const minSafeOutput = stagePolicy.outputPolicy.minOutputTokens;
     const reasoningAllowance =
@@ -583,7 +595,7 @@ export class LocalCliAgentRuntime {
           ? "Make the existing visible navigation and controls genuinely interactive using React state and local browser storage where appropriate. Provide working view changes, search/filtering, menus, dialogs and form actions that fit the existing UI; do not claim a remote backend exists. Keep the original JSX shell, className values, sections, and visual treatment. For functionality-only edits, never rewrite an existing stylesheet; add and import a new CSS file only if new controls need styles. Do not modify Sites-managed files or dependency manifests."
           : operation === "EDIT_SITE"
           ? [
-              "Patch requested editable source files and root index.html branding only; never modify package manifests, configuration, lockfiles, or other Sites-managed files.",
+              "Patch requested editable source files and root index.html branding only; never modify package manifests, configuration, lockfiles, or other Sites-managed files. New src components/modules may use mode create with empty find and complete source in replace. Wire new modules through exact import/router patches against the supplied code; do not overwrite existing files with create.",
               "Every 'find' must match the file byte-for-byte, including whitespace and JSX entities such as &amp;.",
               'With mode "unique" the find text must occur exactly once in that file, so anchor it: include the surrounding attribute, tag or line rather than a bare word. `Menu` alone will match many times; `<a href="#menu">Menu</a>` identifies one place.',
               'For a global brand rename, use mode "all" per relevant file. For a local edit, include the component/section/tag or CSS selector and declaration in a uniquely matching find; widen duplicate text anchors. Never rely on the first match or use "all" to hide local ambiguity.',
@@ -772,6 +784,7 @@ export class LocalCliAgentRuntime {
             jobId: task.jobId, role: "sites.targeted-edit", validationCategory: "INDEPENDENT_UNAUTHORIZED_OPERATION_EXCLUDED", excludedOperationCount,
           }),
           relevantPaths: discovered.editSourcePaths ?? [],
+          ...(discovered.editSourceRanges ? { sourceRanges: discovered.editSourceRanges } : {}),
         });
       } else {
         const submittedBundle = parsed as SiteCoderFileBundle;
@@ -779,7 +792,10 @@ export class LocalCliAgentRuntime {
           ? { ...submittedBundle, files: submittedBundle.files.filter((file) => !file.path.endsWith(".css") || !before.has(file.path)) }
           : submittedBundle;
         if (!generatedBundle.files.length)
-          throw new ApplicationError("VALIDATION_FAILED", "The functionality edit did not include an application source file");
+          throw new ApplicationError("EDIT_REQUIREMENT_INCOMPLETE", "The functionality edit did not include an application source file. No changes were committed.", {
+            metadata: { failureStage: "STATIC_VALIDATION", validationCheck: "edit.outcome", reason: "REQUIRED_APPLICATION_CHANGE_MISSING",
+              suppliedSourcePaths: discovered.editSourcePaths ?? [], returnedPaths: submittedBundle.files.map(file => file.path), editOutcome: "NOT_APPLIED" },
+          });
         bundle = generatedBundle;
         await materializeSiteCoderFileBundle(this.execution, environmentId, generatedBundle);
       }
@@ -912,6 +928,7 @@ export class LocalCliAgentRuntime {
             await applySiteEditPatchBundle(this.execution, environmentId, repairBundle, {
               instruction: task.userRequest, rename: editRequirements.rename,
               requirementSource,
+              sourceSnapshot: candidate,
               onScopeExclusion: excludedOperationCount => recordGenerationTelemetry(this.generationDiagnostics?.telemetry, {
                 jobId: task.jobId, role: "sites.targeted-edit", validationCategory: "INDEPENDENT_UNAUTHORIZED_OPERATION_EXCLUDED", excludedOperationCount,
               }),
@@ -955,6 +972,8 @@ export class LocalCliAgentRuntime {
       validateProtectedEditValues(editRequirements.scope, requirementSource, candidate);
       validateEditScopeCompletion(editRequirements.scope, requirementSource, candidate);
     }
+    let editOutcome: EditOutcome | undefined;
+    if (requirementSource) editOutcome = assessEditOutcome(task.userRequest, requirementSource, await readEditRequirementFiles(this.execution, environmentId)).outcome;
     let autofixResult = await applyDeterministicAutofix(this.execution, environmentId);
     if (completionRequirements && operation === "GENERATE_SITE") {
       const completion = await validateSiteCoderBundleCompletion(
@@ -1138,7 +1157,7 @@ export class LocalCliAgentRuntime {
     )) {
       if (!before.has(entry.path)) files.push(entry.path);
       else if (
-        (entry.sizeBytes ?? 0) <= (task.limits?.maxFileBytes ?? 64_000) &&
+        (operation === "EDIT_SITE" || (entry.sizeBytes ?? 0) <= (task.limits?.maxFileBytes ?? 64_000)) &&
         before.get(entry.path) !== (await this.execution.readFile(environmentId, entry.path))
       )
         files.push(entry.path);
@@ -1166,8 +1185,10 @@ export class LocalCliAgentRuntime {
       finalBuildSuccess: this.execution.getLastBuildSuccess(environmentId) === true,
       ...(preview?.url ? { previewUrl: preview.url } : {}),
       filesChanged: files,
+      ...(editOutcome ? { editOutcome } : {}),
       durationMs: Date.now() - started,
       usage: {
+        ...(discovered.editContextMetrics ? { editContext: discovered.editContextMetrics } : {}),
         inputTokens: directUsage.inputTokens + repairInputTokens,
         cachedInputTokens: directUsage.cachedInputTokens + repairCachedInputTokens,
         outputTokens: directUsage.outputTokens + repairOutputTokens,
@@ -1276,7 +1297,11 @@ export class LocalCliAgentRuntime {
     resolvedCapabilities?: ResolvedCapabilities,
     dependencyManifest?: ResolvedDependencyManifest,
     assetManifest?: AssetManifest,
-  ): Promise<{ readonly text: string; readonly stableChars: number; readonly editRequirementContext?: EditRequirementContext; readonly editSourcePaths?: readonly string[] }> {
+    editSource?: ReadonlyMap<string, string>,
+    editInputTokens?: number,
+  ): Promise<{ readonly text: string; readonly stableChars: number; readonly editRequirementContext?: EditRequirementContext; readonly editSourcePaths?: readonly string[];
+    readonly editUsesRegions?: boolean; readonly editSourceRanges?: ReadonlyMap<string, readonly { start: number; end: number }[]>;
+    readonly editContextMetrics?: Readonly<Record<string, number | string>> }> {
     if (operation === "GENERATE_SITE") {
       const contractLines = [
         buildCapabilityAwareGenerationContext({
@@ -1346,116 +1371,60 @@ export class LocalCliAgentRuntime {
       };
     }
 
-    const maxFiles = task.limits?.maxContextFiles ?? 8;
-    const maxBytes = task.limits?.maxContextBytes ?? 64_000;
-    const maxFile = task.limits?.maxFileBytes ?? 16_000;
+    const maxBytes = task.limits?.maxContextBytes ?? EDIT_CONTEXT_POLICY.defaultContextBytes;
+    const entries = (await this.execution.listFiles(environmentId)).filter(entry => entry.type === "FILE");
     const rename = parseEditRequirements(task.userRequest).rename;
-    // A targeted edit may only patch editable application source, so managed
-    // scaffold files are cost without capability. Of what remains, only the files
-    // the instruction actually implicates are worth sending; the rest are named in
-    // a manifest so the model still knows the shape of the project.
-    const contextEntries = (await this.execution.listFiles(environmentId))
-      .filter((item) => item.type === "FILE")
-      .filter((item) => {
-        const path = item.path.replaceAll("\\", "/");
-        return isEditableContextPath(path, profile) ||
-          (rename && /^public\/.+\.svg$/i.test(path) && isEditableSiteEditPath(path));
-      });
-    const editableEntries = contextEntries.filter((item) => (item.sizeBytes ?? 0) <= maxFile);
-    // A stylesheet too large to send whole still owns the tokens a colour or
-    // theme edit must change; on style intent only its :root blocks are sent.
-    const oversizedStylesheets = contextEntries.filter(
-      (item) => (item.sizeBytes ?? 0) > maxFile && item.path.endsWith(".css"),
-    );
-    const editableFiles: EditContextFile[] = [];
-    for (const entry of editableEntries)
-      editableFiles.push({
-        path: entry.path.replaceAll("\\", "/"),
-        content: await this.execution.readFile(environmentId, entry.path),
-      });
-    // A rename must expose every exact match, even in a file above the usual per-file budget.
-    if (rename) for (const entry of contextEntries.filter((item) => (item.sizeBytes ?? 0) > maxFile)) {
-      const content = await this.execution.readFile(environmentId, entry.path);
-      if (containsRenameLiteral(content, rename.oldLiteral))
-        editableFiles.push({ path: entry.path.replaceAll("\\", "/"), content });
+    const source: EditContextFile[] = [];
+    for (const entry of entries) {
+      const path = entry.path.replaceAll("\\", "/");
+      if (!isEditableContextPath(path, profile) && !(rename && /^public\/.+\.svg$/i.test(path) && isEditableSiteEditPath(path))) continue;
+      source.push({ path, content: editSource?.get(path) ?? await this.execution.readFile(environmentId, entry.path) });
     }
-
-    // Sorted so the prefix is byte-stable between edits, and so a file changed by
-    // one edit only invalidates the cache from its own position onward.
-    const broadFunctionalEdit = isBroadFunctionalEdit(task.userRequest);
-    // Full-file edits cannot write managed root HTML. Do not advertise it as
-    // editable under that contract; precise branding patches still receive it.
-    const sorted = editableFiles.filter(file => !broadFunctionalEdit || file.path !== "index.html")
-      .sort((left, right) => left.path.localeCompare(right.path));
-    const baseline = sorted.find((file) => file.path === BASELINE_STYLESHEET);
-    const core = sorted.filter((file) => file.path !== BASELINE_STYLESHEET);
-    const coreBytes = core.reduce((total, file) => total + Buffer.byteLength(file.content), 0);
-    const selection = selectEditContextFiles(task.userRequest, sorted, { maxFiles, includeAllEditable: broadFunctionalEdit });
-
-    // Small projects: send all application source inside the cached prefix. It
-    // costs a little more on the first edit and is reusable on every later one.
-    // Large projects: fall back to instruction-relevant selection, which keeps
-    // the prompt small at the cost of a prefix too short to cache.
-    const cacheable = coreBytes <= INLINE_ALL_SOURCE_LIMIT;
+    const broad = isBroadFunctionalEdit(task.userRequest);
+    const assembled = selectAdaptiveEditContext({ files: source.filter(file => !broad || file.path !== "index.html"),
+      instruction: task.userRequest, existingPaths: entries.map(entry => entry.path.replaceAll("\\", "/")), maxBytes,
+      ...(editInputTokens !== undefined ? { maxInputTokens: Math.floor(editInputTokens * EDIT_CONTEXT_POLICY.sourceFraction) } : {}),
+      ...(task.limits?.maxFileBytes !== undefined ? { explicitMaxFileBytes: task.limits.maxFileBytes } : {}),
+      ...(task.limits?.maxContextFiles !== undefined ? { maxFiles: task.limits.maxContextFiles } : {}),
+    });
+    const originals = new Map(source.map(file => [file.path, file.content]));
+    const patchRequired = assembled.files.some(file => !file.full && (!file.path.endsWith(".css") || broadFunctionalEditChangesStyle(task.userRequest)));
+    const core = assembled.files.filter(file => file.full && file.path !== BASELINE_STYLESHEET);
+    const cacheable = core.reduce((bytes, file) => bytes + Buffer.byteLength(file.content), 0) <= INLINE_ALL_SOURCE_LIMIT &&
+      !assembled.files.some(file => !file.full && !file.path.endsWith(".css"));
+    const chunk = (file: typeof assembled.files[number]) => file.full
+      ? `--- ${file.path}
+${file.content}`
+      : [...(file.ownerSignatures?.map(signature => `READ-ONLY ENCLOSING SIGNATURE (not a patch target): ${signature}`) ?? []), ...file.ranges.map(range => `--- ${file.path}
+EXACT PATCHABLE EXCERPT (complete code region ${range.start}-${range.end}; labels are not source; patch only the verbatim region, never rewrite this file):
+${originals.get(file.path)!.slice(range.start, range.end)}`)].join("\n\n");
     const stableFiles = cacheable ? core : [];
-    const variableFiles = cacheable
-      ? selection.styleIntent && baseline
-        ? [baseline]
-        : rename && baseline && containsRenameLiteral(baseline.content, rename.oldLiteral) ? [baseline] : []
-      : selection.selected;
-
-    const chunk = (file: EditContextFile) => `--- ${file.path}\n${file.content}`;
-    let bytes = 0;
-    const withinBudget = (files: readonly EditContextFile[]) =>
-      files.filter((file) => {
-        const size = Buffer.byteLength(file.content);
-        if (bytes + size > maxBytes && !(rename && containsRenameLiteral(file.content, rename.oldLiteral))) return false;
-        bytes += size;
-        return true;
-      });
-    const stableSent = withinBudget(stableFiles);
-    const variableSent = withinBudget(variableFiles);
-    const tokenExcerpts: EditContextFile[] = [];
-    if (selection.styleIntent)
-      for (const entry of oversizedStylesheets) {
-        if ([...stableSent, ...variableSent].some((file) => file.path === entry.path.replaceAll("\\", "/"))) continue;
-        const excerpt = designTokenExcerpt(await this.execution.readFile(environmentId, entry.path));
-        if (excerpt) tokenExcerpts.push({ path: entry.path.replaceAll("\\", "/"), content: excerpt });
-      }
-    const excerptSent = withinBudget(tokenExcerpts);
-
+    const tailFiles = assembled.files.filter(file => !stableFiles.includes(file));
     const stable = [
-      `Sites-managed and off-limits (not shown): ${profile.files.managed.filter((path) => broadFunctionalEdit || path !== "index.html").join(", ")}`,
-      `Editable project files: ${sorted.map((file) => file.path).join(", ")}`,
-      // Without the stylesheet itself, the model still needs to know the tokens exist.
-      ...(baseline ? [summarizeDesignSystem(baseline.content)] : []),
-      broadFunctionalEdit
+      `Sites-managed and off-limits (not shown): ${profile.files.managed.filter(path => broad || path !== "index.html").join(", ")}`,
+      `Editable project files: ${source.filter(file => !broad || file.path !== "index.html").map(file => file.path).sort().join(", ")}`,
+      assembled.repositoryMap,
+      broad && !patchRequired
         ? "Full source follows. Return complete contents only for editable files shown below that need functional changes; preserve their visual design."
-        : "Patch only supplied source, including exact patchable excerpts; do not invent files.",
-      ...stableSent.map(chunk),
+        : "Patch only supplied source regions with exact anchors. New safe src modules may use mode create; connect them through supplied imports/routes. Never rewrite an existing file from partial context.",
+      ...stableFiles.map(chunk),
     ].join("\n\n");
-    const variable = [...variableSent.map(chunk), ...excerptSent.map(patchableStyleExcerpt)].join("\n\n");
-
-    // The separator is always part of the prefix, present or not: a boundary that
-    // moves by two characters when the tail is empty makes the prefix differ
-    // between edits and defeats the cache entirely.
-    const context = `${stable}\n\n${variable}`;
-    const included = [...stableSent, ...variableSent].map((file) => file.path);
-    this.#logEditContext(
-      task,
-      context,
-      [...included, ...excerptSent.map((file) => `${file.path} (design tokens)`)],
-      sorted.length - included.length,
-      cacheable,
-    );
-    return {
-      text: context,
-      stableChars: stable.length + 2,
-      editSourcePaths: [...included, ...excerptSent.map(file => file.path)],
-      editRequirementContext: suppliedEditRequirementContext(
-        parseEditRequirements(task.userRequest),
-        [...stableSent, ...variableSent, ...excerptSent],
-      ),
+    const context = stable + "\n\n" + tailFiles.map(chunk).join("\n\n");
+    if (Buffer.byteLength(context) > maxBytes)
+      throw new ApplicationError("AGENT_RUN_BUDGET_EXCEEDED", "Required edit context exceeds the available context budget; no AI request was sent", {
+        metadata: { failureStage: "REQUEST_VALIDATION", validationCheck: "edit.context", reason: "EDIT_CONTEXT_EXCEEDS_LIMIT", maxContextBytes: maxBytes },
+      });
+    this.#logEditContext(task, context, assembled.files.map(file => file.path + (file.full ? "" : file.path.endsWith(".css") ? " (design tokens)" : " (complete regions)")),
+      source.length - assembled.files.length, cacheable);
+    return { text: context, stableChars: stable.length + 2,
+      editUsesRegions: patchRequired,
+      editSourcePaths: assembled.files.map(file => file.path),
+      editContextMetrics: { maxContextBytes: maxBytes, inputTokenAllowance: editInputTokens ?? EDIT_CONTEXT_POLICY.defaultInputTokens,
+        estimatedContextTokens: estimateTokensConservative(context), repositoryMapTokens: estimateTokensConservative(assembled.repositoryMap),
+        sourceFiles: assembled.files.length, sourceRegions: assembled.files.reduce((count, file) => count + file.ranges.length, 0),
+        structureCacheHits: assembled.parseHits, structureParses: assembled.parseMisses, tokenCounting: "CONSERVATIVE_LOCAL_ESTIMATE" },
+      editSourceRanges: new Map(assembled.files.map(file => [file.path, file.ranges])),
+      editRequirementContext: suppliedEditRequirementContext(parseEditRequirements(task.userRequest), assembled.files),
     };
   }
   /**

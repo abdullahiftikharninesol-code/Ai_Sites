@@ -5,7 +5,7 @@
   "description": "A premium multi-page website template for creative, branding and digital agencies.",
   "categoryKey": "agency",
   "tags": ["agency", "creative", "branding", "design", "portfolio", "professional", "multi-page"],
-  "status": "draft",
+  "status": "active",
   "routes": [
     { "path": "/", "label": "Home" },
     { "path": "/work", "label": "Work" },

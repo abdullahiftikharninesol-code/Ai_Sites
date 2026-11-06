@@ -336,6 +336,7 @@ export class PlaygroundService {
       return {
         projectId: result.siteId,
         versionId: result.newVersionId,
+        ...(result.editOutcome ? { editOutcome: result.editOutcome } : {}),
         preview: { sessionId: preview.id, url: preview.url },
         ...(billing ?? {}),
         ...(result.intelligence ? { intelligence: result.intelligence } : {}),

@@ -15,6 +15,33 @@ export interface ScopeValidationResult {
   readonly warnings: readonly SiteGenerationWarning[];
   readonly normalizedRequirements: readonly string[];
 }
+// A negation cue, optionally followed by the verb/determiner it governs
+// ("no", "without a", "do not use any", "doesn't need a", "not connected to").
+const NEGATION_CUE =
+  /\b(?:no|without|not|never|nor|avoid(?:ing)?|(?:do|does|did|should|must|will)\s*(?:not|n't)|(?:don|doesn|didn|shouldn|mustn|won)['’]t)(?:\s+(?:use|using|need|needs|require|requires|include|add|have|want|connect(?:ed)?|to|any|a|an|the|real|actual|external|separate|server-side))*\b/gi;
+// Words that end a negated list and start an affirmative request
+// ("no login but store orders in a database").
+const AFFIRMATIVE_BREAK =
+  /\b(?:but|however|with|using|use|uses|add|include|need|needs|require|requires|store|stores|save|saves|persist|persists|connect|connects|via|through|that|which|for)\b/i;
+
+/** True when every mention of `term` is explicitly excluded ("no database", "without a backend server"). */
+function onlyNegatedMentions(prompt: string, term: string): boolean {
+  const pattern = new RegExp(`\\b${term.replace(/\s+/g, "\\s+")}\\b`, "gi");
+  let mentioned = false;
+  for (const clause of prompt.split(/[.;!?\n]/)) {
+    for (const match of clause.matchAll(pattern)) {
+      mentioned = true;
+      const before = clause.slice(0, match.index);
+      const cues = [...before.matchAll(NEGATION_CUE)];
+      const cue = cues.at(-1);
+      if (!cue) return false;
+      const between = before.slice((cue.index ?? 0) + cue[0].length);
+      if (AFFIRMATIVE_BREAK.test(between)) return false;
+    }
+  }
+  return mentioned;
+}
+
 export class SitesV1ScopeValidator {
   readonly #unsupported = [
     "kubernetes",
@@ -25,9 +52,10 @@ export class SitesV1ScopeValidator {
     "background worker",
   ];
   validate(prompt: string): ScopeValidationResult {
-    const unsupportedFeatures = this.#unsupported.filter((item) =>
-      prompt.toLowerCase().includes(item),
-    );
+    const unsupportedFeatures = this.#unsupported.filter((item) => {
+      const mentioned = new RegExp(`\\b${item.replace(/\s+/g, "\\s+")}\\b`, "i").test(prompt);
+      return mentioned && !onlyNegatedMentions(prompt, item);
+    });
     if (unsupportedFeatures.length)
       throw new ApplicationError(
         "UNSUPPORTED_SITE_REQUIREMENT",

@@ -41,7 +41,9 @@ export class MockAgentProvider implements AgentProvider {
       cachedInput: true,
       structuredOutput: true,
       structuredOutputCapability: "NATIVE_SCHEMA" as const,
-      maxInputTokens: 8_000,
+      // Realistic window: edit context sizing honors declared provider limits,
+      // and an unrealistically small mock limit would reject ordinary sites.
+      maxInputTokens: 128_000,
     };
   }
   async createResponse(request: AgentRequest): Promise<AgentResponse> {

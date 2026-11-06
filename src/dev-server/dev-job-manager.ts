@@ -22,6 +22,7 @@ export interface DevJobRecord {
   updatedAt: string;
   projectId?: string;
   versionId?: string;
+  editOutcome?: "APPLIED" | "NO_CHANGES_REQUIRED";
   preview?: { sessionId: string; url: string };
   billingStatus?: SiteJobBillingStatus;
   creditsCharged?: number;
@@ -54,6 +55,7 @@ export class DevJobManager {
     execute: (onIntelligence: (updates: readonly AgentTaskTelemetry[]) => void, outerRequestId: string) => Promise<{
       projectId: string;
       versionId: string;
+      editOutcome?: "APPLIED" | "NO_CHANGES_REQUIRED";
       preview?: { sessionId: string; url: string };
       intelligence?: readonly AgentTaskTelemetry[];
       billingStatus?: SiteJobBillingStatus;
@@ -135,9 +137,10 @@ export class DevJobManager {
         job.status = "RUNNING";
         return execute(onIntelligence, job.id);
       })
-      .then(({ projectId, versionId, preview, intelligence, billingStatus, creditsCharged, subscriberQuota }) => {
+      .then(({ projectId, versionId, editOutcome, preview, intelligence, billingStatus, creditsCharged, subscriberQuota }) => {
         job.projectId = projectId;
         job.versionId = versionId;
+        if (editOutcome) job.editOutcome = editOutcome;
         if (preview) job.preview = preview;
         if (intelligence) job.intelligence = intelligence;
         if (billingStatus) job.billingStatus = billingStatus;

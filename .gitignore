@@ -25,6 +25,7 @@ tests/*
 !tests/site-templates-phase-7.test.ts
 !tests/targeted-edit-completeness.test.ts
 !tests/targeted-edit-reliability.test.ts
+!tests/intelligent-edit-context.test.ts
 !tests/targeted-edit-schema-reliability.test.ts
 !tests/targeted-edit-ambiguity.test.ts
 !tests/targeted-edit-scope.test.ts

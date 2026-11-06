@@ -5,7 +5,7 @@
   "description": "A premium real estate website template for agencies, brokers and property consultancies.",
   "categoryKey": "real-estate",
   "tags": ["real-estate", "property", "homes", "brokerage", "luxury", "listings", "multi-page"],
-  "status": "draft",
+  "status": "active",
   "routes": [
     { "path": "/", "label": "Home" },
     { "path": "/properties", "label": "Properties" },

@@ -5,6 +5,9 @@ import type {
   LocalCliAgentRuntime,
 } from "../../cli/runtime/local-cli-agent-runtime.js";
 import { ApplicationError } from "../../app/errors/application-error.js";
+import { assessEditOutcome } from "../../cli/runtime/edit-outcome.js";
+import { isEditableRequirementPath, readEditRequirementFiles } from "../../cli/runtime/edit-requirements.js";
+import { functionalSourceManifest } from "./functional-source-contract.js";
 import { functionalBrowserChecks } from "../../browser-qa/functional-capability-checks.js";
 import { assertFunctionalRequestConsistency, assertFunctionalBackendSupport } from "./functional-capabilities.js";
 import type { LocalExecutionProvider } from "../../execution/local/local-execution.provider.js";
@@ -144,6 +147,7 @@ export interface SiteGenerationResult {
   readonly requestProfile?: RequestProfile;
 }
 export interface SiteEditResult {
+  readonly editOutcome?: "APPLIED" | "NO_CHANGES_REQUIRED";
   readonly siteId: SiteId;
   readonly jobId: JobId;
   readonly fromVersionId: VersionId;
@@ -660,6 +664,14 @@ export class LocalSiteGenerationPipeline {
         },
       );
       await validateRequiredUserAssetReferences(this.deps.execution, environment.id, request.assetManifest);
+      const editedSource = await readEditRequirementFiles(this.deps.execution, environment.id);
+      const editOutcome = assessEditOutcome(request.instruction,
+        new Map(Object.entries(before.files).filter(([path]) => isEditableRequirementPath(path))), editedSource).outcome;
+      const discoveredRoutes = functionalSourceManifest({ files: [...editedSource].map(([path, content]) => ({ path, content })) }).routes
+        .map(route => route.path).filter(path => !/[:*]/.test(path));
+      const editedSpec = parent.siteSpec ? { ...parent.siteSpec, requirements: { ...parent.siteSpec.requirements,
+        pages: [...parent.siteSpec.requirements.pages, ...discoveredRoutes.filter(path => !parent.siteSpec!.requirements.pages.some(page => page.path === path))
+          .map(path => ({ path, name: path === "/" ? "Home" : path.slice(1) }))] } } : undefined;
       const intelligenceTelemetry = [
         this.#sessionTelemetry("TARGETED_EDIT", session, "PASS"),
         ...(session.buildRepairInvoked ? [this.#sessionTelemetry("BUILD_REPAIR", session, "PASS")] : []),
@@ -680,9 +692,21 @@ export class LocalSiteGenerationPipeline {
         request.siteId,
         newVersionId,
         previewResult.url,
-        parent.siteSpec,
+        editedSpec,
         assetManifest,
       );
+      if (editOutcome === "NO_CHANGES_REQUIRED") {
+        // A verified review/already-satisfied request must not create another
+        // current-source revision or finalize a successful-edit charge.
+        job = { ...this.#finalJob(job, runContext.getSummary(), true), stage: "NO_CHANGES_REQUIRED", websiteGenerated: false,
+          billingStatus: "NOT_CHARGED", creditsCharged: 0 };
+        await this.deps.jobs.save(job); jobFinalized = true;
+        retainEnvironment = request.retainPreview === true;
+        return { siteId: request.siteId, jobId: editJobId, fromVersionId, newVersionId: fromVersionId,
+          editOutcome, build: this.#build(environment.id), preview: this.#preview(environment.id, previewResult.url, previewResult.port),
+          changedFiles: { filesCreated: [], filesModified: [], filesDeleted: [], summary: [] }, usage: session.usage,
+          ...(browserQARun ? { browserQA: browserQARun.report } : {}), intelligence: intelligenceTelemetry, inference: runContext.getSummary() };
+      }
       // Browser QA is the sole default runtime QA system. Legacy visual
       // review/repair flags remain compatibility-readable but cannot execute.
       const sourceArtifactRef = ArtifactNamespace.version(
@@ -733,7 +757,7 @@ export class LocalSiteGenerationPipeline {
         ...(assetManifestArtifactRef ? { assetManifestArtifactRef } : {}),
         buildArtifactRef,
         buildStatus: "SUCCEEDED",
-        ...(parent.siteSpec ? { siteSpec: parent.siteSpec } : {}),
+        ...(editedSpec ? { siteSpec: editedSpec } : {}),
         ...(parent.technicalProfileId ? { technicalProfileId: parent.technicalProfileId } : {}),
         ...(parent.templateId ? { templateId: parent.templateId } : {}),
         ...(parent.templateVersion !== undefined
@@ -766,6 +790,7 @@ export class LocalSiteGenerationPipeline {
         siteId: request.siteId,
         jobId: editJobId,
         fromVersionId,
+        editOutcome,
         newVersionId: committedVersion.id,
         build,
         preview: this.#preview(environment.id, previewResult.url, previewResult.port),
