@@ -6,6 +6,7 @@ import type {
 } from "../../cli/runtime/local-cli-agent-runtime.js";
 import { ApplicationError } from "../../app/errors/application-error.js";
 import { assessEditOutcome } from "../../cli/runtime/edit-outcome.js";
+import { summarizeInstallFailure } from "../../cli/runtime/build-log-normalizer.js";
 import { isEditableRequirementPath, readEditRequirementFiles } from "../../cli/runtime/edit-requirements.js";
 import { functionalSourceManifest } from "./functional-source-contract.js";
 import { functionalBrowserChecks } from "../../browser-qa/functional-capability-checks.js";
@@ -685,6 +686,20 @@ export class LocalSiteGenerationPipeline {
         previewResult.url,
         request.agentProvider === "mock" ? "AI Sites Updated Hero" : undefined,
       );
+      if (editOutcome === "NO_CHANGES_REQUIRED") {
+        // A verified review/already-satisfied request must not create another
+        // current-source revision or finalize a successful-edit charge. The
+        // source equals the already-validated parent version, so Browser QA is
+        // skipped and no QA artifacts are written for a version that never exists.
+        job = { ...this.#finalJob(job, runContext.getSummary(), true), stage: "NO_CHANGES_REQUIRED", websiteGenerated: false,
+          billingStatus: "NOT_CHARGED", creditsCharged: 0 };
+        await this.deps.jobs.save(job); jobFinalized = true;
+        retainEnvironment = request.retainPreview === true;
+        return { siteId: request.siteId, jobId: editJobId, fromVersionId, newVersionId: fromVersionId,
+          editOutcome, build: this.#build(environment.id), preview: this.#preview(environment.id, previewResult.url, previewResult.port),
+          changedFiles: { filesCreated: [], filesModified: [], filesDeleted: [], summary: [] }, usage: session.usage,
+          intelligence: intelligenceTelemetry, inference: runContext.getSummary() };
+      }
       const versionNumber = parent.versionNumber + 1;
       const newVersionId = randomUUID() as VersionId;
       const browserQARun = await this.#runBrowserQA(
@@ -695,18 +710,6 @@ export class LocalSiteGenerationPipeline {
         editedSpec,
         assetManifest,
       );
-      if (editOutcome === "NO_CHANGES_REQUIRED") {
-        // A verified review/already-satisfied request must not create another
-        // current-source revision or finalize a successful-edit charge.
-        job = { ...this.#finalJob(job, runContext.getSummary(), true), stage: "NO_CHANGES_REQUIRED", websiteGenerated: false,
-          billingStatus: "NOT_CHARGED", creditsCharged: 0 };
-        await this.deps.jobs.save(job); jobFinalized = true;
-        retainEnvironment = request.retainPreview === true;
-        return { siteId: request.siteId, jobId: editJobId, fromVersionId, newVersionId: fromVersionId,
-          editOutcome, build: this.#build(environment.id), preview: this.#preview(environment.id, previewResult.url, previewResult.port),
-          changedFiles: { filesCreated: [], filesModified: [], filesDeleted: [], summary: [] }, usage: session.usage,
-          ...(browserQARun ? { browserQA: browserQARun.report } : {}), intelligence: intelligenceTelemetry, inference: runContext.getSummary() };
-      }
       // Browser QA is the sole default runtime QA system. Legacy visual
       // review/repair flags remain compatibility-readable but cannot execute.
       const sourceArtifactRef = ArtifactNamespace.version(
@@ -1053,9 +1056,11 @@ export class LocalSiteGenerationPipeline {
       );
       return;
     }
-    const output = `${install.stderr}\n${install.stdout}`.trim().slice(-8_000);
+    // Redacted and bounded; npm's leading error lines carry the cause.
+    const failure = summarizeInstallFailure(install.stderr, install.stdout, 4_000);
     console.error(
-      `[sites] job=${jobId} ${source} dependency installation failed exit=${install.exitCode ?? "null"} timedOut=${install.timedOut}\n${output}`,
+      `[sites] job=${jobId} ${source} dependency installation failed exit=${install.exitCode ?? "null"} timedOut=${install.timedOut}` +
+        `${failure.npmErrorCode ? ` npmErrorCode=${failure.npmErrorCode}` : ""}\n${failure.output}`,
     );
     throw new ApplicationError(
       "PROJECT_BOOTSTRAP_FAILED",
@@ -1067,6 +1072,7 @@ export class LocalSiteGenerationPipeline {
           exitCode: install.exitCode,
           timedOut: install.timedOut,
           durationMs: install.durationMs,
+          ...(failure.npmErrorCode ? { npmErrorCode: failure.npmErrorCode } : {}),
         },
       },
     );

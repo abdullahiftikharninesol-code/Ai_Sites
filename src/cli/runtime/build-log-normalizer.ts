@@ -16,7 +16,11 @@ const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
   // Bearer tokens: Bearer abc...
   /(?<=\bBearer\s+)[a-zA-Z0-9_\-.~+/=]{10,}/gi,
   // Common provider key prefixes
-  /\b(?:ghp_[a-zA-Z0-9]{20,}|sk-[a-zA-Z0-9]{20,}|AIza[0-9A-Za-z\-_]{35})\b/g,
+  /\b(?:ghp_[a-zA-Z0-9]{20,}|sk-[a-zA-Z0-9]{20,}|AIza[0-9A-Za-z\-_]{35}|npm_[A-Za-z0-9]{36})\b/g,
+  // npm registry credentials in .npmrc-style output: //registry/:_authToken=value
+  /(?<=_auth(?:Token)?\s*=\s*)[^\s"']+/gi,
+  // Credentials embedded in URLs: https://user:password@host
+  /(?<=[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+(?=@)/gi,
 ];
 
 // Noise lines from npm, Vite, and Rollup that contain no compiler diagnostic information
@@ -99,11 +103,60 @@ export function normalizeBuildLog(
 
   const result = filteredLines.join("\n").trim();
 
-  // Bounded byte size from tail (where compiler errors usually live)
   if (Buffer.byteLength(result, "utf8") <= maxBytes) {
     return result;
   }
 
-  // Slice from end if too long
-  return `[...earlier logs omitted...]\n${result.slice(-maxBytes)}`;
+  // The first compiler diagnostics are usually the root cause; later ones are
+  // often cascades. Keep the leading located diagnostics (bounded to half the
+  // budget), then fill the remainder with whole lines from the tail.
+  const primary: string[] = [];
+  let primaryBytes = 0;
+  for (const line of filteredLines) {
+    if (primary.length >= 6 || !PRIMARY_DIAGNOSTIC.test(line)) continue;
+    const bytes = Buffer.byteLength(line, "utf8") + 1;
+    if (primaryBytes + bytes > maxBytes / 2) break;
+    primary.push(line); primaryBytes += bytes;
+  }
+  const header = primary.length ? `[primary compiler diagnostics]\n${primary.join("\n")}\n` : "";
+  const tail: string[] = [];
+  let used = Buffer.byteLength(header, "utf8") + 32;
+  for (let index = filteredLines.length - 1; index >= 0; index--) {
+    const line = filteredLines[index]!;
+    if (primary.includes(line)) continue;
+    const bytes = Buffer.byteLength(line, "utf8") + 1;
+    if (used + bytes > maxBytes) { if (!tail.length) tail.unshift(line.slice(-(maxBytes - used))); break; }
+    tail.unshift(line); used += bytes;
+  }
+  return `${header}[...earlier logs omitted...]\n${tail.join("\n")}`;
 }
+
+export interface InstallFailureSummary {
+  /** npm error code such as ERESOLVE, E404, EINTEGRITY or ENOTFOUND, when reported. */
+  readonly npmErrorCode?: string;
+  /** Redacted, bounded npm error lines (or the log tail when npm printed none). */
+  readonly output: string;
+}
+
+/** Concise, redacted `npm ci` failure evidence. npm prints the cause first
+ * (`npm error code …`, conflict/404 detail) and boilerplate last, so error
+ * lines are kept from the head; the raw tail is only a fallback. */
+export function summarizeInstallFailure(stderr: string, stdout = "", maxBytes = 1_500): InstallFailureSummary {
+  const lines = normalizeBuildLog(stderr, stdout, { maxBytes: 64_000 }).split("\n")
+    .filter(line => !/A complete log of this run|verbose|^\s*npm (?:ERR!|error)\s*$/i.test(line));
+  const errors = lines.filter(line => /^\s*npm (?:ERR!|error)\b/i.test(line));
+  const code = errors.map(line => /^\s*npm (?:ERR!|error) code (\S+)/i.exec(line)?.[1]).find(Boolean);
+  const selected: string[] = [];
+  let used = 0;
+  const source = errors.length ? errors : lines.slice(-20);
+  for (const line of source) {
+    const bytes = Buffer.byteLength(line, "utf8") + 1;
+    if (used + bytes > maxBytes) break;
+    selected.push(line); used += bytes;
+  }
+  if (!selected.length && source.length) selected.push(source[0]!.slice(0, maxBytes));
+  return { ...(code ? { npmErrorCode: code } : {}), output: selected.join("\n") };
+}
+
+/** Located TypeScript / esbuild / Vite diagnostics: `file(line,col): error TS…` or `file:line:col: ERROR`. */
+const PRIMARY_DIAGNOSTIC = /\.(?:[cm]?[jt]sx?|css|json)(?:\(\d+,\d+\)|:\d+:\d+)\s*:?\s*(?:error|ERROR)\b|\berror TS\d+:/;

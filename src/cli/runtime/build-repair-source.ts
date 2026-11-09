@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { compilerSourceDiagnostics } from "./build-repair-source-safety.js";
 
 export interface RepairSourceFile {
   readonly path: string;
@@ -11,6 +12,8 @@ export interface BuildRepairSourceSnapshot {
   readonly contextDigest: string;
   readonly context: string;
   readonly files: readonly RepairSourceFile[];
+  /** Parser-located syntax/JSX evidence from the current source (build failures only). */
+  readonly compilerDiagnostics?: string;
 }
 export const repairDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
 export function repairSourceRevision(files: readonly { readonly path: string; readonly content: string }[]): string {
@@ -23,7 +26,9 @@ export function createBuildRepairSourceSnapshot(
   diagnostics: string,
   maxBytes = 16_000,
 ): BuildRepairSourceSnapshot {
-  const normalized = diagnostics.replaceAll("\\", "/");
+  // Parser evidence also targets excerpts, so an opening tag on another line is supplied verbatim.
+  const compilerDiagnostics = diagnostics ? compilerSourceDiagnostics(input) : "";
+  const normalized = `${diagnostics}\n${compilerDiagnostics}`.replaceAll("\\", "/");
   const mentioned = [...new Set(normalized.match(/src\/[\w./-]+\.(?:tsx?|jsx?|css|json)/g) ?? [])];
   const priorities = [...mentioned, ...input.filter(file => /(?:^|\/)App\.[jt]sx?$/.test(file.path)).map(file => file.path), ...input.map(file => file.path)];
   const selected = [...new Set(priorities)].filter(path => input.some(file => file.path === path)).slice(0, 5);
@@ -70,5 +75,6 @@ export function createBuildRepairSourceSnapshot(
   }
   const context = chunks.join("\n\n");
   return Object.freeze({ revision: repairSourceRevision(input), contextDigest: repairDigest(context), context,
+    ...(compilerDiagnostics ? { compilerDiagnostics } : {}),
     files: Object.freeze(files.map(file => Object.freeze({ ...file, excerpts: Object.freeze(file.excerpts.map(range => Object.freeze(range))) }))) });
 }

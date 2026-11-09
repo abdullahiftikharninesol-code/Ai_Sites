@@ -27,15 +27,48 @@ export interface DeterministicEditScope {
 const action = /\b(?:rename|replace|change|update|rewrite|set|add|remove|implement|make|adjust)\b/i;
 const preserve = /^(?:\s*\d+[.)]\s*)?(?:do\s+not|don't|never|keep|preserve|retain|leave|without changing)\b/i;
 const contactWords = /\b(?:e-?mail|mailto|phone|telephone|tel|contact\s+(?:information|details|address)|domains?|URLs?|external\s+links?|website\s+address)\b/i;
+// Link/social wording authorizes a contact change only together with a supplied value.
+const linkWords = /\b(?:links?|websites?|web\s+site|social(?:\s+media)?|profiles?|handles?|instagram|facebook|twitter|linkedin|youtube|tiktok|pinterest|whatsapp|threads|behance|dribbble|github)\b/i;
 const normalize = (value: string) => value.replace(/&amp;|&#38;|&#x26;/gi, "&").replace(/&quot;/g, '"').replace(/&(?:apos|#39);/g, "'").replace(/\s+/g, " ").trim();
+const QUOTED = /["“][^"”]*["”]|(?<!\w)'[^']*'(?!\w)/g;
+// A preservation tail ("but keep the layout", "without changing the footer") is
+// its own clause, so it neither disables the requested change nor authorizes anything.
+const CLAUSE_TAIL = /,?\s+(?:but|while|whilst)\s+|,?\s+and\s+(?=(?:also\s+)?(?:keep|preserve|retain|leave|do\s+not|don't|never)\b)|\s+(?=without\s+(?:changing|altering|modifying|touching)\b)/gi;
+function editClauses(instruction: string): string[] {
+  return instruction.split(/[;\n]+|(?<=[.!?])\s+/).flatMap(clause => {
+    const masked = clause.replace(QUOTED, match => "\u0001".repeat(match.length)), parts: string[] = [];
+    let last = 0;
+    for (const match of masked.matchAll(CLAUSE_TAIL)) { parts.push(clause.slice(last, match.index)); last = match.index + match[0].length; }
+    parts.push(clause.slice(last));
+    return parts;
+  }).map(value => value.trim()).filter(Boolean);
+}
+
+// Website/social URLs written equivalently by the user and in source:
+// scheme (http/https or none), "www.", host case and a trailing slash or
+// sentence punctuation are not semantic. Paths, queries and fragments stay exact.
+const URL_TOKEN = /(?<![@\w.-])(?:(?:https?:)?\/\/)?(?:[a-z\d](?:[a-z\d-]*[a-z\d])?\.)+[a-z]{2,63}(?::\d{2,5})?(?:[/?#][^\s<>"'`{}]*)?/gi;
+const FILE_LIKE = /\.(?:[jt]sx?|css|json|html?|svg|png|jpe?g|webp|gif|woff2?|mjs|cjs)$/i;
+export function canonicalWebUrl(value: string): string | undefined {
+  const match = /^(?:(?:https?:)?\/\/)?(?:www\.)?((?:[a-z\d](?:[a-z\d-]*[a-z\d])?\.)+[a-z]{2,63}(?::\d{2,5})?)([/?#][^\s<>"'`{}]*)?$/i.exec(value.replace(/[.,;:!?)\]]+$/, ""));
+  if (!match || FILE_LIKE.test(match[1]!)) return undefined;
+  return match[1]!.toLowerCase() + (match[2] ?? "").replace(/\/+(?=$|[?#])/, "");
+}
+function suppliedWebUrls(text: string): string[] {
+  return [...text.matchAll(URL_TOKEN)].map(match => match[0].replace(/[.,;:!?)\]]+$/, "")).filter(token => canonicalWebUrl(token) !== undefined);
+}
+const webValue = (value: ProtectedValue) => value.kind === "domain" || value.kind === "url" && !/^(?:mailto|tel):/i.test(value.value);
+const valueCategory = (value: ProtectedValue): ProtectedKind => /^mailto:/i.test(value.value) ? "email" : /^tel:/i.test(value.value) ? "phone" : value.kind;
+const categories = (values: readonly ProtectedValue[]) => [...new Set(values.map(valueCategory))].sort();
 
 /** Deterministic, deliberately conservative grammar; preservation is not authorization. */
 export function analyzeEditScope(instruction: string, rename?: { readonly oldLiteral: string; readonly newLiteral: string }): DeterministicEditScope {
-  const clauses = instruction.split(/[;\n]+|(?<=[.!?])\s+/).map(value => value.trim()).filter(Boolean);
-  const unquoted = (value: string) => value.replace(/["“][^"”]*["”]|'[^']*'/g, "");
+  const clauses = editClauses(instruction);
+  const unquoted = (value: string) => value.replace(QUOTED, "");
   const active = clauses.filter(value => action.test(value) && !preserve.test(value) && !/\b(?:not|never|except|excluding|keep|preserve|retain|leave)\b/i.test(unquoted(value)));
   const contactClauses = active.filter(value => contactWords.test(unquoted(value)) ||
-    protectedEditValues(value).length >= 2 && /\b(?:replace|change|set)\b/i.test(value));
+    linkWords.test(unquoted(value)) && (protectedEditValues(value).length > 0 || suppliedWebUrls(value).length > 0) ||
+    protectedEditValues(value).length >= 2 && /\b(?:replace|change|set|update)\b/i.test(value));
   const copyTargets: CopyTarget[] = [];
   const colors: string[] = [];
   let complete = true;
@@ -58,7 +91,11 @@ export function analyzeEditScope(instruction: string, rename?: { readonly oldLit
     contact: contactClauses.length > 0,
     functional: /\b(?:functionality|interactive|interactions?|cart|checkout|quantity|search|filters?|gallery|newsletter|size|controls?|handlers?|state)\b/i.test(activeText),
     instruction, contactClauses,
-    requestedContacts: [...new Set(contactClauses.flatMap(clause => protectedEditValues(clause.split(/\b(?:to|with)\b/i).at(-1) ?? '').map(value => value.value)))],
+    requestedContacts: [...new Set(contactClauses.flatMap(clause => {
+      const supplied = clause.split(/\b(?:to|with)\b/i).at(-1) ?? '';
+      // Web addresses keep their full path ("instagram.com/studio"), not just the host.
+      return [...protectedEditValues(supplied).filter(value => !webValue(value)).map(value => value.value), ...suppliedWebUrls(supplied)];
+    }))],
     copyTargets, colors: [...new Set(colors.map(value => value.toLowerCase()))],
     canProveCompletion: active.length > 0 && complete,
   };
@@ -153,13 +190,16 @@ export function maskProtectedEditValues(source: string): string {
 
 function authorized(value: ProtectedValue, scope: DeterministicEditScope): boolean {
   const phoneLike = value.kind === "phone" || value.value.startsWith("tel:");
+  const web = webValue(value) ? canonicalWebUrl(value.value) : undefined;
   return scope.contactClauses.some(clause => {
     const suppliedPhone = phoneLike && protectedEditValues(clause).some(supplied => supplied.kind === "phone" && samePhoneNumber(supplied.value, value.value));
-    if (!suppliedPhone && !clause.includes(value.value) && !(value.value.startsWith("mailto:") && clause.includes(value.value.slice(7))) &&
+    // The value must still be supplied by the user; only its spelling may differ.
+    const suppliedWeb = web !== undefined && suppliedWebUrls(clause).some(supplied => canonicalWebUrl(supplied) === web);
+    if (!suppliedPhone && !suppliedWeb && !clause.includes(value.value) && !(value.value.startsWith("mailto:") && clause.includes(value.value.slice(7))) &&
         !(value.value.startsWith("tel:") && clause.includes(value.value.slice(4)))) return false;
-    return value.kind === "email" || value.value.startsWith("mailto:") ? /\b(?:email|e-mail|mailto|replace|change|set)\b/i.test(clause)
-      : value.kind === "phone" || value.value.startsWith("tel:") ? /\b(?:phone|telephone|tel|replace|change|set)\b/i.test(clause)
-      : /\b(?:domain|url|link|address|replace|change|set)\b/i.test(clause);
+    return value.kind === "email" || value.value.startsWith("mailto:") ? /\b(?:email|e-mail|mailto|replace|change|set|update)\b/i.test(clause)
+      : value.kind === "phone" || value.value.startsWith("tel:") ? /\b(?:phone|telephone|tel|replace|change|set|update)\b/i.test(clause)
+      : /\b(?:domain|url|link|address|replace|change|set|update)\b/i.test(clause) || linkWords.test(clause);
   });
 }
 
@@ -182,20 +222,31 @@ export function validateProtectedEditValues(scope: DeterministicEditScope, befor
     const removed = old.filter(value => (a.get(value.value) ?? 0) > (b.get(value.value) ?? 0));
     const added = next.filter(value => (b.get(value.value) ?? 0) > (a.get(value.value) ?? 0));
     if (!removed.length && !added.length && JSON.stringify(old.map(value => value.value)) !== JSON.stringify(next.map(value => value.value)))
-      throw scopeError(path, "PROTECTED_VALUE_REORDER_NOT_AUTHORIZED");
+      throw scopeError(path, "PROTECTED_VALUE_REORDER_NOT_AUTHORIZED", undefined,
+        { phase: "SOURCE_VALIDATION", rule: "PROTECTED_VALUE_ORDER_CHANGED", values: old });
     if (removed.length || added.length) {
       // An explicit category and supplied new literal are required. Moving or deleting
       // contact values is uncertain too; it cannot be laundered through a broad patch.
-      if (!added.length || added.some(value => !authorized(value, scope)) || removed.some(value =>
-        !added.some(replacement => replacement.kind === value.kind && authorized(replacement, scope))))
-        throw scopeError(path, "PROTECTED_VALUE_CHANGE_NOT_AUTHORIZED");
+      const unsupplied = added.filter(value => !authorized(value, scope));
+      const unreplaced = removed.filter(value => !added.some(replacement => replacement.kind === value.kind && authorized(replacement, scope)));
+      if (!added.length || unsupplied.length || unreplaced.length)
+        throw scopeError(path, "PROTECTED_VALUE_CHANGE_NOT_AUTHORIZED", undefined, {
+          phase: "SOURCE_VALIDATION",
+          rule: !added.length ? "PROTECTED_VALUE_REMOVED" : unsupplied.length ? "REPLACEMENT_NOT_SUPPLIED_BY_USER" : "REMOVED_VALUE_NOT_REPLACED",
+          values: unsupplied.length ? unsupplied : unreplaced.length ? unreplaced : removed,
+        });
     }
   }
 }
 
-export function scopeError(path: string, reason: string, patch?: SiteEditPatch): ApplicationError {
-  return new ApplicationError("VALIDATION_FAILED", `Targeted edit scope rejected in ${path}: ${reason}`, {
+/** Protection evidence names the stage, rule and value categories, never the values themselves. */
+interface ProtectionEvidence { readonly phase: "PATCH_PREFLIGHT" | "SOURCE_VALIDATION"; readonly rule: string; readonly values: readonly ProtectedValue[] }
+export function scopeError(path: string, reason: string, patch?: SiteEditPatch, evidence?: ProtectionEvidence): ApplicationError {
+  const valueCategories = evidence ? categories(evidence.values) : undefined;
+  const detail = evidence ? ` [stage=${evidence.phase}; rule=${evidence.rule}; categories=${valueCategories!.join(",") || "none"}]` : "";
+  return new ApplicationError("VALIDATION_FAILED", `Targeted edit scope rejected in ${path}: ${reason}${detail}`, {
     metadata: { failureStage: "PATCH_APPLICATION", validationCheck: "edit.scope", path, reason,
+      ...(evidence ? { protectionStage: evidence.phase, protectionRule: evidence.rule, valueCategories, valueCount: evidence.values.length } : {}),
       ...(patch ? { findDigest: editTextDigest(patch.find), replacementDigest: editTextDigest(patch.replace) } : {}) },
   });
 }
@@ -232,7 +283,8 @@ export function independentScopedPatches(patches: readonly SiteEditPatch[], sour
         old.length !== next.length || old.some((value, i) => value.kind !== next[i]!.kind) ||
         new Set(old.map(value => value.value)).size !== 1 || new Set(next.map(value => value.value)).size !== 1 ||
         [...old, ...next].some(value => scope.instruction.includes(value.value)))
-      throw scopeError(patch.path, "MIXED_OR_UNCERTAIN_UNAUTHORIZED_OPERATION", patch);
+      throw scopeError(patch.path, "MIXED_OR_UNCERTAIN_UNAUTHORIZED_OPERATION", patch,
+        { phase: "PATCH_PREFLIGHT", rule: "UNAUTHORIZED_PROTECTED_VALUE_IN_PATCH", values: next.filter(value => !authorized(value, scope)).concat(old) });
     const original = source.get(patch.path) ?? "", offsets = exactMatchOffsets(original, patch.find);
     if (!offsets.length || !/\.[jt]sx$/.test(patch.path)) throw scopeError(patch.path, "UNPROVEN_SOURCE_INDEPENDENCE", patch);
     const file = ts.createSourceFile(patch.path, original, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -347,12 +399,14 @@ function provenAuthorizedPatch(patch: SiteEditPatch, source: string, scope: Dete
 export function validateEditScopeCompletion(scope: DeterministicEditScope, before: ReadonlyMap<string, string>, after: ReadonlyMap<string, string>): void {
   for (const requested of scope.requestedContacts) {
     let found = false;
+    const requestedWeb = canonicalWebUrl(requested);
     for (const [path, source] of after) {
       if (!/\.[jt]sx?$/.test(path)) continue;
       const file = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
       const visit = (node: ts.Node): void => {
         if ((ts.isStringLiteralLike(node) || ts.isJsxText(node)) && protectedEditValues(ts.isJsxText(node) ? node.getText(file) : node.text)
           .some(value => value.value === requested || value.value === `mailto:${requested}` || value.value === `tel:${requested}` ||
+            requestedWeb !== undefined && webValue(value) && canonicalWebUrl(value.value) === requestedWeb ||
             !/[@a-z]/i.test(requested) && (value.kind === "phone" || value.value.startsWith("tel:")) && samePhoneNumber(value.value, requested))) found = true;
         ts.forEachChild(node, visit);
       };

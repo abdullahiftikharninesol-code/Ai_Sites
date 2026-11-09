@@ -14,6 +14,7 @@ import type { ArtifactStore } from "../../persistence/artifact-store.js";
 import type { SiteProjectRepository } from "../../persistence/repositories.js";
 import type { SiteVersionCommitter, UnnumberedSiteVersion } from "../../persistence/version-committer.js";
 import { SITE_V1_TECHNICAL_PROFILE } from "../../cli/runtime/site-technical-profile.js";
+import { normalizeBuildLog, summarizeInstallFailure } from "../../cli/runtime/build-log-normalizer.js";
 import type { SiteProject } from "../../sites/domain/entities.js";
 import { SitePackageValidator } from "../../sites/generation/site-policies.js";
 import { SiteSourceSnapshotService, summarizeChanges } from "../../sites/generation/source-snapshot.js";
@@ -114,10 +115,14 @@ export class TemplateInstantiationService {
         timeoutMs: 300_000,
       });
       if (install.exitCode !== 0 || install.timedOut) {
-        markTemplateInstantiationStage("BUILD", { command: "npm ci", exitCode: install.exitCode, timedOut: install.timedOut });
+        const failure = summarizeInstallFailure(install.stderr, install.stdout);
+        markTemplateInstantiationStage("BUILD", { command: "npm ci", exitCode: install.exitCode, timedOut: install.timedOut,
+          ...(failure.npmErrorCode ? { npmErrorCode: failure.npmErrorCode } : {}), output: failure.output });
         throw new ApplicationError(
           "TEMPLATE_INSTANTIATION_BUILD_FAILED",
           "Template dependency installation failed",
+          { metadata: { failureStage: "BUILD", command: "npm ci", exitCode: install.exitCode, timedOut: install.timedOut,
+            ...(failure.npmErrorCode ? { npmErrorCode: failure.npmErrorCode } : {}) } },
         );
       }
       const buildCommand = await this.deps.execution.executeCommand(environment.id, {
@@ -126,7 +131,8 @@ export class TemplateInstantiationService {
         timeoutMs: 180_000,
       });
       if (buildCommand.exitCode !== 0 || buildCommand.timedOut) {
-        markTemplateInstantiationStage("BUILD", { command: "npm run build", exitCode: buildCommand.exitCode, timedOut: buildCommand.timedOut });
+        markTemplateInstantiationStage("BUILD", { command: "npm run build", exitCode: buildCommand.exitCode, timedOut: buildCommand.timedOut,
+          output: normalizeBuildLog(buildCommand.stderr, buildCommand.stdout, { maxBytes: 1_500 }) });
         throw new ApplicationError(
           "TEMPLATE_INSTANTIATION_BUILD_FAILED",
           "Template build validation failed",

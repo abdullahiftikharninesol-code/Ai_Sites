@@ -217,4 +217,21 @@ describe("Real scratch pipeline, compiler repair and unchanged QA gates", () => 
     expect(retained.buildRepair.kind).toBe("interaction");
     expect(retained.buildRepair.initialDiagnostics).not.toContain("TS2322");
   }, 120_000);
+
+  it("Studio Solace regression: the single repair request names the unclosed <p> behind a bare TS1003, without extra calls", async () => {
+    const path = "src/App.tsx", text = "Thoughtful digital experiences for ambitious ideas.";
+    const candidate: SiteCoderFileBundle = { ...vertexBundle, files: vertexBundle.files.map(file => file.path === path ? { ...file, content: file.content.replace(`${text}</p>`, `${text}</>`) } : file) };
+    const content = candidate.files.find(file => file.path === path)!.content;
+    expect(content).toContain(`<p>${text}</>`);
+    const line = content.split("\n").findIndex(source => source.includes(`${text}</>`)) + 1;
+    const lineText = content.split("\n")[line - 1]!;
+    const h = await harness(candidate, () => ({ patches: [] }));
+    await expect(h.product.pipeline.generate({ ...request, retainPreview: false })).rejects.toMatchObject({ code: "REPAIR_LIMIT_REACHED" });
+    expect(h.requests).toHaveLength(2);
+    const repairContext = h.requests[1]!.messages[0]!.content;
+    expect(repairContext).toContain("Parser-located source diagnostics");
+    expect(repairContext).toContain(`JSX <p> opened at ${path}:${line}:${lineText.indexOf(`<p>${text}`) + 1} is closed by </> at ${path}:${line}:${lineText.indexOf(`${text}</>`) + text.length + 1}`);
+    expect(repairContext).toContain(`${path}:${line}:`);
+    expect(h.billing.finalizeSuccessfulJob).not.toHaveBeenCalled();
+  }, 120_000);
 });

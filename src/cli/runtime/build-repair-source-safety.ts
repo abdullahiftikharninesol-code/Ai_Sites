@@ -33,6 +33,46 @@ export function redundantJsxClosingRepair(path: string, content: string): { read
   return { content: next, line: position.line + 1, column: position.character + 1 };
 }
 
+/** Parser-located evidence for build repair. Compiler output can name only a
+ * secondary symptom (e.g. TS1003 at `</>`) or be truncated; the TypeScript parser
+ * on the current source gives the exact positions of the first syntax errors and
+ * of each JSX element whose closing tag does not match its opening tag. */
+export function compilerSourceDiagnostics(files: readonly { readonly path: string; readonly content: string }[], maxBytes = 1_500): string {
+  const findings: string[] = [];
+  let used = 0;
+  const push = (line: string): boolean => {
+    const bytes = Buffer.byteLength(line) + 1;
+    if (used + bytes > maxBytes) return false;
+    findings.push(line); used += bytes; return true;
+  };
+  for (const file of files) {
+    if (!/\.[jt]sx?$/.test(file.path) || Buffer.byteLength(file.content) > 256 * 1024) continue;
+    const source = parse(file.path, file.content);
+    if (!source.parseDiagnostics.length) continue;
+    const at = (offset: number) => { const p = source.getLineAndCharacterOfPosition(offset); return `${file.path}:${p.line + 1}:${p.character + 1}`; };
+    const excerpt = (start: number, end: number) => JSON.stringify(file.content.slice(Math.max(0, start - 40), Math.min(file.content.length, end + 40)).replace(/\s+/g, " "));
+    for (const diagnostic of source.parseDiagnostics.slice(0, 2))
+      if (!push(`${at(diagnostic.start ?? 0)} TS${diagnostic.code}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, " ")}`)) return findings.join("\n");
+    const mismatched: ts.JsxElement[] = [];
+    const visit = (node: ts.Node): void => {
+      if (ts.isJsxElement(node) && node.openingElement.tagName.getText(source) !== node.closingElement.tagName.getText(source)) mismatched.push(node);
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    // Innermost (earliest-closing) mismatch first: outer mismatches are usually recovery cascades.
+    mismatched.sort((a, b) => a.closingElement.getStart(source) - b.closingElement.getStart(source));
+    for (const element of mismatched.slice(0, 3)) {
+      const tag = element.openingElement.tagName.getText(source), opening = element.openingElement.getStart(source);
+      const close = element.closingElement, closeStart = close.getStart(source), closeTag = close.tagName.getText(source);
+      const line = close.end > closeStart
+        ? `JSX <${tag}> opened at ${at(opening)} is closed by </${closeTag}> at ${at(closeStart)}; opening context ${excerpt(opening, element.openingElement.end)}; closing context ${excerpt(closeStart, close.end)}`
+        : `JSX <${tag}> opened at ${at(opening)} has no closing tag before ${at(closeStart)}; opening context ${excerpt(opening, element.openingElement.end)}`;
+      if (!push(line)) return findings.join("\n");
+    }
+  }
+  return findings.join("\n");
+}
+
 interface Control { readonly key: string; readonly required: boolean; readonly disabled: boolean; readonly readOnly: boolean; readonly hidden: boolean; readonly handlers: readonly string[]; readonly bindings: readonly string[] }
 function formControls(source: ts.SourceFile): Control[] {
   const controls: Control[] = [];

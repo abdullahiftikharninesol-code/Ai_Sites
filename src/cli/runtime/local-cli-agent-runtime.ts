@@ -539,6 +539,7 @@ export class LocalCliAgentRuntime {
           "Each 'find' must copy a unique, contiguous verbatim anchor from the supplied source snapshot, including surrounding context when text repeats. Headers are not source. Reference only these exact paths; never guess an extension. All patches refer to this same snapshot: combine overlapping changes; do not target text created by an earlier patch.",
           `Source revision: ${snapshot.revision}`,
           `${kind === "build" ? "Build output" : kind === "functional" && output.startsWith("Browser QA") ? "Browser QA diagnostics" : "Static validation diagnostics"}:\n${output}`,
+          snapshot.compilerDiagnostics ? `Parser-located source diagnostics (current files; fix the root mismatch first):\n${snapshot.compilerDiagnostics}` : "",
           dependencyManifest ? `Current dependency manifest:\n${JSON.stringify({
             dependencies: dependencyManifest.dependencies, devDependencies: dependencyManifest.devDependencies,
           })}` : "",
