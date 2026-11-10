@@ -72,6 +72,8 @@ const relativeTime = (value?: string) => {
   const days = Math.round(hours / 24);
   return `Updated ${days} day${days === 1 ? "" : "s"} ago`;
 };
+/** Below the server idle TTL (1 hour by default). */
+const PREVIEW_KEEPALIVE_MS = 5 * 60 * 1000;
 const readableError = (reason: unknown, fallback: string) => reason instanceof Error ? reason.message : fallback;
 export function App() {
   const location = useLocation();
@@ -180,6 +182,23 @@ export function App() {
     const projectId = decodeURIComponent(match[1]!);
     if (detail?.project.projectId !== projectId) void openSite(projectId);
   }, [location.pathname, detail?.project.projectId]);
+  // While a preview is shown, keep it out of idle cleanup. If it has ended (idle
+  // timeout, process exit or server restart), restore the saved version from its
+  // source snapshot; this never calls the AI or charges.
+  useEffect(() => {
+    const siteId = detail?.project.projectId;
+    if (!preview || !siteId) return;
+    const current = preview;
+    const timer = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      void api.touchPreview(current.id).catch(async (reason: unknown) => {
+        if ((reason as { code?: unknown }).code !== "PREVIEW_EXPIRED") return;
+        const restored = await api.preview(siteId, current.versionId);
+        setPreview((shown) => shown?.id === current.id ? { id: restored.previewSessionId, url: restored.previewUrl, versionId: current.versionId } : shown);
+      }).catch((reason: unknown) => setError(readableError(reason, "Unable to restore the preview")));
+    }, PREVIEW_KEEPALIVE_MS);
+    return () => clearInterval(timer);
+  }, [preview?.id, detail?.project.projectId]);
   const newRun = () => { navigate("/"); setDetail(undefined); setSelectedVersion(undefined); setPreview(undefined); setMode("PREVIEW"); setError(""); setConversation([]); };
   const startVersionPreview = async (siteId: string, versionId: string) => { if (preview) await api.stopPreview(preview.id); const value = await api.preview(siteId, versionId); setPreview({ id: value.previewSessionId, url: value.previewUrl, versionId }); };
   const followJob = (jobId: string) => new Promise<JobStatus>((resolve, reject) => {

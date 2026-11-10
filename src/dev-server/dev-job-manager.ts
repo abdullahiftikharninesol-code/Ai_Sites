@@ -39,6 +39,11 @@ export interface DevJobRecord {
     quotaCategory?: string;
     retryAfterSeconds?: number;
     diagnostics?: string;
+    /** Request-review failures: what in the prompt cannot be built, in plain language. */
+    requestIssue?: "UNSUPPORTED_FEATURES" | "CONFLICTING_INSTRUCTIONS";
+    unsupportedFeatures?: string[];
+    matchedPhrases?: string[];
+    conflictingFeatures?: string[];
   };
   intelligence?: readonly AgentTaskTelemetry[];
   readonly events: DevJobEvent[];
@@ -49,6 +54,10 @@ export class DevJobManager {
   readonly #owners = new Map<string, string>();
   readonly #listeners = new Map<string, Set<(event: DevJobEvent) => void>>();
   #mutationRunning = false;
+  /** True while a generation or edit may still commit a new version. */
+  get mutationRunning(): boolean {
+    return this.#mutationRunning;
+  }
   constructor(private readonly progress: InMemoryProgressBus) {}
   start(
     operation: DevJobRecord["operation"],
@@ -198,6 +207,11 @@ export class DevJobManager {
           ...(typeof metadata.diagnostics === "string"
             ? { diagnostics: metadata.diagnostics.slice(-8_000) }
             : {}),
+          ...(metadata.requestIssue === "UNSUPPORTED_FEATURES" || metadata.requestIssue === "CONFLICTING_INSTRUCTIONS"
+            ? { requestIssue: metadata.requestIssue } : {}),
+          ...requestReviewList("unsupportedFeatures", metadata.unsupportedFeatures),
+          ...requestReviewList("matchedPhrases", metadata.matchedPhrases),
+          ...requestReviewList("conflictingFeatures", metadata.conflictingFeatures),
         };
         console.error(
           `[sites] job=${job.id} operation=${operation} status=FAILED code=${job.error.code} message=${job.error.message}`,
@@ -254,4 +268,11 @@ export class DevJobManager {
       }
     }
   }
+}
+
+/** Bounded, string-only lists copied from request-review error metadata. */
+function requestReviewList<K extends string>(key: K, value: unknown): Partial<Record<K, string[]>> {
+  if (!Array.isArray(value)) return {};
+  const items = value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 6).map(item => item.slice(0, 120));
+  return items.length ? ({ [key]: items } as Partial<Record<K, string[]>>) : {};
 }

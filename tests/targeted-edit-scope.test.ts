@@ -110,6 +110,53 @@ describe('Deterministic targeted-edit scope, no provider calls', () => {
     expect(protectedEditValues('.product.card{color:red}', 'src/styles.css')).toEqual([]);
     expect(protectedEditValues('background:url(//cdn.oldbrand.fashion/photo)', 'src/styles.css')).toMatchObject([{ kind: 'url', value: '//cdn.oldbrand.fashion/photo)' }]);
   });
+
+  const petSafeInstruction = 'On the Shop page, add a "Pet-safe" filter checkbox and show a "Pet-safe" tag on the plants that qualify.';
+  const shopPath = 'src/App.tsx';
+  const filterAnchor = "plants.filter(plant => (category === 'All' || plant.category === category) && plant.name.toLowerCase().includes(query.toLowerCase()))";
+  const cardAnchor = '<article><h3>{product.name}</h3>';
+  const shopSource = [
+    "import { useMemo, useState } from 'react';",
+    "type Product = { name: string; category: string; petSafe: boolean };",
+    "const plants: Product[] = [{ name: 'Boston Fern', category: 'Indoor', petSafe: true }, { name: 'Aloe Vera', category: 'Succulent', petSafe: false }];",
+    `function ProductCard({ product }: { product: Product }) { return ${cardAnchor}<p>{product.category}</p></article>; }`,
+    'function Shop() {',
+    "  const [query] = useState('');",
+    "  const [category] = useState('All');",
+    `  const visible = useMemo(() => ${filterAnchor}, [category, query]);`,
+    '  return <main>{visible.map(product => <ProductCard key={product.name} product={product} />)}<a href="https://leafandloom.fashion">Visit</a><p>hello@leafandloom.example</p></main>;',
+    '}',
+  ].join('\n');
+  const petSafePatches = [
+    patch("  const [query] = useState('');", "  const [query] = useState('');\n  const [petSafeOnly, setPetSafeOnly] = useState(false);", 'unique', shopPath),
+    patch(filterAnchor, filterAnchor.replace('&& plant.name', '&& (!petSafeOnly || plant.petSafe) && plant.name'), 'unique', shopPath),
+    patch('[category, query]', '[category, query, petSafeOnly]', 'unique', shopPath),
+    patch('return <main>', 'return <main><label><input type="checkbox" checked={petSafeOnly} onChange={event => setPetSafeOnly(event.target.checked)} />Pet-safe</label>', 'unique', shopPath),
+    patch(cardAnchor, cardAnchor + '{product.petSafe && <span>Pet-safe</span>}', 'unique', shopPath),
+  ];
+
+  it('applies a pet-safe filter and tag using partial TSX anchors without mistaking member access for domains', async () => {
+    const before = new Map([[shopPath, shopSource]]), w = await setup(before);
+    const excluded = vi.fn();
+    await applySiteEditPatchBundle(w.execution, w.id, { patches: petSafePatches }, { ...context(petSafeInstruction, before), onScopeExclusion: excluded });
+    const after = await w.execution.readFile(w.id, shopPath);
+    expect(after).toContain('(!petSafeOnly || plant.petSafe)');
+    expect(after).toContain('onChange={event => setPetSafeOnly(event.target.checked)}');
+    expect(after).toContain('{product.petSafe && <span>Pet-safe</span>}');
+    expect(protectedEditValues(after, shopPath).map(value => value.value)).toEqual(['https://leafandloom.fashion', 'hello@leafandloom.example']);
+    expect(excluded).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['leafandloom.fashion', 'other.fashion'],
+    ['hello@leafandloom.example', 'hello@other.example'],
+  ])('still rejects an unrelated contact change alongside the filter (%s)', async (find, replace) => {
+    const before = new Map([[shopPath, shopSource]]), w = await setup(before);
+    const writes = vi.spyOn(w.execution, 'writeFile');
+    await expect(applySiteEditPatchBundle(w.execution, w.id, { patches: [...petSafePatches, patch(find, replace, 'unique', shopPath)] }, context(petSafeInstruction, before))).rejects.toMatchObject({ code: 'VALIDATION_FAILED', metadata: { validationCheck: 'edit.scope' } });
+    expect(writes).not.toHaveBeenCalled();
+    expect(await w.execution.readFile(w.id, shopPath)).toBe(shopSource);
+  });
   it.each([0, 1, 2, 3, 4])('does not accept missing requested operation %s just because the email was excluded', async missing => {
     const w = await setup();
     await expect(applySiteEditPatchBundle(w.execution, w.id, { patches: [...required.filter((_item, index) => index !== missing), email] }, context())).rejects.toMatchObject({ code: 'EDIT_REQUIREMENT_INCOMPLETE' });

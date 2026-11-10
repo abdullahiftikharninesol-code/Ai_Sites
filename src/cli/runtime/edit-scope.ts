@@ -269,12 +269,26 @@ function protectedShape(source: string): string {
   return result;
 }
 
+/** A patch fragment need not parse on its own: an unfinished JSX anchor can
+ * make product.petSafe look like a bare domain. Only dismiss that evidence
+ * when every exact source location preserves the full protected-value sequence.
+ * The resolved bundle is still checked before any writes. */
+function preservesProtectedValuesInSource(patch: SiteEditPatch, source: string): boolean {
+  if (patch.mode === "create") return false;
+  const offsets = exactMatchOffsets(source, patch.find);
+  if (!offsets.length) return false;
+  const signature = (text: string) => JSON.stringify(protectedEditValues(text, patch.path).map(value => [value.kind, value.value]));
+  const before = signature(source);
+  return offsets.every(offset => signature(source.slice(0, offset) + patch.replace + source.slice(offset + patch.find.length)) === before);
+}
+
 /** Only whole, pure protected-literal substitutions can be excluded, never a mixed patch. */
 export function independentScopedPatches(patches: readonly SiteEditPatch[], source: ReadonlyMap<string, string>, scope: DeterministicEditScope): { readonly patches: readonly SiteEditPatch[]; readonly excluded: readonly number[] } {
   const excluded: number[] = [];
   for (const [index, patch] of patches.entries()) {
     const old = protectedEditValues(patch.find, patch.path), next = protectedEditValues(patch.replace, patch.path);
     if (JSON.stringify([...counts(old)]) === JSON.stringify([...counts(next)])) continue;
+    if ([...old, ...next].some(value => value.kind === "domain") && preservesProtectedValuesInSource(patch, source.get(patch.path) ?? "")) continue;
     if (next.length && next.every(value => authorized(value, scope))) continue;
     // Contact/navigation requests that cannot be bound to a supplied value are
     // uncertain, not clearly unrelated. Do not silently omit a required change.

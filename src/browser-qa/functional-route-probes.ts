@@ -7,6 +7,7 @@ import { equivalentPage } from "../sites/generation/requested-pages.js";
 import { functionalPageSurface, meaningfulPageContent } from "./functional-surfaces.js";
 import { classifyBrowserQAFailure } from "./browser-qa-failure.js";
 import { mobileNavigationToggle } from "./mobile-navigation.js";
+import { FunctionalCoverageLimit } from "./behavior-probes.js";
 
 /** Resolve real semantic sections; a descriptive name is never a guessed ID. */
 export async function functionalSectionSurface(page: Page, target: FunctionalRequirement["target"]): Promise<Locator> {
@@ -151,14 +152,17 @@ export interface FunctionalProbeResult {
   readonly capability: string;
   readonly expectedRoute: string;
   readonly actualRoute: string;
-  readonly result: "PASS" | "FAIL";
+  /** LIMITED: the behavior could not be objectively established (coverage, not a defect). */
+  readonly result: "PASS" | "FAIL" | "LIMITED";
+  /** What was actually checked, or why coverage is limited (bounded). */
+  readonly detail?: string;
   readonly sourceEvidence?: FunctionalRequirement["sourceEvidence"];
   readonly sourceAssessment?: FunctionalRequirement["sourceAssessment"];
 }
 export async function runRouteRequirements(
   context: BrowserQAPageContext,
   contract: ResolvedFunctionalContract,
-  probe: (requirement: FunctionalRequirement) => Promise<void>,
+  probe: (requirement: FunctionalRequirement) => Promise<string | void>,
 ): Promise<BrowserQACheckResult> {
   const observations: FunctionalProbeResult[] = [];
   const applicable = contract.requirements.filter(requirement => {
@@ -170,6 +174,10 @@ export async function runRouteRequirements(
     const candidates = requirement.routes ?? [];
     const siteWide = requirement.target.kind === "SITE";
     let error: unknown;
+    // Every attempted route's failure is kept: the last candidate's error alone
+    // (e.g. "absent" on a route that never had the control) hides the real defect.
+    const attempts: string[] = [];
+    let passed = false;
     for (const route of siteWide ? [context.route] : candidates) {
       try {
         const target = new URL(route, context.page.url());
@@ -177,24 +185,34 @@ export async function runRouteRequirements(
         await context.page.locator("main,#root").first().waitFor({ state: "visible", timeout: 2_000 });
         await frame(context.page);
         if (requirement.target.kind === "SECTION") await functionalSectionSurface(context.page, requirement.target);
-        await probe(requirement);
+        const checked = await probe(requirement);
         observations.push({ requirementId: requirement.id, capability: requirement.capability, expectedRoute: route, actualRoute: new URL(context.page.url()).pathname,
-          result: "PASS", sourceEvidence: requirement.sourceEvidence, sourceAssessment: requirement.sourceAssessment }); error = undefined; break;
+          result: "PASS", ...(checked ? { detail: checked.slice(0, 300) } : {}), sourceEvidence: requirement.sourceEvidence, sourceAssessment: requirement.sourceAssessment }); error = undefined; passed = true; break;
       } catch (cause) {
+        if (cause instanceof FunctionalCoverageLimit) {
+          // Not objectively verifiable here: try another candidate route, never fail on it.
+          observations.push({ requirementId: requirement.id, capability: requirement.capability, expectedRoute: route, actualRoute: new URL(context.page.url()).pathname,
+            result: "LIMITED", detail: cause.message.slice(0, 300), sourceEvidence: requirement.sourceEvidence, sourceAssessment: requirement.sourceAssessment });
+          continue;
+        }
         error = cause;
+        attempts.push(`${route}: ${cause instanceof Error ? cause.message.slice(0, 600) : String(cause)}`);
         observations.push({ requirementId: requirement.id, capability: requirement.capability, expectedRoute: route, actualRoute: new URL(context.page.url()).pathname,
           result: "FAIL", sourceEvidence: requirement.sourceEvidence, sourceAssessment: requirement.sourceAssessment });
       }
     }
-    const detail = error instanceof Error ? error.message : "No implemented required route";
+    if (!error && !passed && candidates.length && observations.some(item => item.requirementId === requirement.id && item.result === "LIMITED")) continue;
+    const detail = error instanceof Error ? (attempts.length > 1 ? attempts.join(" | ") : error.message) : "No implemented required route";
     const boundedDetail = detail.length <= 1500 ? detail : detail.slice(0, 900) + "\n…\n" + detail.slice(-590);
     if (error || !candidates.length) return createBrowserQACheckResult({ checkId: "functional.requirements", category: "INTERACTION", status: "FAIL", severity: "ERROR",
       failureKind: error ? classifyBrowserQAFailure(error, "functional.requirements") : "FUNCTIONAL_FAILURE",
       route: context.route, viewport: context.viewport, message: `${requirement.id} on ${candidates.join(", ")}`.slice(0, 400) + ": " + boundedDetail,
       functionalProbes: observations });
   }
+  const limited = new Set(observations.filter(item => item.result === "LIMITED" && !observations.some(other => other.requirementId === item.requirementId && other.result === "PASS")).map(item => item.requirementId));
   return createBrowserQACheckResult({ checkId: "functional.requirements", category: "INTERACTION", status: applicable.length ? "PASS" : "SKIPPED", severity: "ERROR",
-    route: context.route, viewport: context.viewport, message: applicable.length ? "Route-scoped requested behavior passed observable probes" : "No requested functional behavior is assigned to this route and viewport", functionalProbes: observations });
+    route: context.route, viewport: context.viewport, message: !applicable.length ? "No requested functional behavior is assigned to this route and viewport"
+      : limited.size ? `Route-scoped requested behavior passed observable probes; limited coverage for ${[...limited].join(", ").slice(0, 200)}` : "Route-scoped requested behavior passed observable probes", functionalProbes: observations });
 }
 
 /** Required pages need actual reachable navigation, including collapsed mobile menus. */

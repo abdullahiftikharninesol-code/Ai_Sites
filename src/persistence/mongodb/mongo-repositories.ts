@@ -12,7 +12,7 @@ import type {
   SiteProjectRepository,
   SiteVersionRepository,
 } from "../repositories.js";
-import type { SiteVersionCommitter, UnnumberedSiteVersion } from "../version-committer.js";
+import type { SiteVersionCommitOptions, SiteVersionCommitter, UnnumberedSiteVersion } from "../version-committer.js";
 import type { MongoModels, MongoSiteJobRecord, MongoSiteProjectRecord } from "./mongo-models.js";
 
 interface LegacyMongoCurrentFile {
@@ -160,9 +160,23 @@ export class MongoSiteVersionRepository implements SiteVersionRepository {
     const parsed = parseVersionId(id);
     if (!parsed) return undefined;
     const record = await this.models.projects.findById(parsed.siteId).lean().exec();
-    if (!record || record.versionNumber < 1 || record.versionNumber !== parsed.versionNumber)
-      return undefined;
-    return this.#current(record);
+    if (!record || record.versionNumber < 1) return undefined;
+    if (record.versionNumber === parsed.versionNumber) return this.#current(record);
+    // The one retained previous verified version (one-step recovery); older
+    // versions are intentionally not addressable in the current-state model.
+    const previous = record.previousVersion;
+    if (previous?.versionNumber !== parsed.versionNumber) return undefined;
+    const version: SiteVersion = {
+      id: versionIdFor(record._id, previous.versionNumber),
+      siteId: record._id as SiteId,
+      versionNumber: previous.versionNumber,
+      sourceArtifactRef: previous.sourceArtifactRef,
+      ...(previous.sourceManifestRef ? { sourceManifestRef: previous.sourceManifestRef } : {}),
+      buildStatus: "SUCCEEDED",
+      browserQAStatus: "PASSED",
+      createdAt: new Date(previous.updatedAt),
+    };
+    return version;
   }
 
   async save(version: SiteVersion) {
@@ -203,6 +217,7 @@ export class MongoSiteVersionCommitter implements SiteVersionCommitter {
     project: SiteProject,
     draft: UnnumberedSiteVersion,
     expectedNumber?: number,
+    options: SiteVersionCommitOptions = {},
   ): Promise<SiteVersion> {
     try {
       if (draft.siteId !== project.id)
@@ -227,7 +242,7 @@ export class MongoSiteVersionCommitter implements SiteVersionCommitter {
           "PERSISTENCE_TRANSACTION_FAILED",
           "Current site changed while saving the generated result",
         );
-      const operation = current.versionNumber === 0 ? "GENERATE" : "EDIT";
+      const operation = current.versionNumber === 0 ? "GENERATE" : options.operation ?? "EDIT";
       const set: Record<string, unknown> = {
         sourceArtifactRef: draft.sourceArtifactRef,
         sourceManifestRef,
@@ -236,8 +251,17 @@ export class MongoSiteVersionCommitter implements SiteVersionCommitter {
         lastOperation: operation,
         updatedAt: new Date(),
       };
+      // Retain the replaced verified version in the same compare-and-swap, so a
+      // one-step rollback never depends on a separate (non-atomic) write.
+      if (current.versionNumber > 0)
+        set.previousVersion = {
+          versionNumber: current.versionNumber,
+          sourceArtifactRef: sourceArtifactRefFrom(current),
+          sourceManifestRef: sourceManifestRefFrom(current),
+          updatedAt: current.updatedAt,
+        };
       const update: Record<string, unknown> = { $set: set };
-      if (operation === "EDIT") set.lastEditPrompt = project.lastEditPrompt ?? "";
+      if (operation !== "GENERATE") set.lastEditPrompt = project.lastEditPrompt ?? "";
       else {
         set.name = project.name;
         update.$unset = { lastEditPrompt: 1 };
@@ -254,8 +278,10 @@ export class MongoSiteVersionCommitter implements SiteVersionCommitter {
           "PERSISTENCE_TRANSACTION_FAILED",
           "Current site changed while saving the generated result",
         );
+      // The parent is exactly the version retained as previousVersion above.
       const version: SiteVersion = {
         ...draft, id: versionIdFor(project.id, versionNumber), versionNumber, sourceManifestRef,
+        ...(current.versionNumber > 0 ? { parentVersionId: versionIdFor(project.id, current.versionNumber) } : {}),
       };
       this.state.versions.set(project.id, cloneVersion(version));
       return version;

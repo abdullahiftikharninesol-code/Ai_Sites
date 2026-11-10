@@ -9,7 +9,9 @@ import { browserQARuntimeChecks } from "./browser-qa-runtime-checks.js";
 import { functionalBrowserChecks } from "./functional-capability-checks.js";
 import type { ResolvedFunctionalContract } from "../sites/generation/functional-route-contract.js";
 
-const advisoryChecks = new Set(["generation.requirement-advisories", "functional.requirements", "functional.navigation", "functional.controls", "interaction-smoke", "interaction.mobile-nav", "form-smoke", "responsive-overflow", "broken-images", "accessibility-smoke", "runtime.console-error"]);
+// functional.requirements is not advisory: it carries only source-recognized requested
+// behavior (see adaptive-qa-policy). Uncertain requirements use the optional check id.
+const advisoryChecks = new Set(["generation.requirement-advisories", "functional.optional-requirements", "functional.navigation", "functional.controls", "interaction-smoke", "interaction.mobile-nav", "form-smoke", "responsive-overflow", "broken-images", "accessibility-smoke", "runtime.console-error"]);
 
 /** Change acceptance, never erase a failed assertion or its diagnostic evidence. */
 export function applyUsableGenerationReportPolicy(report: BrowserQAReport): BrowserQAReport {

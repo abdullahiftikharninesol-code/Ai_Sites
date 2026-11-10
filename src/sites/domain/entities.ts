@@ -10,7 +10,7 @@ export interface SiteProject {
   readonly name: string;
   readonly originalPrompt?: string;
   readonly versionNumber?: number;
-  readonly lastOperation?: "GENERATE" | "EDIT";
+  readonly lastOperation?: "GENERATE" | "EDIT" | "ROLLBACK";
   readonly lastEditPrompt?: string;
   readonly slug: string;
   readonly status: SiteProjectStatus;

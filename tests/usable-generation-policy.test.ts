@@ -39,13 +39,15 @@ describe('Usable generation acceptance without complete prompt coverage',()=>{
     expect(generationInteractionAdvisories(original)[0]?.check).toBe('interaction.controls');
     expect(()=>validateReferenceInteractions(original)).toThrow(/without an action/);
   });
-  it.each(['functional.requirements','functional.navigation','functional.controls','interaction-smoke','interaction.mobile-nav','form-smoke','responsive-overflow','accessibility-smoke','runtime.console-error'])('retains %s failure evidence as advisory',checkId=>{
+  // Phase 2: only source-uncertain requirement probes are advisory; source-recognized
+  // requested behavior (functional.requirements) is a blocking assertion.
+  it.each(['functional.optional-requirements','functional.navigation','functional.controls','interaction-smoke','interaction.mobile-nav','form-smoke','responsive-overflow','accessibility-smoke','runtime.console-error'])('retains %s failure evidence as advisory',checkId=>{
     const report=createBrowserQAReport({runId:'offline',browser:{name:'chromium'},routes:['/'],viewports:[],checks:[{checkId,category:'INTERACTION',status:'FAIL',severity:'ERROR',failureKind:'CHECK_TIMEOUT',message:'Original private finding'}],startedAt:new Date(0).toISOString(),completedAt:new Date(1).toISOString(),durationMs:1});
     expect(report.status).toBe('FAIL');const accepted=applyUsableGenerationReportPolicy(report);
     expect(accepted.status).toBe('PASS_WITH_WARNINGS');expect(accepted.checks[0]).toMatchObject({status:'FAIL',severity:'WARNING',failureKind:'CHECK_TIMEOUT',message:'Original private finding'});
     expect(report.checks[0]?.severity).toBe('ERROR');
   });
-  it.each(['generation.meaningful-content','generation.primary-navigation','runtime.page-error','network.failed-request','qa.run-budget','qa.infrastructure'])('never downgrades the blocking %s gate',checkId=>{
+  it.each(['functional.requirements','generation.meaningful-content','generation.primary-navigation','runtime.page-error','network.failed-request','qa.run-budget','qa.infrastructure'])('never downgrades the blocking %s gate',checkId=>{
     const report=createBrowserQAReport({runId:'offline',browser:{name:'chromium'},routes:['/'],viewports:[],checks:[{checkId,category:'RUNTIME',status:'FAIL',severity:'ERROR',message:'Blocking finding'}],startedAt:new Date(0).toISOString(),completedAt:new Date(1).toISOString(),durationMs:1});
     expect(applyUsableGenerationReportPolicy(report).status).toBe('FAIL');
   });
@@ -94,7 +96,10 @@ describe('Real offline build/QA/persistence under usable generation policy',()=>
   it('accepts a usable site missing requested pages, FAQ, tabs, form and mobile menu; saves unchanged current source and bills once',async()=>{
     const h=await harness();const result=await h.product.pipeline.generate(h.request);
     expect(result.build.success).toBe(true);expect(result.browserQA?.status).toBe('PASS_WITH_WARNINGS');expect(result.browserQA?.checks.filter(check=>check.status==='FAIL'&&check.severity==='ERROR')).toEqual([]);
-    expect(result.browserQA?.routes).toEqual(['/']);expect(new Set(result.browserQA?.viewports.map(view=>view.id))).toEqual(new Set(['DESKTOP','TABLET','MOBILE']));
+    // Adaptive generation QA: every route at desktop and mobile; tablet is no longer exhaustive by default.
+    expect(result.browserQA?.routes).toEqual(['/']);expect(new Set(result.browserQA?.viewports.map(view=>view.id))).toEqual(new Set(['DESKTOP','MOBILE']));
+    // Smoke evidence never claims the missing requested features were verified.
+    expect(result.qaVerification).toMatchObject({outcome:'VERIFIED',coverage:'BROWSER_SMOKE',limitedCoverage:true,plan:{profile:'GENERATION'}});expect(result.qaVerification?.unverifiedRequests?.length).toBeGreaterThan(0);expect(result.browserQA?.screenshots?.length).toBeLessThanOrEqual(2);
     expect(result.browserQA?.checks.some(check=>check.checkId==='generation.requirement-advisories'&&check.status==='WARNING')).toBe(true);
     expect(h.requests).toHaveLength(1);expect(h.requests[0]?.systemInstructions).toContain(USABLE_GENERATION_GUIDANCE);expect(result.inference?.stages.BUILD_REPAIR.logicalRequests).toBe(0);
     expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce();expect((await h.product.projects.getById(result.siteId))?.latestVersionId).toBe(result.versionId);

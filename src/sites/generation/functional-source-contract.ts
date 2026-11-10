@@ -3,7 +3,7 @@ import { posix } from "node:path";
 import { ApplicationError } from "../../app/errors/application-error.js";
 import type { SiteCoderFileBundle } from "../../cli/runtime/site-coder-file-bundle.js";
 import type { SiteSpec } from "../domain/site-spec.js";
-import type { FunctionalCapability, FunctionalRequirements } from "./functional-capabilities.js";
+import { VERIFICATION_ONLY_CAPABILITIES, type FunctionalCapability, type FunctionalRequirements } from "./functional-capabilities.js";
 import type { FunctionalSourceReference, ResolvedFunctionalContract } from "./functional-route-contract.js";
 import { equivalentPage, pageId, requestedPages } from "./requested-pages.js";
 import { assessFunctionalSource, type FunctionalSourceAssessment, type FunctionalSourcePart } from "./functional-source-evidence.js";
@@ -278,6 +278,7 @@ export function resolveFunctionalSourceContract(spec: SiteSpec, bundle: SiteCode
     else if (requirement.target.kind === "ANY_PAGE") {
       const matching = candidates.filter(route => route.capabilityAssessments[requirement.capability].state !== "PROVEN_MISSING");
       if (matching.length) candidates = matching;
+      candidates = recognizedFirst(requirement.capability, candidates);
     }
     if (!candidates.length || candidates.every(route => route.capabilityAssessments[requirement.capability].state === "PROVEN_MISSING"))
       fail(`Required ${requirement.capability} has no implemented control on ${candidates.map(route => route.path).join(", ") || requirement.target.pageName || "its required section"}`, requirement.id, requirement.capability, candidates[0]?.path);
@@ -286,6 +287,16 @@ export function resolveFunctionalSourceContract(spec: SiteSpec, bundle: SiteCode
     return { ...requirement, routes: candidates.map(route => route.path), sourceEvidence: candidates.flatMap(route => route.sourceEvidence).slice(0, 8), sourceAssessment };
   });
   return { version: 1, pages, actualRoutes: manifest.routes.map(route => route.path), requirements };
+}
+/**
+ * A verification-only family placed on no particular page is asserted where the
+ * source structurally implements it; one uncertain route elsewhere must not
+ * turn a recognized implementation into an optional check.
+ */
+function recognizedFirst<T extends { readonly capabilityAssessments: Readonly<Record<FunctionalCapability, FunctionalSourceAssessment>> }>(capability: FunctionalCapability, candidates: readonly T[]): readonly T[] {
+  if (!VERIFICATION_ONLY_CAPABILITIES.has(capability)) return candidates;
+  const recognized = candidates.filter(route => route.capabilityAssessments[capability].state === "RECOGNIZED");
+  return recognized.length ? recognized : candidates.filter(route => route.capabilityAssessments[capability].state !== "PROVEN_MISSING");
 }
 export function applyFunctionalSourceContract(spec: SiteSpec, contract: ResolvedFunctionalContract): SiteSpec {
   const pages = (contract.acceptancePolicy === "USABLE_WEBSITE" ? spec.requirements.pages.filter(page => contract.pages.some(item => equivalentPage(item.name, page.name))) : spec.requirements.pages).map(page => {
@@ -314,13 +325,18 @@ export function resolveUsableGenerationSourceContract(spec: SiteSpec, bundle: Si
     const page = pages.find(page => page.id === requirement.target.pageId);
     let candidates = manifest.routes.filter(route => !requirement.target.pageId || (page ? route.path === page.route : route.labels.some(label => equivalentPage(label, requirement.target.pageName ?? requirement.target.pageId!))));
     if (requirement.target.sectionId) candidates = candidates.filter(route => !route.sectionIdsComplete || route.sections.includes(requirement.target.sectionId!));
+    if (requirement.target.kind === "ANY_PAGE") candidates = [...recognizedFirst(requirement.capability, candidates)];
     if (!candidates.length || candidates.every(route => route.capabilityAssessments[requirement.capability].state === "PROVEN_MISSING")) {
       advisories.push({ check: "functional.completion", message: `Requested ${requirement.capability} has no recognized control on ${requirement.target.pageName ?? "its assigned surface"}` });
       return [];
     }
     if (candidates.every(route => route.capabilityAssessments[requirement.capability].state !== "RECOGNIZED"))
       advisories.push({ check: "functional.completion", message: `Requested ${requirement.capability} uses an uncertain implementation; full requirement behavior is not an acceptance gate` });
-    return [{ ...requirement, routes: candidates.map(route => route.path), sourceEvidence: candidates.flatMap(route => route.sourceEvidence).slice(0, 8) }];
+    // Carry the static assessment so QA can tell a reliably recognized control
+    // (mandatory browser assertion) from an uncertain one (limited coverage).
+    const states = candidates.map(route => route.capabilityAssessments[requirement.capability]);
+    const sourceAssessment = states.find(state => state.state === "UNCERTAIN") ?? states.find(state => state.state === "RECOGNIZED") ?? states[0]!;
+    return [{ ...requirement, routes: candidates.map(route => route.path), sourceEvidence: candidates.flatMap(route => route.sourceEvidence).slice(0, 8), sourceAssessment }];
   });
   return { version: 1, acceptancePolicy: "USABLE_WEBSITE", pages, actualRoutes: manifest.routes.map(route => route.path), requirements, advisories };
 }

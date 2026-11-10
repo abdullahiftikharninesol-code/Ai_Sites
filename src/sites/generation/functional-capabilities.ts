@@ -7,7 +7,16 @@ import { assignFunctionalRequirements, functionalRouteGuidance, type FunctionalR
 import { functionalIntent } from "./functional-intent.js";
 
 export type FunctionalCapability = "cart" | "quantity" | "size" | "gallery" | "category-filter" | "product-navigation" |
-  "mobile-nav" | "tabs" | "accordion" | "dialog" | "search" | "form" | "newsletter";
+  "mobile-nav" | "tabs" | "accordion" | "dialog" | "search" | "form" | "newsletter" |
+  "sort" | "filter" | "calculator" | "multi-step" | "comparison";
+/**
+ * Behavior families recognized for verification only. They never add text to
+ * the generation or planning prompt (no token change): requests that mention
+ * them are generated exactly as before, and QA asserts the requested behavior
+ * only where the generated source structurally implements it.
+ */
+export const VERIFICATION_ONLY_CAPABILITIES: ReadonlySet<FunctionalCapability> = new Set(["sort", "filter", "calculator", "multi-step", "comparison"]);
+const guided = (capability: FunctionalCapability) => !VERIFICATION_ONLY_CAPABILITIES.has(capability);
 export interface FunctionalRequirements {
   readonly version: 1;
   readonly capabilities: readonly FunctionalCapability[];
@@ -15,28 +24,83 @@ export interface FunctionalRequirements {
   readonly excludedCapabilities?: readonly FunctionalCapability[];
   readonly backendRequired: boolean;
   readonly unsupportedTransactions: boolean;
+  /** The request's own words that asked for real backend behavior (for an actionable message). */
+  readonly backendPhrases?: readonly string[];
   readonly requirements?: readonly FunctionalRequirement[];
   readonly conflictingCapabilities?: readonly FunctionalCapability[];
 }
+const TRANSACTION_PATTERN = /\b(?:(?:real|live)\s+(?:payments?|payment processing|checkout|bookings?|reservations?)|process\s+(?:(?:live|real)\s+)?payments|charge\s+(?:credit\s+)?cards|persistent bookings|send (?:actual|real) emails)\b/gi;
+const BACKEND_PATTERN = /\b(?:real backend|persistent submissions|real account creation)\b/gi;
+/** Negation directly governing a phrase inside its own clause ("demo checkout (no real payments)"). */
+const NEGATED_BEFORE = /\b(?:no|not|without|never|instead of|rather than|excluding|except|avoid(?:ing)?|no need (?:to|for))\b|n't\b/i;
+const NEGATED_AFTER = /^\s*(?:(?:is|are|isn't|aren't)\s+)?(?:not\s+(?:required|needed|necessary|wanted)|unnecessary|not needed|out of scope)\b/i;
+// "or" is not a boundary: negation distributes over it ("without real emails or a real backend").
+const CLAUSE_BOUNDARY = /[.;:!?\n()[\],]|\b(?:and|but)\b/gi;
+/** Phrases the request actually asks for; a negated mention is not a request. */
+function affirmedPhrases(text: string, pattern: RegExp): string[] {
+  const found: string[] = [];
+  for (const match of text.matchAll(pattern)) {
+    let start = 0;
+    for (const boundary of text.slice(0, match.index).matchAll(CLAUSE_BOUNDARY)) start = boundary.index + boundary[0].length;
+    const before = text.slice(start, match.index).trim().split(/\s+/).slice(-6).join(" ");
+    const afterClause = text.slice(match.index + match[0].length).split(CLAUSE_BOUNDARY)[0] ?? "";
+    if (NEGATED_BEFORE.test(before) || NEGATED_AFTER.test(afterClause)) continue;
+    found.push(match[0].toLowerCase());
+  }
+  return found;
+}
+function unsupportedBackendMessage(phrases: readonly string[] | undefined): string {
+  const asked = phrases?.length ? ` ("${phrases.join('", "')}")` : "";
+  return `Your request asks for real backend behavior${asked}, which has no configured implementation, so a frontend-only website cannot honestly provide it. ` +
+    'Remove that requirement, or ask for a demo version instead (for example "a demo checkout with no real payments").';
+}
+
 /** Explicit behavior only; visual adjectives/template controls never add requirements. */
 export function functionalRequirements(prompt: string): FunctionalRequirements {
   const { affirmative, capabilities, optionalCapabilities, excludedCapabilities, conflicts } = functionalIntent(prompt);
-  const unsupportedTransactions = /\b(?:(?:real|live)\s+(?:payments?|payment processing|checkout|bookings?|reservations?)|process\s+(?:(?:live|real)\s+)?payments|charge\s+(?:credit\s+)?cards|persistent bookings|send (?:actual|real) emails)\b/i.test(affirmative);
+  const transactions = affirmedPhrases(affirmative, TRANSACTION_PATTERN), backend = affirmedPhrases(affirmative, BACKEND_PATTERN);
+  const unsupportedTransactions = transactions.length > 0;
   return Object.freeze({ version: 1, capabilities: Object.freeze(capabilities), requirements: Object.freeze(assignFunctionalRequirements(prompt, capabilities)),
     ...(conflicts.length ? { conflictingCapabilities: Object.freeze(conflicts) } : {}),
     ...(optionalCapabilities.length ? { optionalCapabilities: Object.freeze(optionalCapabilities) } : {}),
     ...(excludedCapabilities.length ? { excludedCapabilities: Object.freeze(excludedCapabilities) } : {}),
-    backendRequired: unsupportedTransactions || /\b(?:real backend|persistent submissions|real account creation)\b/i.test(affirmative),
-    unsupportedTransactions });
+    backendRequired: unsupportedTransactions || backend.length > 0,
+    unsupportedTransactions, ...(transactions.length || backend.length ? { backendPhrases: Object.freeze([...new Set([...transactions, ...backend])].slice(0, 3)) } : {}) });
 }
+/** Plain-language names for features a user can recognize in their own prompt. */
+const CAPABILITY_LABELS: Readonly<Record<FunctionalCapability, string>> = {
+  cart: "shopping cart", quantity: "quantity selector", size: "size selector", gallery: "image gallery", "category-filter": "category filter",
+  "product-navigation": "product detail pages", "mobile-nav": "mobile menu", tabs: "tabs", accordion: "accordion / FAQ", dialog: "pop-up dialog",
+  search: "search", form: "contact form", newsletter: "newsletter signup", sort: "sorting", filter: "filters", calculator: "calculator",
+  "multi-step": "multi-step form", comparison: "comparison tool",
+};
+/** What each unsupported real-backend phrase means for the user. */
+function unsupportedFeatureLabel(phrase: string): string {
+  if (/payment|checkout|charge/i.test(phrase)) return "Real payment processing (charging actual money)";
+  if (/booking|reservation/i.test(phrase)) return "Real bookings or reservations that are saved and confirmed";
+  if (/email/i.test(phrase)) return "Sending real emails";
+  if (/account/i.test(phrase)) return "Real user accounts and sign-up";
+  return "A real backend that stores submitted data";
+}
+/**
+ * Request-review failures carry structured, client-safe metadata so the UI can
+ * explain exactly what to change in the prompt instead of a generic failure.
+ */
 export function assertFunctionalRequestConsistency(requirements: FunctionalRequirements): void {
-  if (requirements.conflictingCapabilities?.length)
-    throw new ApplicationError("UNSUPPORTED_SITE_REQUIREMENT", "Conflicting include/exclude instructions for: " + requirements.conflictingCapabilities.join(", "));
+  const conflicts = requirements.conflictingCapabilities ?? [];
+  if (conflicts.length)
+    throw new ApplicationError("UNSUPPORTED_SITE_REQUIREMENT", "Conflicting include/exclude instructions for: " + conflicts.join(", "), {
+      metadata: { failureStage: "REQUEST_REVIEW", requestIssue: "CONFLICTING_INSTRUCTIONS", conflictingFeatures: conflicts.map(id => CAPABILITY_LABELS[id]) },
+    });
 }
 export function assertFunctionalBackendSupport(requirements: FunctionalRequirements, spec?: SiteSpec): void {
   assertFunctionalRequestConsistency(requirements);
   if (requirements.unsupportedTransactions || (requirements.backendRequired && !spec?.runtime?.enabled && !spec?.auth?.authRequired))
-    throw new ApplicationError("UNSUPPORTED_SITE_REQUIREMENT", "Requested real backend behavior has no configured implementation; frontend mock success cannot satisfy it");
+    throw new ApplicationError("UNSUPPORTED_SITE_REQUIREMENT", unsupportedBackendMessage(requirements.backendPhrases), {
+      metadata: { failureStage: "REQUEST_REVIEW", requestIssue: "UNSUPPORTED_FEATURES",
+        unsupportedFeatures: [...new Set((requirements.backendPhrases?.length ? requirements.backendPhrases : ["real backend"]).map(unsupportedFeatureLabel))],
+        matchedPhrases: requirements.backendPhrases ?? [] },
+    });
 }
 /** A configured backend does not make a known demo-only form a real submission. */
 export function validateFunctionalBackendBundle(bundle: SiteCoderFileBundle, requirements: FunctionalRequirements): void {
@@ -82,10 +146,16 @@ const contracts: Record<FunctionalCapability, string> = {
   search: 'ProductSearch: products:{id,name,category?}[]; live local query filters visible results. Or useProductFilter for a custom layout.',
   form: 'DemoForm: label?="Contact",className?; required name/email/message, native validation, visible honest demo-only confirmation; no remote send or persistence.',
   newsletter: 'NewsletterSignup: className?; required valid email and visible demo-only confirmation. Never claim actual subscription, email delivery, account creation or payment.',
+  // Verification-only families: never sent to the model.
+  sort: "", filter: "", calculator: "", "multi-step": "", comparison: "",
 };
-export function functionalGenerationContract(requirements: FunctionalRequirements): string {
-  const boundaries = [requirements.optionalCapabilities?.length ? `Optional suggestions, not mandatory completion gates: ${requirements.optionalCapabilities.join(", ")}. If shown, controls must work.` : "",
-    requirements.excludedCapabilities?.length ? `Explicitly excluded capabilities: ${requirements.excludedCapabilities.join(", ")}. Do not add them.` : ""].filter(Boolean);
+export function functionalGenerationContract(input: FunctionalRequirements): string {
+  // Verification-only families are filtered out so the prompt is byte-identical to before.
+  const optionalCapabilities = input.optionalCapabilities?.filter(guided), excludedCapabilities = input.excludedCapabilities?.filter(guided);
+  const requirements: FunctionalRequirements = { ...input, capabilities: input.capabilities.filter(guided),
+    ...(input.requirements ? { requirements: input.requirements.filter(requirement => guided(requirement.capability)) } : {}) };
+  const boundaries = [optionalCapabilities?.length ? `Optional suggestions, not mandatory completion gates: ${optionalCapabilities.join(", ")}. If shown, controls must work.` : "",
+    excludedCapabilities?.length ? `Explicitly excluded capabilities: ${excludedCapabilities.join(", ")}. Do not add them.` : ""].filter(Boolean);
   if (!requirements.capabilities.length) return boundaries.join("\n");
   return ["Functional capability contract v1 (mandatory requested behavior):", ...boundaries,
     "Prefer verified named imports from ./sites-ui/functional; style with className/CSS. Equivalent custom behavior is allowed. No empty/alert-only callbacks or fake destinations.",

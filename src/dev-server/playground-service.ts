@@ -5,6 +5,11 @@ import { createMongoPersistentSitesProduct } from "../sites/generation/create-mo
 import type { SiteId, UserId, VersionId } from "../shared/types.js";
 import { DevJobManager } from "./dev-job-manager.js";
 import { DevelopmentPreviewManager } from "./development-preview-manager.js";
+import { planStorageCleanup } from "../storage/storage-cleanup-planner.js";
+import { MongoStorageReferenceSource } from "../storage/storage-references.js";
+import { withLegacyStoreReferences } from "../storage/legacy-store-references.js";
+import { createMongoModels } from "../persistence/mongodb/mongo-models.js";
+import { reconcileExecutionWorkspaces, type ReconcileOptions, type ReconciliationReport } from "../execution/local/workspace-reconciliation.js";
 import { createAgentProviderRegistry } from "../agents/registry/create-agent-provider-registry.js";
 import { loadConfig } from "../app/config/environment.js";
 import type { SiteSourceSnapshot } from "../sites/generation/source-snapshot.js";
@@ -156,6 +161,9 @@ export class PlaygroundService {
       await this.hosting.start();
       await this.runtimeGateway.start();
       this.#started = true;
+      // Crash/restart reconciliation runs in the background with its own deadline,
+      // so it can never block or fail normal startup.
+      void this.reconcileWorkspaces().catch(() => console.warn("[sites] workspace reconciliation unavailable"));
     } catch (error) {
       // Both close operations are idempotent and prevent a partial startup from
       // leaving one of the local ports occupied.
@@ -163,6 +171,28 @@ export class PlaygroundService {
       await this.product.close();
       throw error;
     }
+  }
+  /** Classifies leftover execution workspaces; records orphan candidates, never deletes. */
+  async reconcileWorkspaces(options: Partial<Pick<ReconcileOptions, "listProcesses" | "isProcessAlive" | "stopProcess" | "timeoutMs">> = {}) {
+    const report = await reconcileExecutionWorkspaces({
+      root: join(this.config.dataRoot, "execution"),
+      isVersionRecoverable: async (siteId, versionId) => (await this.product.versions.getById(versionId as VersionId))?.siteId === siteId,
+      ...options,
+    });
+    this.lastReconciliation = report;
+    const { ACTIVE, RECOVERABLE, ORPHANED, UNKNOWN, stoppedProcesses, untrackedPreviewProcesses } = report.counts;
+    console.info(`[sites] workspace reconciliation active=${ACTIVE} recoverable=${RECOVERABLE} orphaned=${ORPHANED} unknown=${UNKNOWN} stoppedOrphanPreviews=${stoppedProcesses} untrackedPreviews=${untrackedPreviewProcesses} processScan=${report.processScan} truncated=${report.truncated} durationMs=${report.durationMs}`);
+    return report;
+  }
+  lastReconciliation?: ReconciliationReport;
+  /** Dry-run storage plan with this server's live workspaces and pending uploads protected. Deletes nothing. */
+  planStorageCleanup() {
+    return planStorageCleanup({
+      dataRoot: this.config.dataRoot,
+      references: withLegacyStoreReferences(new MongoStorageReferenceSource(createMongoModels(this.product.database.connection), () => this.product.databaseStatus().connected), this.config.dataRoot),
+      activeEnvironmentIds: new Set([...this.product.execution.activeEnvironmentIds(), ...this.previews.list().map((session) => session.environmentId)]),
+      protectedAssetKeys: new Set([...this.#uploadedAssets.values()].map(({ asset }) => asset.asset.storageKey)),
+    });
   }
   databaseStatus() {
     return this.product.databaseStatus();
@@ -372,7 +402,8 @@ export class PlaygroundService {
     const deployments = (await this.product.deployments.listBySite(project.id)).items;
     const domains = await this.product.customDomains.listForSite(project.id);
     const runtime = await this.product.siteRuntime.getRuntime(project.id);
-    const activePreview = this.previews.list().find((session) => session.siteId === project.id);
+    // Only a live preview is advertised; opening the site also refreshes its idle timer.
+    const activePreview = await this.previews.active(project.id);
     const latest =
       versions.find((version) => version.id === project.latestVersionId) ?? versions.at(-1);
     return {
@@ -514,24 +545,51 @@ export class PlaygroundService {
     const version = await this.product.versions.getById(versionId as VersionId);
     if (!version || version.siteId !== project.id)
       throw this.#error("VERSION_NOT_FOUND", "Version not found");
-    const session = await this.previews.start(project.id, version.id);
+    let session;
+    try {
+      session = await this.previews.start(project.id, version.id);
+    } catch (error) {
+      throw this.#previewRestoreError(error);
+    }
+    // The URL is returned only after the preview answered readiness; internal
+    // workspace paths are never exposed.
     return {
       previewSessionId: session.id,
       previewUrl: session.url,
       environmentId: session.environmentId,
-      workspacePath: this.product.execution.getWorkspacePath(session.environmentId),
+    };
+  }
+  /** Restores the previous verified version as the new current one (saved source only; no AI, no charge). */
+  async rollback(ownerId: string, siteId: string, expectedVersionId: string) {
+    const project = await this.#project(ownerId, siteId);
+    // A running generation/edit could commit next; its commit would then fail the
+    // version check anyway, but refusing up front gives a clear answer.
+    if (this.jobs.mutationRunning)
+      throw this.#error("DEV_JOB_BUSY", "Another generation or edit is already running");
+    const result = await this.product.pipeline.rollbackToPreviousVersion({
+      siteId: project.id, ownerId: project.ownerId, expectedVersionId: expectedVersionId as VersionId,
+    });
+    // An open preview shows the replaced version; it is rebuilt on next open.
+    const active = this.previews.list().find((session) => session.siteId === project.id);
+    if (active) await this.previews.stop(active.id);
+    return {
+      projectId: project.id,
+      versionId: result.version.id,
+      versionNumber: result.version.versionNumber,
+      restoredFromVersionId: result.restoredFromVersionId,
     };
   }
   async previewInspector(ownerId: string, id: string) {
     const session = await this.#ownedPreview(ownerId, id);
-    if (!session) throw this.#error("INVALID_REQUEST", "Preview instance was not found");
+    // Sessions are in-memory and end on idle, process exit or server restart; the
+    // saved project is unaffected and can be previewed again from its snapshot.
+    if (!session) throw this.#error("PREVIEW_EXPIRED", "This preview session has ended. Start the preview again to restore the saved version.");
     const logs = await this.product.execution.readLogs(session.environmentId);
     return {
       previewSessionId: session.id,
       siteId: session.siteId,
       versionId: session.versionId,
       environmentId: session.environmentId,
-      workspacePath: this.product.execution.getWorkspacePath(session.environmentId),
       previewUrl: session.url,
       status: "RUNNING" as const,
       processCount: this.product.execution.ownedProcessCount(session.environmentId),
@@ -623,7 +681,16 @@ export class PlaygroundService {
       if ((error as { code?: unknown }).code === "SITE_NOT_FOUND") return undefined;
       throw error;
     }
-    return this.previews.get(id);
+    return this.previews.resolve(id);
+  }
+  /** Saved-source problems and restore failures are distinct, user-safe codes; details stay in server logs. */
+  #previewRestoreError(error: unknown) {
+    const code = (error as { code?: unknown }).code;
+    if (code === "SITE_NOT_FOUND" || code === "VERSION_NOT_FOUND") return error;
+    console.warn("[sites] preview restore failed", { code: typeof code === "string" ? code : "UNKNOWN" });
+    return code === "ARTIFACT_NOT_FOUND" || code === "ARTIFACT_INTEGRITY_FAILED"
+      ? this.#error("PREVIEW_SOURCE_UNAVAILABLE", "The saved source for this version is missing or failed integrity verification, so it cannot be previewed.")
+      : this.#error("PREVIEW_RESTORE_FAILED", "The saved version could not be started for preview. Please try again.");
   }
   #owner(ownerId: string) {
     if (typeof ownerId !== "string" || !ownerId)

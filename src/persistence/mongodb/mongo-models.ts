@@ -9,9 +9,18 @@ export interface MongoSiteProjectRecord {
   sourceManifestRef?: string;
   status: string;
   versionNumber: number;
-  lastOperation?: "GENERATE" | "EDIT";
+  lastOperation?: "GENERATE" | "EDIT" | "ROLLBACK";
   lastEditPrompt?: string;
+  /** The verified version this one replaced; retained for one-step recovery. */
+  previousVersion?: MongoPreviousVersionRecord;
   createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface MongoPreviousVersionRecord {
+  versionNumber: number;
+  sourceArtifactRef: string;
+  sourceManifestRef?: string;
   updatedAt: Date;
 }
 
@@ -64,8 +73,17 @@ const projectSchema = new Schema<MongoSiteProjectRecord>(
     sourceManifestRef: String,
     status: { type: String, required: true },
     versionNumber: { type: Number, required: true, min: 0, default: 0 },
-    lastOperation: { type: String, enum: ["GENERATE", "EDIT"] },
+    lastOperation: { type: String, enum: ["GENERATE", "EDIT", "ROLLBACK"] },
     lastEditPrompt: String,
+    previousVersion: {
+      type: new Schema<MongoPreviousVersionRecord>({
+        versionNumber: { type: Number, required: true, min: 1 },
+        sourceArtifactRef: { type: String, required: true },
+        sourceManifestRef: String,
+        updatedAt: { type: Date, required: true },
+      }, { _id: false, strict: "throw" }),
+      required: false,
+    },
     createdAt: { type: Date, required: true },
     updatedAt: { type: Date, required: true },
   },

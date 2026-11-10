@@ -399,7 +399,8 @@ describe("current-only Mongo persistence and validated candidate replacement", (
     const h = await currentHarness(); const first = await h.seed("Original");
     await h.versions.save({ ...first, id: `${siteId}:v2` as VersionId, versionNumber: 2 });
     expect((await h.versions.listBySite(siteId)).items.map((v) => v.versionNumber)).toEqual([2]);
-    expect(await h.versions.getById(first.id)).toBeUndefined();
+    // Phase 3A: exactly one previous verified version stays addressable for one-step recovery.
+    expect((await h.versions.getById(first.id))?.sourceArtifactRef).toBe(first.sourceArtifactRef);
     await expect(h.versions.save({ ...first, versionNumber: 1 })).rejects.toMatchObject({
       code: "PERSISTENCE_TRANSACTION_FAILED",
     });
@@ -466,7 +467,8 @@ describe("current-only Mongo persistence and validated candidate replacement", (
     expect(commit).toHaveBeenCalledTimes(1);
     expect(h.provider.callCount).toBe(2);
     expect(result.newVersionId).toBe(`${siteId}:v2`);
-    expect(await h.versions.getById(first.id)).toBeUndefined();
+    // Phase 3A: exactly one previous verified version stays addressable for one-step recovery.
+    expect((await h.versions.getById(first.id))?.sourceArtifactRef).toBe(first.sourceArtifactRef);
     const current = (await h.versions.getById(result.newVersionId))!;
     expect(Buffer.from((await h.artifacts.get(current.sourceArtifactRef))!).toString()).toContain("NovaPay");
     expect(h.memory.versionRecords.size).toBe(0);
@@ -603,7 +605,8 @@ describe("current-only Mongo persistence and validated candidate replacement", (
     const afterRestart = new MongoSiteVersionRepository(h.memory.asModels(), h.artifacts);
     const latest = (await afterRestart.getById(edited.newVersionId))!;
     expect(latest).toMatchObject({ templateId: "restaurant", templateVersion: 2, versionNumber: 2 });
-    expect(await afterRestart.getById(first.id)).toBeUndefined();
+    // Phase 3A: exactly one previous verified version stays addressable for one-step recovery.
+    expect((await afterRestart.getById(first.id))?.versionNumber).toBe(1);
     expect((await afterRestart.listBySite(instantiated.projectId)).items).toHaveLength(1);
     const currentSnapshot = JSON.parse(Buffer.from((await h.artifacts.get(latest.sourceArtifactRef))!).toString()) as SiteSourceSnapshot;
     expect(currentSnapshot.manifest).toMatchObject({ templateId: "restaurant", templateVersion: 2 });
@@ -678,7 +681,8 @@ describe("current-only Mongo persistence and validated candidate replacement", (
     });
     const reload = new MongoSiteVersionRepository(h.memory.asModels(), h.artifacts);
     expect((await reload.listBySite(generated.siteId)).items.map((v) => v.versionNumber)).toEqual([2]);
-    expect(await reload.getById(first.id)).toBeUndefined();
+    // Phase 3A: exactly one previous verified version stays addressable for one-step recovery.
+    expect((await reload.getById(first.id))?.sourceArtifactRef).toBe(first.sourceArtifactRef);
     expect((await h.projects.getById(generated.siteId))?.latestVersionId).toBe(edited.newVersionId);
     expect(h.memory.versionRecords.size).toBe(0);
     expect(h.provider.callCount).toBe(2);
@@ -806,6 +810,7 @@ describe("MongoDB Sites persistence", () => {
         "name",
         "originalPrompt",
         "ownerId",
+        "previousVersion",
         "sourceArtifactRef",
         "sourceManifestRef",
         "status",
@@ -916,7 +921,8 @@ describe("MongoDB Sites persistence", () => {
       name: "NOMA Living",
     });
     expect(memory.projectRecords.get(siteId)).not.toHaveProperty("currentFiles");
-    await expect(versions.getById(first.id)).resolves.toBeUndefined();
+    // Phase 3A: exactly one previous verified version stays addressable for one-step recovery.
+    await expect(versions.getById(first.id)).resolves.toMatchObject({ versionNumber: 1, sourceArtifactRef: firstDraft.sourceArtifactRef });
     await expect(versions.listBySite(siteId)).resolves.toMatchObject({
       items: [
         { id: `${siteId}:v2`, versionNumber: 2 },
@@ -932,7 +938,8 @@ describe("MongoDB Sites persistence", () => {
       versionNumber: 2,
       parentVersionId: `${siteId}:v1`,
     });
-    await expect(afterRestart.getById(first.id)).resolves.toBeUndefined();
+    // Phase 3A: exactly one previous verified version stays addressable for one-step recovery.
+    await expect(afterRestart.getById(first.id)).resolves.toMatchObject({ versionNumber: 1, sourceArtifactRef: firstDraft.sourceArtifactRef });
     expect(await artifacts.exists(firstDraft.sourceArtifactRef)).toBe(true);
     expect(await artifacts.exists(secondDraft.sourceArtifactRef)).toBe(true);
     expect(Object.keys(memory.projectRecords.get(siteId)!)).not.toEqual(

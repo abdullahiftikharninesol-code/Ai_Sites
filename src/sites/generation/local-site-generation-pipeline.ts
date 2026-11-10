@@ -7,10 +7,11 @@ import type {
 import { ApplicationError } from "../../app/errors/application-error.js";
 import { assessEditOutcome } from "../../cli/runtime/edit-outcome.js";
 import { summarizeInstallFailure } from "../../cli/runtime/build-log-normalizer.js";
-import { isEditableRequirementPath, readEditRequirementFiles } from "../../cli/runtime/edit-requirements.js";
+import { isEditableRequirementPath, parseEditRequirements, readEditRequirementFiles } from "../../cli/runtime/edit-requirements.js";
 import { functionalSourceManifest } from "./functional-source-contract.js";
-import { functionalBrowserChecks } from "../../browser-qa/functional-capability-checks.js";
-import { assertFunctionalRequestConsistency, assertFunctionalBackendSupport } from "./functional-capabilities.js";
+import { analyzeEditImpact, applyOptionalRequirementPolicy, checksForPlan, evaluateQAVerification, requestedEditRequirements, requirementChecks, selectEditQAPlan, selectGenerationQAPlan, type BrowserQAPlan, type QAVerification } from "./adaptive-qa-policy.js";
+import { assertFunctionalRequestConsistency, assertFunctionalBackendSupport, functionalRequirements } from "./functional-capabilities.js";
+import { validateEditScopeCompletion } from "../../cli/runtime/edit-scope.js";
 import type { LocalExecutionProvider } from "../../execution/local/local-execution.provider.js";
 import type { BuildResult, PreviewSession } from "../../execution/execution-types.js";
 import type { ArtifactStore } from "../../persistence/artifact-store.js";
@@ -51,6 +52,7 @@ import type { StarterTemplate, StarterTemplateRegistry } from "./starter-templat
 import type {
   SiteVersionCommitter,
   UnnumberedSiteVersion,
+  SiteVersionCommitOptions,
 } from "../../persistence/version-committer.js";
 import { ArtifactNamespace } from "../../persistence/artifact-namespace.js";
 import type { SiteRuntimeProvider } from "../../site-runtime/site-runtime-provider.js";
@@ -146,6 +148,8 @@ export interface SiteGenerationResult {
   readonly inference?: InferenceRunSummary;
   readonly completion?: GenerationCompletionTelemetry;
   readonly requestProfile?: RequestProfile;
+  /** Adaptive QA outcome and what it actually covered. */
+  readonly qaVerification?: QAVerification;
 }
 export interface SiteEditResult {
   readonly editOutcome?: "APPLIED" | "NO_CHANGES_REQUIRED";
@@ -164,6 +168,8 @@ export interface SiteEditResult {
   readonly visualRepairAttempt?: VisualRepairAttempt;
   readonly intelligence?: readonly AgentTaskTelemetry[];
   readonly inference?: InferenceRunSummary;
+  /** Adaptive QA outcome and what it actually covered. */
+  readonly qaVerification?: QAVerification;
 }
 export interface LocalSiteGenerationPipelineDependencies {
   execution: LocalExecutionProvider;
@@ -349,6 +355,8 @@ export class LocalSiteGenerationPipeline {
       let behaviorValidatedInRuntime = false;
       let behaviorAttempt = 0;
       let validatedBrowserQARun: { readonly report: BrowserQAReport; readonly artifactRef: string } | undefined;
+      let generationQAPlan: BrowserQAPlan | undefined;
+      let previousQAFailure: { readonly route?: string | undefined; readonly viewport?: string | undefined }[] | undefined;
       const session = await this.deps.runtime.run(
         environment.id,
         {
@@ -386,11 +394,17 @@ export class LocalSiteGenerationPipeline {
           await this.#functional.validate(candidate.previewUrl, request.agentProvider === "mock" ? "AI Sites Generated Hero" : undefined);
           const candidateContract = candidate.functionalContract ? { ...candidate.functionalContract, advisories: [...(candidate.functionalContract.advisories ?? []), ...assetAdvisories] } : undefined;
           const candidateSpec = candidateContract ? applyFunctionalSourceContract(siteSpec, candidateContract) : siteSpec;
+          // After a functional repair, rerun every mandatory check but revisit mobile
+          // only where the previous attempt failed (plus the entry route).
+          const qaPlan = selectGenerationQAPlan(candidateSpec.requirements.pages.map(page => page.path), candidateContract,
+            behaviorAttempt > 1 && previousQAFailure ? { failed: previousQAFailure } : undefined);
+          generationQAPlan = qaPlan;
+          try {
           validatedBrowserQARun = await this.#runBrowserQA(
             true,
             siteId, versionId, candidate.previewUrl, candidateSpec, assetManifest,
             [...(templateReference ? [templateReferenceBrowserCheck(templateReference, request.prompt)] : []),
-              ...functionalBrowserChecks(candidateSpec.requirements.functional ?? requestProfile.functional, candidateSpec.requirements.pages.map(page => page.path), Boolean(candidateSpec.runtime?.enabled), candidateContract)],
+              ...requirementChecks(qaPlan, candidateSpec.requirements.functional ?? requestProfile.functional, Boolean(candidateSpec.runtime?.enabled), candidateContract)],
             { execution: this.deps.execution, environmentId: environment.id, jobId, siteId, generationAttempt: behaviorAttempt > 1 ? 2 : 1,
               ...(request.outerRequestId ? { outerRequestId: request.outerRequestId } : {}),
               ...(candidate.completion ? { completion: candidate.completion } : {}), functionalRequirements: candidateSpec.requirements.functional ?? requestProfile.functional,
@@ -400,7 +414,13 @@ export class LocalSiteGenerationPipeline {
                 physicalRequests: runContext.getSummary().physicalRequests, billingStatus: "NOT_FINALIZED" },
               referenceContext: referenceContextTelemetry(request.templateReference, templateReference ? templateDesignPrompt(templateReference.design) : undefined) },
             "USABLE_GENERATION",
+            qaPlan,
           );
+          } catch (cause) {
+            const findings = cause instanceof ApplicationError ? cause.metadata?.blockingFindings : undefined;
+            if (Array.isArray(findings)) previousQAFailure = findings.map(item => ({ route: (item as { route?: string }).route, viewport: (item as { viewport?: string }).viewport }));
+            throw cause;
+          }
           behaviorValidatedInRuntime = true;
         },
       );
@@ -417,11 +437,13 @@ export class LocalSiteGenerationPipeline {
       const previewResult = this.deps.execution.getLatestPreview(environment.id);
       if (!previewResult?.url)
         throw new ApplicationError("PREVIEW_FAILED", "Generation produced no ready preview");
-      await this.#functional.validate(
+      // The runtime behavior callback already fetched this same preview.
+      if (!behaviorValidatedInRuntime) await this.#functional.validate(
         previewResult.url,
         request.agentProvider === "mock" ? "AI Sites Generated Hero" : undefined,
       );
       if (session.functionalContract) siteSpec = applyFunctionalSourceContract(siteSpec, session.functionalContract);
+      if (!behaviorValidatedInRuntime) generationQAPlan = selectGenerationQAPlan(siteSpec.requirements.pages.map(page => page.path), session.functionalContract);
       const browserQARun = behaviorValidatedInRuntime ? validatedBrowserQARun : await this.#runBrowserQA(
         true,
         siteId,
@@ -430,7 +452,7 @@ export class LocalSiteGenerationPipeline {
         siteSpec,
         assetManifest,
         [...(templateReference ? [templateReferenceBrowserCheck(templateReference, request.prompt)] : []),
-          ...functionalBrowserChecks(siteSpec.requirements.functional ?? requestProfile.functional, siteSpec.requirements.pages.map(page => page.path), Boolean(siteSpec.runtime?.enabled), session.functionalContract)],
+          ...requirementChecks(generationQAPlan!, siteSpec.requirements.functional ?? requestProfile.functional, Boolean(siteSpec.runtime?.enabled), session.functionalContract)],
         { execution: this.deps.execution, environmentId: environment.id, jobId, siteId, completion: session.generationCompletion,
           ...(request.outerRequestId ? { outerRequestId: request.outerRequestId } : {}),
           functionalRequirements: siteSpec.requirements.functional ?? requestProfile.functional,
@@ -439,7 +461,9 @@ export class LocalSiteGenerationPipeline {
             physicalRequests: runContext.getSummary().physicalRequests, billingStatus: "NOT_FINALIZED" },
           referenceContext: referenceContextTelemetry(request.templateReference, templateReference ? templateDesignPrompt(templateReference.design) : undefined) },
         "USABLE_GENERATION",
+        generationQAPlan,
       );
+      const qaVerification = generationQAPlan ? evaluateQAVerification(generationQAPlan, browserQARun?.report) : undefined;
       // Browser QA is the sole default runtime QA system. Legacy screenshot
       // review/repair flags remain readable on old request objects but have no
       // executable production path.
@@ -534,6 +558,7 @@ export class LocalSiteGenerationPipeline {
         warnings: [],
         usage: session.usage,
         ...(browserQARun ? { browserQA: browserQARun.report } : {}),
+        ...(qaVerification ? { qaVerification } : {}),
         intelligence: intelligenceTelemetry,
         inference: runContext.getSummary(),
         requestProfile,
@@ -666,8 +691,9 @@ export class LocalSiteGenerationPipeline {
       );
       await validateRequiredUserAssetReferences(this.deps.execution, environment.id, request.assetManifest);
       const editedSource = await readEditRequirementFiles(this.deps.execution, environment.id);
-      const editOutcome = assessEditOutcome(request.instruction,
-        new Map(Object.entries(before.files).filter(([path]) => isEditableRequirementPath(path))), editedSource).outcome;
+      const parentSource = new Map(Object.entries(before.files).filter(([path]) => isEditableRequirementPath(path)));
+      const editAssessment = assessEditOutcome(request.instruction, parentSource, editedSource);
+      const editOutcome = editAssessment.outcome;
       const discoveredRoutes = functionalSourceManifest({ files: [...editedSource].map(([path, content]) => ({ path, content })) }).routes
         .map(route => route.path).filter(path => !/[:*]/.test(path));
       const editedSpec = parent.siteSpec ? { ...parent.siteSpec, requirements: { ...parent.siteSpec.requirements,
@@ -702,14 +728,31 @@ export class LocalSiteGenerationPipeline {
       }
       const versionNumber = parent.versionNumber + 1;
       const newVersionId = randomUUID() as VersionId;
-      const browserQARun = await this.#runBrowserQA(
+      // Adaptive QA: explicitly requested behavior must exist in source before any
+      // browser time is spent; browser scope follows the proven change scope.
+      const qaRoutes = [...new Set(editedSpec?.requirements.pages.map(page => page.path) ?? discoveredRoutes)];
+      const editScope = parseEditRequirements(request.instruction).scope;
+      const qaPlan = selectEditQAPlan({
+        impact: analyzeEditImpact(parentSource, editedSource, editAssessment.changedPaths, qaRoutes),
+        ...(editScope ? { scope: editScope } : {}),
+        requirements: requestedEditRequirements(request.instruction, editedSource),
+        routes: qaRoutes,
+      });
+      // Source-only acceptance re-proves the requested copy on the final source.
+      if (qaPlan.mode === "SOURCE_BUILD_ONLY" && editScope) validateEditScopeCompletion(editScope, parentSource, editedSource);
+      const browserQARun = qaPlan.mode === "SOURCE_BUILD_ONLY" ? undefined : await this.#runBrowserQA(
         request.browserQAEnabled,
         request.siteId,
         newVersionId,
         previewResult.url,
         editedSpec,
         assetManifest,
+        requirementChecks(qaPlan, editedSpec?.requirements.functional ?? functionalRequirements(request.instruction), Boolean(editedSpec?.runtime?.enabled)),
+        undefined,
+        "STRICT",
+        qaPlan,
       );
+      const qaVerification = evaluateQAVerification(qaPlan, browserQARun?.report, { browserQAEnabled: request.browserQAEnabled === true });
       // Browser QA is the sole default runtime QA system. Legacy visual
       // review/repair flags remain compatibility-readable but cannot execute.
       const sourceArtifactRef = ArtifactNamespace.version(
@@ -800,6 +843,7 @@ export class LocalSiteGenerationPipeline {
         changedFiles,
         usage: session.usage,
         ...(browserQARun ? { browserQA: browserQARun.report } : {}),
+        qaVerification,
         intelligence: intelligenceTelemetry,
         inference: runContext.getSummary(),
       };
@@ -864,6 +908,61 @@ export class LocalSiteGenerationPipeline {
       await this.deps.execution.destroyEnvironment(environment.id);
       throw cause;
     }
+  }
+  /**
+   * One-step rollback: the previous verified version becomes current again as a
+   * NEW version number (history stays monotonic, the replaced version stays
+   * recoverable). No AI call, build or charge: the previous snapshot is verified
+   * byte-for-byte and its existing artifacts are reused, never copied. The
+   * expected current version guards against silently overwriting a concurrent
+   * edit or rollback; the persistence commit re-checks it atomically.
+   */
+  async rollbackToPreviousVersion(request: { readonly siteId: SiteId; readonly ownerId: string; readonly expectedVersionId: VersionId }): Promise<{ readonly version: SiteVersion; readonly restoredFromVersionId: VersionId }> {
+    const log = (result: string, extra = "") => console.info(`[sites] rollback site=${request.siteId} expected=${request.expectedVersionId} result=${result}${extra}`);
+    const project = await this.deps.projects.getById(request.siteId);
+    if (!project || project.ownerId !== request.ownerId) throw new ApplicationError("SITE_NOT_FOUND", "Site project was not found");
+    const conflict = () => new ApplicationError("VERSION_CONFLICT", "The website changed since this rollback was requested. Reload and try again.", {
+      metadata: { reason: "CURRENT_VERSION_CHANGED" } });
+    if (project.latestVersionId !== request.expectedVersionId) { log("CONFLICT"); throw conflict(); }
+    const current = await this.deps.versions.getById(request.expectedVersionId);
+    const previous = current?.parentVersionId ? await this.deps.versions.getById(current.parentVersionId) : undefined;
+    if (!current || !previous || previous.siteId !== project.id) {
+      log("UNAVAILABLE");
+      throw new ApplicationError("ROLLBACK_UNAVAILABLE", "No previous saved version is available to restore.");
+    }
+    try {
+      await this.#snapshots.verify(previous.sourceArtifactRef);
+      if (previous.assetManifestArtifactRef && !(await this.deps.artifacts.exists(previous.assetManifestArtifactRef)))
+        throw new ApplicationError("ARTIFACT_NOT_FOUND", "Previous asset manifest is missing");
+    } catch (cause) {
+      const code = cause instanceof ApplicationError ? cause.code : "UNKNOWN";
+      log("SOURCE_UNAVAILABLE", ` cause=${code}`);
+      throw new ApplicationError("ROLLBACK_SOURCE_UNAVAILABLE", "The previous version's saved source is missing or failed integrity verification. The current version is unchanged.", {
+        metadata: { reason: code === "ARTIFACT_NOT_FOUND" ? "MISSING_SNAPSHOT" : "INTEGRITY_FAILED" } });
+    }
+    // Reuse the previous version's verified artifacts and metadata (no copies).
+    const carried = (["sourceManifestRef", "assetManifestArtifactRef", "buildArtifactRef", "siteSpec", "technicalProfileId", "templateId", "templateVersion",
+      "browserQAStatus", "browserQAArtifactRef", "browserQAScreenshotRefs", "runtimeSchemaVersion"] as const)
+      .filter(key => previous[key] !== undefined).map(key => [key, previous[key]] as const);
+    const draft: UnnumberedSiteVersion = {
+      ...(Object.fromEntries(carried) as Partial<UnnumberedSiteVersion>),
+      sourceArtifactRef: previous.sourceArtifactRef,
+      id: randomUUID() as VersionId,
+      siteId: project.id,
+      parentVersionId: current.id,
+      buildStatus: "SUCCEEDED",
+      changeSummary: [`Restored version ${previous.versionNumber}`],
+      createdAt: new Date(),
+    };
+    let version: SiteVersion;
+    try {
+      version = await this.#commitVersion(project, draft, current.versionNumber + 1, { operation: "ROLLBACK" });
+    } catch (cause) {
+      if (cause instanceof ApplicationError && cause.code === "PERSISTENCE_TRANSACTION_FAILED") { log("CONFLICT"); throw conflict(); }
+      throw cause;
+    }
+    log("RESTORED", ` newVersion=${version.versionNumber} restoredFrom=${previous.versionNumber}`);
+    return { version, restoredFromVersionId: previous.id };
   }
   async disposeRestoredEnvironment(environmentId: string): Promise<void> {
     await this.deps.execution.destroyEnvironment(environmentId);
@@ -948,12 +1047,17 @@ export class LocalSiteGenerationPipeline {
     additionalChecks: readonly BrowserQACheckExecutor[] = [],
     failedCandidate?: Omit<FailedCandidateEvidenceRequest, "report" | "functionalContract"> & { readonly functionalContract?: ResolvedFunctionalContract },
     acceptance: "STRICT" | "USABLE_GENERATION" = "STRICT",
+    plan?: BrowserQAPlan,
   ): Promise<{ readonly report: BrowserQAReport; readonly artifactRef: string } | undefined> {
     if (!enabled) return undefined;
     if (!this.deps.browserQA)
       throw new ApplicationError("VALIDATION_FAILED", "Browser QA is not configured");
-    const checks = acceptance === "USABLE_GENERATION" ? usableGenerationChecks(failedCandidate?.functionalContract, (assetManifest?.assets.length ?? 0) > 0,
-      additionalChecks.filter(check => !check.definition.checkId.startsWith("functional.") && check.definition.checkId !== "template-reference.requirements")) : [
+    // Planned requirement assertions are passed explicitly; other functional.*
+    // probes stay excluded from usable-generation acceptance as before.
+    const planned = (check: BrowserQACheckExecutor) => /^functional\.(?:optional-)?requirements$/.test(check.definition.checkId);
+    const allChecks = acceptance === "USABLE_GENERATION" ? usableGenerationChecks(failedCandidate?.functionalContract, (assetManifest?.assets.length ?? 0) > 0,
+      additionalChecks.filter(check => plan ? planned(check) || !check.definition.checkId.startsWith("functional.") && check.definition.checkId !== "template-reference.requirements"
+        : !check.definition.checkId.startsWith("functional.") && check.definition.checkId !== "template-reference.requirements")) : [
       ...browserQACoreCheckExecutors,
       ...browserQAResponsiveAndInteractionChecks,
       ...additionalChecks,
@@ -961,6 +1065,7 @@ export class LocalSiteGenerationPipeline {
         definition.checkId !== "broken-images" || (assetManifest?.assets.length ?? 0) > 0,
       ),
     ];
+    const checks = plan ? checksForPlan(plan, allChecks) : allChecks;
     const rawReport = await this.deps.browserQA.run({
       runId: `${siteId}-${versionId}`,
       target: {
@@ -969,11 +1074,23 @@ export class LocalSiteGenerationPipeline {
         siteVersionId: versionId,
       },
       routes: acceptance === "USABLE_GENERATION" ? [...new Set(["/", ...(siteSpec?.requirements.pages.map(({ path }) => path) ?? [])])] : siteSpec?.requirements.pages.map(({ path }) => path) ?? ["/"],
+      ...(plan ? { targets: plan.targets, ...(plan.screenshotTargets === "ALL" ? {} : { screenshotTargets: plan.screenshotTargets }),
+        policy: { fullPageScreenshots: plan.fullPageScreenshots } } : {}),
       checks,
       artifactPrefix: `sites/${siteId}/versions/${versionId}/qa/screenshots/browser`,
     });
-    const report = acceptance === "USABLE_GENERATION" ? applyUsableGenerationReportPolicy(rawReport) : rawReport;
+    const report = applyOptionalRequirementPolicy(acceptance === "USABLE_GENERATION" ? applyUsableGenerationReportPolicy(rawReport) : rawReport);
     const artifactRef = await persistBrowserQAReport(this.deps.artifacts, siteId, versionId, report);
+    if (report.status === "FAIL" && plan && evaluateQAVerification(plan, report).outcome === "INCONCLUSIVE") {
+      // Infrastructure/timeouts prove only that verification did not finish. Never
+      // promote the candidate, never label it defective, never spend a model repair.
+      const blocking = report.checks.filter(check => check.status === "FAIL" && check.severity === "ERROR");
+      throw new ApplicationError("BROWSER_QA_INCONCLUSIVE", "Browser verification could not complete. Your saved website is unchanged; please try again.", {
+        metadata: { failureStage: "BROWSER_QA", qaOutcome: "INCONCLUSIVE", browserQAArtifactRef: artifactRef,
+          failureKinds: [...new Set(blocking.map(check => check.failureKind ?? "UNCLASSIFIED"))],
+          blockingChecks: blocking.slice(0, 12).map(check => ({ checkId: check.checkId, route: check.route, viewport: check.viewport?.id, failureKind: check.failureKind })) },
+      });
+    }
     if (report.status === "FAIL") {
       if (failedCandidate && this.deps.failedCandidateEvidence) {
         try {
@@ -1000,6 +1117,7 @@ export class LocalSiteGenerationPipeline {
             blockingChecks: blocking.map((check) => check.checkId),
             blockingFindings: blocking.map(check => ({ checkId: check.checkId, route: check.route, viewport: check.viewport?.id, message: check.message, ...(check.failureKind ? { failureKind: check.failureKind } : {}) })),
             failureStage: "BROWSER_QA",
+            qaOutcome: "FAILED",
           },
         },
       );
@@ -1028,8 +1146,14 @@ export class LocalSiteGenerationPipeline {
     project: SiteProject,
     draft: UnnumberedSiteVersion,
     fallbackNumber: number,
+    options?: SiteVersionCommitOptions,
   ): Promise<SiteVersion> {
-    if (this.deps.versionCommitter) return this.deps.versionCommitter.commit(project, draft);
+    if (this.deps.versionCommitter) return this.deps.versionCommitter.commit(project, draft, undefined, options);
+    // Without an atomic committer, still refuse to replace a version that changed
+    // after this candidate started (edit vs rollback race in one process).
+    const latest = await this.deps.projects.getById(project.id);
+    if (latest?.latestVersionId !== project.latestVersionId)
+      throw new ApplicationError("PERSISTENCE_TRANSACTION_FAILED", "Current site changed while saving the result");
     const version: SiteVersion = { ...draft, versionNumber: fallbackNumber };
     await this.deps.versions.save(version);
     await this.deps.projects.save({

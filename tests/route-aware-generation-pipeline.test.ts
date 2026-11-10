@@ -65,7 +65,7 @@ describe("Production route-aware generation with offline output and real build/Q
     try {
       expect(result.build.success).toBe(true); expect(result.browserQA?.status).not.toBe("FAIL");
       expect(result.browserQA?.checks.filter(check => check.status === "FAIL" && check.severity === "ERROR")).toEqual([]);
-      const navigation=result.browserQA!.checks.filter(check=>check.checkId==='generation.primary-navigation'&&check.route==='/');expect(navigation).toHaveLength(3);expect(navigation.every(check=>check.status==='PASS')).toBe(true);
+      const navigation=result.browserQA!.checks.filter(check=>check.checkId==='generation.primary-navigation'&&check.route==='/');/* desktop + mobile */expect(navigation).toHaveLength(2);expect(navigation.every(check=>check.status==='PASS')).toBe(true);
       expect(h.requests).toHaveLength(1); expect(result.inference?.stages.BUILD_REPAIR.logicalRequests).toBe(0);
       expect((await h.product.projects.getById(result.siteId))?.latestVersionId).toBe(result.versionId);
       expect((await h.product.versions.listBySite(result.siteId)).items).toHaveLength(1);
@@ -91,7 +91,8 @@ describe("Production route-aware generation with offline output and real build/Q
       expect(qa.status).not.toBe("FAIL");
       expect(qa.checks.filter(check => check.status === "FAIL" && check.severity === "ERROR")).toEqual([]);
       expect(new Set(qa.routes)).toEqual(new Set(["/", "/services", route, "/about", "/contact"]));
-      for (const viewport of ["DESKTOP", "TABLET", "MOBILE"]) {
+      // Adaptive generation QA: primary navigation is verified at desktop and mobile.
+      for (const viewport of ["DESKTOP", "MOBILE"]) {
         const checks = qa.checks.filter(check => check.viewport?.id === viewport);
         expect(checks.some(check=>check.checkId==='generation.primary-navigation'&&check.status==='PASS')).toBe(true);
       }

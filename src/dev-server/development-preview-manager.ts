@@ -40,6 +40,29 @@ export class DevelopmentPreviewManager {
     if (session) session.lastAccessedAt = new Date().toISOString();
     return session;
   }
+  /** Whether the session's preview process still serves its URL (providers without process tracking are trusted). */
+  #live(session: DevelopmentPreviewSession): boolean {
+    const probe = (this.execution as Partial<Pick<LocalExecutionProvider, "isPreviewRunning">>).isPreviewRunning;
+    return probe ? probe.call(this.execution, session.environmentId) : true;
+  }
+  /**
+   * A usable session, with its idle timer refreshed. A terminated preview is
+   * expired (workspace disposed) instead of handing out a dead URL; callers then
+   * restore from the saved source snapshot without any AI call.
+   */
+  async resolve(id: string): Promise<DevelopmentPreviewSession | undefined> {
+    const session = this.#sessions.get(id);
+    if (!session) return undefined;
+    if (this.#live(session)) return this.get(id);
+    console.warn(`[sites] preview process ended unexpectedly site=${session.siteId} session=${session.id}; it will be restored from the saved version on demand`);
+    await this.stop(id);
+    return undefined;
+  }
+  /** The live session currently serving a site, if any (refreshes its idle timer). */
+  async active(siteId: SiteId): Promise<DevelopmentPreviewSession | undefined> {
+    const id = this.#bySite.get(siteId);
+    return id ? this.resolve(id) : undefined;
+  }
   start(siteId: SiteId, versionId: VersionId) {
     if (this.#closed) return Promise.reject(new Error("Preview manager is closed"));
     return this.#serialize(siteId, () => this.#start(siteId, versionId));
@@ -53,6 +76,7 @@ export class DevelopmentPreviewManager {
       const current = this.execution.getLatestPreview(environmentId);
       if (!current?.url || current.url !== preview.url)
         throw new Error("Cannot adopt a generation preview whose environment is not ready");
+      await this.#annotate(environmentId, siteId, versionId);
       const now = new Date().toISOString();
       const session: DevelopmentPreviewSession = {
         id: randomUUID(),
@@ -68,10 +92,23 @@ export class DevelopmentPreviewManager {
       return session;
     });
   }
+  /** Best-effort label so a crash leftover is recognized as rebuildable, not unknown. */
+  async #annotate(environmentId: string, siteId: SiteId, versionId: VersionId): Promise<void> {
+    const annotate = (this.execution as Partial<Pick<LocalExecutionProvider, "annotateEnvironment">>).annotateEnvironment;
+    await annotate?.call(this.execution, environmentId, { purpose: "PREVIEW", siteId, versionId }).catch(() => undefined);
+  }
   async #start(siteId: SiteId, versionId: VersionId) {
     const old = this.#bySite.get(siteId);
+    // Concurrent or repeated requests for the same version share one live preview:
+    // replacing it would kill the URL already returned to the first caller.
+    const current = old ? this.#sessions.get(old) : undefined;
+    if (current && current.versionId === versionId && this.#live(current)) {
+      current.lastAccessedAt = new Date().toISOString();
+      return current;
+    }
     if (old) await this.#stop(old);
     const restored = await this.pipeline.restoreVersion(versionId);
+    await this.#annotate(restored.environmentId, siteId, versionId);
     try {
       const preview = await this.execution.startPreview(restored.environmentId, { port: 0 });
       if (!preview.url) throw new Error("Preview URL was not created");
@@ -106,8 +143,9 @@ export class DevelopmentPreviewManager {
     return true;
   }
   async sweep(now = Date.now()) {
-    for (const session of this.#sessions.values())
-      if (now - Date.parse(session.lastAccessedAt) >= this.ttlMs) await this.stop(session.id);
+    // Idle sessions and sessions whose preview process already exited release their workspace.
+    for (const session of [...this.#sessions.values()])
+      if (now - Date.parse(session.lastAccessedAt) >= this.ttlMs || !this.#live(session)) await this.stop(session.id);
   }
   async close() {
     this.#closed = true;

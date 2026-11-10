@@ -9,6 +9,12 @@ export const functionalPatterns: readonly [FunctionalCapability, RegExp][] = [
   ["tabs", /\btabs\b/i], ["accordion", /\baccordions?\b|\b(?:expandable|collapsible) (?:FAQs?|questions?|answers?)\b/i],
   ["dialog", /\b(?:modal|dialog)\b/i], ["search", /\b(?:search|searchable)\b/i],
   ["form", /\b(?:contact|inquiry|feedback) form\b/i], ["newsletter", /\bnewsletter\b/i],
+  // Verification-only behavior families: explicit behavior words, never nouns alone.
+  ["sort", /\b(?:sortable|sorting|sort\s+(?:by|options?|order|controls?|dropdown|menu|products|items|results|listings|them|the))\b/i],
+  ["filter", /\b(?:filterable|filtering|filters?\s+(?:by|for|products|items|results|listings|options?|controls?|panel|sidebar)|(?:price|availability|rating|tag|type|status|brand|location)\s+filters?)\b/i],
+  ["calculator", /\b(?:calculator|estimator|(?:cost|price|quote|savings|loan|mortgage|payment|shipping|bmi|tip)\s+(?:calculator|estimate|estimator))\b/i],
+  ["multi-step", /\b(?:multi[- ]?step|step[- ]by[- ]step\s+(?:form|wizard|flow|process|checkout|booking|signup|onboarding)|wizard|(?:two|three|four|five|[2-9])[- ]step\s+(?:form|wizard|flow|process|checkout|booking|signup|onboarding))\b/i],
+  ["comparison", /\b(?:compare\s+(?:selected|up to|two|three|\d)|comparison\s+(?:tool|feature|view|tray|drawer|panel|mode)|(?:select|choose|pick|add)\b[^.]{0,40}?\bto\s+compare)\b/i],
 ];
 
 /** Scan all clauses, not a truncated prefix. Markdown bullets do not negate negation. */
@@ -37,8 +43,12 @@ export function functionalIntent(prompt: string): {
   });
   const affirmative = mandatory.join(". ");
   const commerce = /\b(?:product|products|clothing|ecommerce|store|cart)\b/i.test(affirmative);
+  const categoryFilter = /\b(?:categor(?:y|ies) filter(?:s|ing)?|filter.*categor(?:y|ies))\b/i.test(affirmative);
   const capabilities = functionalPatterns.filter(([id, pattern]) => {
     if (id === "size" && !commerce && !/\bsize (?:selection|selector)\b/i.test(affirmative)) return false;
+    // The category filter probe already covers a category-only filter request.
+    // "category filters for its dishes" is still the category filter, not another kind.
+    if (id === "filter" && categoryFilter && !/\b(?:price|availability|rating|tag|type|status|brand|location)\s+filters?\b|(?<!\bcategor(?:y|ies)\s+)\bfilters?\s+(?:by|for)\s+(?!categor)/i.test(affirmative)) return false;
     return mandatory.some(clause => [...clause.matchAll(new RegExp(pattern.source, "gi"))].some(match =>
       !/\b(?:no|without|omit|exclude|do not|don't|never)\s+(?:(?:include|add|any|a|an|the)\s+)*$/i.test(clause.slice(0, match.index))));
   }).map(([id]) => id);

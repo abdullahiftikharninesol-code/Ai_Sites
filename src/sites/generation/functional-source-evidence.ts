@@ -7,7 +7,10 @@ export interface FunctionalSourceAssessment {
   readonly reason: "STRUCTURAL_MATCH_REQUIRES_BEHAVIOR" | "NO_POSSIBLE_RENDERED_CONTROL" | "DYNAMIC_OR_CUSTOM_IMPLEMENTATION";
 }
 export interface FunctionalSourcePart { readonly file: ts.SourceFile; readonly node: ts.Node }
-const capabilities: readonly FunctionalCapability[] = ["cart", "quantity", "size", "gallery", "category-filter", "product-navigation", "mobile-nav", "tabs", "accordion", "dialog", "search", "form", "newsletter"];
+const capabilities: readonly FunctionalCapability[] = ["cart", "quantity", "size", "gallery", "category-filter", "product-navigation", "mobile-nav", "tabs", "accordion", "dialog", "search", "form", "newsletter",
+  "sort", "filter", "calculator", "multi-step", "comparison"];
+/** Control wording that names an order with a key or direction (not just any dropdown). */
+const SORT_WORDING = /\bsort|\border by\b|low(?:est)? to high|high(?:est)? to low|\ba\s*(?:-|–|—|to)\s*z\b|\bz\s*(?:-|–|—|to)\s*a\b|ascending|descending|newest|oldest/i;
 const managed: Readonly<Record<string, readonly FunctionalCapability[]>> = {
   Accordion: ["accordion"], Tabs: ["tabs"], DemoDialog: ["dialog"], DemoForm: ["form"], ContactSection: ["form"], MobileNav: ["mobile-nav"],
   CategoryFilter: ["category-filter"], ProductSearch: ["search"], NewsletterSignup: ["newsletter"], ProductGallery: ["gallery"],
@@ -23,12 +26,20 @@ export function assessFunctionalSource(
 ): Readonly<Record<FunctionalCapability, FunctionalSourceAssessment>> {
   const recognized = new Set<FunctionalCapability>(), possible = new Set<FunctionalCapability>();
   let opaque = !graphComplete;
+  // Behavior-family evidence needs both a control and the logic it drives.
+  const controlTexts: string[] = [];
+  let sortCall = false, filterCall = false, numericInput = false, liveOutput = false, ariaSort = false;
   let activeOmitted: readonly ts.Node[] = [];
   const contained = (outer: ts.Node, inner: ts.Node) => outer.getSourceFile() === inner.getSourceFile() && inner.pos >= outer.pos && inner.end <= outer.end;
   const visit = (node: ts.Node, file: ts.SourceFile): void => {
     if (activeOmitted.some(other => other === node || contained(other, node))) return;
     if (ts.isCallExpression(node) && /(?:^|\.)(?:createElement|cloneElement|createPortal|insertAdjacentHTML|appendChild|replaceChildren|render)$/.test(node.expression.getText(file))) opaque = true;
     if (ts.isBinaryExpression(node) && ts.isPropertyAccessExpression(node.left) && ["innerHTML", "outerHTML"].includes(node.left.name.text)) opaque = true;
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const method = node.expression.name.text;
+      if (method === "sort" || method === "toSorted") sortCall = true;
+      if (method === "filter") filterCall = true;
+    }
     if (ts.isJsxExpression(node) && node.expression && (ts.isJsxElement(node.parent) || ts.isJsxFragment(node.parent))) {
       const value = node.expression;
       const primitive = ts.isStringLiteralLike(value) || ts.isNumericLiteral(value) || [ts.SyntaxKind.TrueKeyword, ts.SyntaxKind.FalseKeyword, ts.SyntaxKind.NullKeyword].includes(value.kind);
@@ -45,6 +56,22 @@ export function assessFunctionalSource(
         const value = attribute(name)?.initializer;
         return value && ts.isStringLiteral(value) ? value.text : value && ts.isJsxExpression(value) && value.expression && ts.isStringLiteralLike(value.expression) ? value.expression.text : undefined;
       };
+      const role = literal("role");
+      if (!/^[A-Z]/.test(tag)) {
+        if (tag === "input" && ["number", "range"].includes(literal("type") ?? "")) numericInput = true;
+        if (tag === "output" || attribute("aria-live") || role === "status") liveOutput = true;
+        if (attribute("aria-sort")) ariaSort = true;
+        if (["button", "option", "label", "legend", "summary", "th", "select", "input", "a"].includes(tag) || ["button", "tab", "checkbox", "radio", "switch"].includes(role ?? "")) {
+          const own = [literal("aria-label"), literal("title"), literal("placeholder")];
+          if (ts.isJsxOpeningElement(node) && ts.isJsxElement(node.parent))
+            for (const child of node.parent.children) {
+              if (ts.isJsxText(child)) own.push(child.text);
+              else if (ts.isJsxExpression(child) && child.expression && ts.isStringLiteralLike(child.expression)) own.push(child.expression.text);
+            }
+          const text = own.filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+          if (text) controlTexts.push(text);
+        }
+      }
       if (/^[A-Z]/.test(tag)) {
         const resolved = component(file, tag);
         if (resolved.kind === "MANAGED") for (const capability of managed[resolved.exportName ?? ""] ?? []) recognized.add(capability);
@@ -69,6 +96,12 @@ export function assessFunctionalSource(
     activeOmitted = omitted.filter(node => node !== part.node && contained(part.node, node));
     visit(part.node, part.file);
   }
+  const named = (pattern: RegExp) => controlTexts.some(text => pattern.test(text));
+  if (sortCall && (ariaSort || named(SORT_WORDING))) recognized.add("sort");
+  if (filterCall && named(/\bfilter|^(?:all|show all|any)\b/i)) recognized.add("filter");
+  if (numericInput && liveOutput) recognized.add("calculator");
+  if (named(/^(?:next|continue)\b/i) && named(/^(?:back|previous|prev)\b/i)) recognized.add("multi-step");
+  if (named(/\bcompar/i)) recognized.add("comparison");
   return Object.fromEntries(capabilities.map(capability => [capability,
     recognized.has(capability) ? { state: "RECOGNIZED", reason: "STRUCTURAL_MATCH_REQUIRES_BEHAVIOR" }
       : opaque || possible.has(capability) ? { state: "UNCERTAIN", reason: "DYNAMIC_OR_CUSTOM_IMPLEMENTATION" }

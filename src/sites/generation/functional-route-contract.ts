@@ -1,4 +1,5 @@
-import type { FunctionalCapability, FunctionalRequirements } from "./functional-capabilities.js";
+import { VERIFICATION_ONLY_CAPABILITIES, type FunctionalCapability, type FunctionalRequirements } from "./functional-capabilities.js";
+import { extractCalculationFormula, type CalculationFormula } from "./calculation-formula.js";
 import type { SitePageSpec, SiteSpec } from "../domain/site-spec.js";
 import { equivalentPage, pageFamily, pageId, requestedPages } from "./requested-pages.js";
 import type { FunctionalSourceAssessment } from "./functional-source-evidence.js";
@@ -15,6 +16,8 @@ export interface FunctionalRequirement {
   readonly routes?: readonly string[];
   readonly sourceEvidence?: readonly FunctionalSourceReference[];
   readonly sourceAssessment?: FunctionalSourceAssessment;
+  /** calculator: an explicit rule the user stated; without it correctness is never asserted. */
+  readonly formula?: CalculationFormula;
 }
 export interface ResolvedFunctionalContract {
   readonly version: 1;
@@ -34,6 +37,11 @@ export const functionalBehaviors: Readonly<Record<FunctionalCapability, string>>
   cart: "Adding the selected product updates the cart quantity; the cart opens with the actual added item.",
   quantity: "Quantity controls update the selected positive quantity.", size: "Selecting a size updates the actual selected value.",
   gallery: "Selecting a thumbnail changes the active product image.", "product-navigation": "Product navigation opens the matching implemented product page.",
+  sort: "Choosing an order whose key and direction are stated reorders the same items into that order.",
+  filter: "Applying a filter shows a matching subset of the items; clearing it restores the full set.",
+  calculator: "Changing an input updates the visible result; it matches an explicitly stated formula when one is given.",
+  "multi-step": "Next advances to a different step; Back returns to the previous step with entered values preserved.",
+  comparison: "Selecting items shows exactly those items in the comparison view; deselecting removes them.",
 };
 
 type SectionBinding = { readonly sectionId: string } | { readonly sectionName: string; readonly exactLabel: boolean };
@@ -80,6 +88,7 @@ export function assignFunctionalRequirements(prompt: string, capabilities: reado
     form: /\b(?:contact|inquiry|feedback) form|form.*valid/i, "mobile-nav": /mobile (?:menu|nav)/i,
     search: /\bsearch/i, newsletter: /\bnewsletter/i, cart: /\bcart\b|add to bag/i,
     quantity: /\bquantity\b/i, size: /\b(?:size|sizes)\b/i, gallery: /\bgallery\b/i, "product-navigation": /product[- ]detail/i,
+    sort: /\bsort/i, filter: /\bfilter/i, calculator: /\b(?:calculat|estimat)/i, "multi-step": /\b(?:multi[- ]?step|wizard|step)/i, comparison: /\bcompar/i,
   };
   const result: FunctionalRequirement[] = [];
   for (const capability of capabilities) {
@@ -92,7 +101,11 @@ export function assignFunctionalRequirements(prompt: string, capabilities: reado
     });
     const defaultFamily = capability === "form" ? "contact" : capability === "tabs" ? "services" : capability === "category-filter" || capability === "dialog" ? "portfolio"
       : ["size", "quantity", "gallery", "cart", "product-navigation"].includes(capability) ? "product" : capability === "accordion" ? "faq" : "home";
-    const preferred = pages.find(page => pageFamily(page.name) === defaultFamily) ?? (["accordion", "category-filter"].includes(capability) ? pages.find(page => pageFamily(page.name) === "home") : undefined);
+    // Verification-only families have no conventional page: unless the request
+    // places them, they resolve to the routes whose source implements them.
+    const preferred = VERIFICATION_ONLY_CAPABILITIES.has(capability) ? undefined
+      : pages.find(page => pageFamily(page.name) === defaultFamily) ?? (["accordion", "category-filter"].includes(capability) ? pages.find(page => pageFamily(page.name) === "home") : undefined);
+    const formula = capability === "calculator" ? extractCalculationFormula(prompt) : undefined;
     const targets = owners.length ? owners : preferred ? [preferred] : [];
     if (capability === "mobile-nav") {
       result.push({ id: "functional:mobile-nav:site", capability, target: { kind: "SITE" }, expectedBehavior: functionalBehaviors[capability], mandatory: true, validation: "BROWSER_BEHAVIOR" });
@@ -109,7 +122,7 @@ export function assignFunctionalRequirements(prompt: string, capabilities: reado
         // either an exact DOM ID or an exact visible heading as a QA prerequisite.
         else result.push({ id: base, capability, target: { kind: page ? "PAGE" : "ANY_PAGE", ...identity,
           ...(sections.length === 1 && "sectionName" in sections[0]! ? { sectionName: sections[0].sectionName } : {}) },
-          expectedBehavior: functionalBehaviors[capability], mandatory: true, validation: "BROWSER_BEHAVIOR" });
+          expectedBehavior: functionalBehaviors[capability], mandatory: true, validation: "BROWSER_BEHAVIOR", ...(formula ? { formula } : {}) });
       }
     }
   }
@@ -124,7 +137,8 @@ export function plannedFunctionalRequirements(requirements: FunctionalRequiremen
   }) };
 }
 export function functionalRouteGuidance(requirements: FunctionalRequirements): string {
-  return (requirements.requirements ?? []).map(requirement => `PAGE: ${requirement.target.pageName ?? (requirement.target.kind === "SITE" ? "shared site navigation" : "appropriate implemented page")}${requirement.routes?.length ? ` [${requirement.routes.join(", ")}]` : ""}${requirement.target.kind === "SECTION" ? `; SECTION: ${requirement.target.sectionId ? `literal id=${JSON.stringify(requirement.target.sectionId)}` : `accessible heading/label ${JSON.stringify(requirement.target.sectionName)}`}` : requirement.target.sectionName ? `; LOCATION INTENT: ${JSON.stringify(requirement.target.sectionName)} (descriptive, not a literal ID or heading)` : ""}; REQUIRED: ${requirement.capability}; BEHAVIOR: ${requirement.expectedBehavior}`).join("\n");
+  // Verification-only families never reach the planner or generator prompt.
+  return (requirements.requirements ?? []).filter(requirement => !VERIFICATION_ONLY_CAPABILITIES.has(requirement.capability)).map(requirement => `PAGE: ${requirement.target.pageName ?? (requirement.target.kind === "SITE" ? "shared site navigation" : "appropriate implemented page")}${requirement.routes?.length ? ` [${requirement.routes.join(", ")}]` : ""}${requirement.target.kind === "SECTION" ? `; SECTION: ${requirement.target.sectionId ? `literal id=${JSON.stringify(requirement.target.sectionId)}` : `accessible heading/label ${JSON.stringify(requirement.target.sectionName)}`}` : requirement.target.sectionName ? `; LOCATION INTENT: ${JSON.stringify(requirement.target.sectionName)} (descriptive, not a literal ID or heading)` : ""}; REQUIRED: ${requirement.capability}; BEHAVIOR: ${requirement.expectedBehavior}`).join("\n");
 }
 export function withFunctionalContract(spec: SiteSpec, requirements: FunctionalRequirements): SiteSpec {
   return { ...spec, requirements: { ...spec.requirements, functional: plannedFunctionalRequirements(requirements, spec.requirements.pages) } };

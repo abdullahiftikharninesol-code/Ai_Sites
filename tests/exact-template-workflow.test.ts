@@ -279,11 +279,17 @@ describe('Original exact-template workflow, no live AI', () => {
     if (['corporate-business','restaurant'].includes(key)) expect(record.version).toBe(2);
     expect(createHash('sha256').update(artifacts.get(key)!).digest('hex')).toBe(record.sourceSha256);
     const h = await harness(record);
-    const created = await h.service.instantiate({ ownerId: 'exact-owner' as UserId, templateKey: key }).catch(async error => {
-      const failed = await h.qa.mock.results.at(-1)?.value as BrowserQAReport | undefined;
-      const proof = resolve(process.env.SITES_EXACT_TEMPLATE_PROOF_ROOT ?? '.sites-runtime/exact-template-proof'); await mkdir(proof, { recursive: true });
-      await writeFile(join(proof, `${key}-qa.json`), JSON.stringify(failed));
-      console.info('[exact-template] failure evidence', JSON.stringify(failed?.checks.filter(check => check.status === 'FAIL' && check.severity === 'ERROR').slice(0, 3).map(check => ({ check: check.checkId, route: check.route, viewport: check.viewport?.id, message: check.message, evidence: check.evidence }))));
+    const created = await h.service.instantiate({ ownerId: 'exact-owner' as UserId, templateKey: key }).catch(async (error: unknown) => {
+      // Evidence is best-effort: a failure before browser QA (e.g. npm ci) has no
+      // report, and writing evidence must never replace the original error.
+      try {
+        const failed = await h.qa.mock.results.at(-1)?.value as BrowserQAReport | undefined;
+        if (failed) {
+          const proof = resolve(process.env.SITES_EXACT_TEMPLATE_PROOF_ROOT ?? '.sites-runtime/exact-template-proof'); await mkdir(proof, { recursive: true });
+          await writeFile(join(proof, `${key}-qa.json`), JSON.stringify(failed));
+          console.info('[exact-template] failure evidence', JSON.stringify(failed.checks.filter(check => check.status === 'FAIL' && check.severity === 'ERROR').slice(0, 3).map(check => ({ check: check.checkId, route: check.route, viewport: check.viewport?.id, message: check.message, evidence: check.evidence }))));
+        } else console.info('[exact-template] failed before browser QA', key, error instanceof Error ? error.message : String(error));
+      } catch (evidenceError) { console.info('[exact-template] evidence capture failed', evidenceError instanceof Error ? evidenceError.message : String(evidenceError)); }
       throw error;
     });
     try {

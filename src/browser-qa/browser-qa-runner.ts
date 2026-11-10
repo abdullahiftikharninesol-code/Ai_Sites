@@ -70,6 +70,8 @@ export interface BrowserQARunnerPolicy {
   readonly perPageTimeoutMs: number;
   readonly totalTimeoutMs: number;
   readonly captureScreenshots: boolean;
+  /** Full-page captures are costly; targeted plans capture the viewport only. */
+  readonly fullPageScreenshots: boolean;
   readonly reducedMotion: boolean;
   readonly permissions: readonly string[];
   readonly allowDownloads: boolean;
@@ -82,6 +84,7 @@ export const DEFAULT_BROWSER_QA_RUNNER_POLICY: BrowserQARunnerPolicy = Object.fr
   perPageTimeoutMs: 30_000,
   totalTimeoutMs: 120_000,
   captureScreenshots: true,
+  fullPageScreenshots: true,
   reducedMotion: false,
   permissions: Object.freeze([]),
   allowDownloads: false,
@@ -92,13 +95,33 @@ export interface BrowserQARunRequest {
   readonly target: BrowserQAPreviewTarget;
   readonly routes?: readonly string[];
   readonly viewports?: readonly BrowserQAViewport[];
+  /** Explicit route/viewport pairs. When present, replaces the routes x viewports product. */
+  readonly targets?: readonly BrowserQARouteTarget[];
+  /** Pages to capture; omitted means every visited page (historical behavior). */
+  readonly screenshotTargets?: readonly BrowserQARouteTarget[];
   readonly checks?: readonly BrowserQACheckExecutor[];
   readonly artifactPrefix?: string;
   readonly policy?: Partial<BrowserQARunnerPolicy>;
 }
 
+export interface BrowserQARouteTarget {
+  readonly route: string;
+  readonly viewport: BrowserQAViewport;
+}
+
+/** Cumulative counters for measuring QA cost; never part of a persisted report. */
+export interface BrowserQARunnerMetrics {
+  readonly runs: number;
+  readonly browserLaunches: number;
+  readonly pagesOpened: number;
+  readonly routeVisits: number;
+  readonly screenshots: number;
+}
+
 export interface BrowserQARunnerOptions {
   readonly artifacts?: ArtifactStore;
+  /** Browsers allowed at once across concurrent QA runs (bounds CPU/RAM). */
+  readonly maxConcurrentBrowsers?: number;
   readonly now?: () => Date;
   readonly launchBrowser?: (options: { readonly headless: boolean; readonly timeout: number }) => Promise<Browser>;
 }
@@ -108,9 +131,14 @@ export class BrowserQARunner {
   readonly #now: () => Date;
   readonly #launchBrowser: NonNullable<BrowserQARunnerOptions["launchBrowser"]>;
   #activeBrowsers = 0;
+  readonly #maxConcurrentBrowsers: number;
+  readonly #waiting: (() => void)[] = [];
+  #slots = 0;
+  readonly #metrics = { runs: 0, browserLaunches: 0, pagesOpened: 0, routeVisits: 0, screenshots: 0 };
 
   constructor(options: BrowserQARunnerOptions = {}) {
     this.#artifacts = options.artifacts;
+    this.#maxConcurrentBrowsers = Math.max(1, Math.floor(options.maxConcurrentBrowsers ?? 2));
     this.#now = options.now ?? (() => new Date());
     this.#launchBrowser = options.launchBrowser ?? ((launchOptions) => chromium.launch(launchOptions));
   }
@@ -119,7 +147,20 @@ export class BrowserQARunner {
     return this.#activeBrowsers;
   }
 
+  get metrics(): BrowserQARunnerMetrics {
+    return Object.freeze({ ...this.#metrics });
+  }
+
   async run(request: BrowserQARunRequest): Promise<BrowserQAReport> {
+    // Bound concurrent Chromium instances; queued runs wait instead of spiking CPU/RAM.
+    if (this.#slots >= this.#maxConcurrentBrowsers) await new Promise<void>(resolve => this.#waiting.push(resolve));
+    this.#slots++;
+    try { return await this.#run(request); }
+    finally { this.#slots--; this.#waiting.shift()?.(); }
+  }
+
+  async #run(request: BrowserQARunRequest): Promise<BrowserQAReport> {
+    this.#metrics.runs++;
     const started = this.#now();
     const wallStarted = Date.now();
     const policy = { ...DEFAULT_BROWSER_QA_RUNNER_POLICY, ...request.policy };
@@ -128,13 +169,18 @@ export class BrowserQARunner {
       baseUrl.origin,
       ...(request.target.allowedOrigins ?? []).map(validateOrigin),
     ]);
-    const routes = normalizeRoutes(request.routes ?? [baseUrl.pathname || "/"]);
-    const viewports = [...(request.viewports ?? BROWSER_QA_VIEWPORTS)];
+    const targets = request.targets?.length
+      ? request.targets.map(target => ({ route: normalizeRoutes([target.route])[0]!, viewport: target.viewport }))
+      : undefined;
+    const routes = targets ? [...new Set(targets.map(target => target.route))].sort((a, b) => a.localeCompare(b)) : normalizeRoutes(request.routes ?? [baseUrl.pathname || "/"]);
+    const viewports = targets ? BROWSER_QA_VIEWPORTS.filter(viewport => targets.some(target => target.viewport.id === viewport.id)) : [...(request.viewports ?? BROWSER_QA_VIEWPORTS)];
+    const visits = targets ?? viewports.flatMap(viewport => routes.map(route => ({ route, viewport })));
+    const screenshotKeys = request.screenshotTargets ? new Set(request.screenshotTargets.map(target => `${target.viewport.id} ${target.route}`)) : undefined;
     const checks: BrowserQACheckResult[] = [];
     const screenshotRefs: string[] = [];
     const screenshots: BrowserQAScreenshotDescriptor[] = [];
     let browser: Browser;
-    try { browser = await this.#launchWithRetry(policy); }
+    try { browser = await this.#launchWithRetry(policy); this.#metrics.browserLaunches++; }
     catch (error) {
       const completed = this.#now();
       return createBrowserQAReport({ runId: request.runId, ...request.target,
@@ -145,8 +191,8 @@ export class BrowserQARunner {
     }
     this.#activeBrowsers++;
     try {
-      routeRuns: for (const viewport of viewports) {
-        for (const route of routes) {
+      routeRuns: for (const { route, viewport } of visits) {
+        {
           const remainingMs = policy.totalTimeoutMs - Math.max(this.#now().getTime() - started.getTime(), Date.now() - wallStarted);
           if (remainingMs <= 0) {
             checks.push(createBrowserQACheckResult({ checkId: "qa.run-budget", category: "RUNTIME", status: "FAIL", severity: "ERROR", route, viewport,
@@ -163,7 +209,7 @@ export class BrowserQARunner {
             viewport,
             checks: request.checks ?? [],
             ...(request.artifactPrefix === undefined ? {} : { artifactPrefix: request.artifactPrefix }),
-            policy,
+            policy: screenshotKeys && !screenshotKeys.has(`${viewport.id} ${route}`) ? { ...policy, captureScreenshots: false } : policy,
             screenshotRefs,
             screenshots,
             budgetMs: Math.min(policy.perPageTimeoutMs, remainingMs),
@@ -241,6 +287,7 @@ export class BrowserQARunner {
       acceptDownloads: input.policy.allowDownloads,
       serviceWorkers: "block",
     });
+    this.#metrics.routeVisits++;
     let page: Page | undefined;
     const pageChecks: BrowserQACheckResult[] = [];
     let expired = false;
@@ -263,6 +310,7 @@ export class BrowserQARunner {
         await route.abort("blockedbyclient");
       });
       page = await context.newPage();
+      this.#metrics.pagesOpened++;
       context.on("page", (popup) => {
         if (popup === page || openingProbe) return;
         events.popups.push(Object.freeze({ type: "network", url: popup.url() || "about:blank", failureText: "Unexpected popup blocked" }));
@@ -366,7 +414,7 @@ export class BrowserQARunner {
           // abort a timed-out check without its pending clicks affecting the next.
           if (check.definition.category === "INTERACTION" || check.definition.category === "FORM") {
             openingProbe = true;
-            try { probe = await context.newPage(); } finally { openingProbe = false; }
+            try { probe = await context.newPage(); this.#metrics.pagesOpened++; } finally { openingProbe = false; }
             observe(probe);
             await probe.emulateMedia({ reducedMotion: input.policy.reducedMotion ? "reduce" : "no-preference" });
             const response = await probe.goto(destination.toString(), { waitUntil: "load", timeout: input.policy.navigationTimeoutMs });
@@ -410,7 +458,8 @@ export class BrowserQARunner {
     screenshots: BrowserQAScreenshotDescriptor[],
   ): Promise<string | undefined> {
     if (!input.policy.captureScreenshots || !this.#artifacts || input.artifactPrefix === undefined) return undefined;
-    const bytes = await page.screenshot({ fullPage: true, type: "png", timeout: input.policy.navigationTimeoutMs });
+    const bytes = await page.screenshot({ fullPage: input.policy.fullPageScreenshots, type: "png", timeout: input.policy.navigationTimeoutMs });
+    this.#metrics.screenshots++;
     const routeKey = input.route === "/" ? "home" : input.route.replace(/^\/+/, "").replace(/[^a-zA-Z0-9_-]+/g, "-") || "route";
     const fullHash = createHash("sha256").update(bytes).digest("hex");
     const ref = `${input.artifactPrefix}/${input.viewport.id.toLowerCase()}-${routeKey}-${fullHash.slice(0, 16)}.png`;

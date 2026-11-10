@@ -86,6 +86,13 @@ const safeError = (error: unknown) => {
     "TEMPLATE_SOURCE_INTEGRITY_FAILED",
     "TEMPLATE_INSTANTIATION_BUILD_FAILED",
     "TEMPLATE_INSTANTIATION_QA_FAILED",
+    "BROWSER_QA_INCONCLUSIVE",
+    "PREVIEW_EXPIRED",
+    "PREVIEW_SOURCE_UNAVAILABLE",
+    "PREVIEW_RESTORE_FAILED",
+    "VERSION_CONFLICT",
+    "ROLLBACK_UNAVAILABLE",
+    "ROLLBACK_SOURCE_UNAVAILABLE",
     "UNSAFE_TEMPLATE_SOURCE",
     "MANIFEST_INVALID",
   ]);
@@ -326,6 +333,14 @@ export class PlaygroundHttpServer {
           );
         return this.#json(res, 202, { jobId: job.id, projectId: match[1] });
       }
+      // One-step rollback: restores saved source only (no AI call, no charge).
+      match = /^\/api\/dev\/sites\/([^/]+)\/rollback$/.exec(path);
+      if (method === "POST" && match) {
+        const body = await readJson(req);
+        if (typeof body.expectedVersionId !== "string" || !body.expectedVersionId)
+          throw Object.assign(new Error("expectedVersionId is required"), { code: "INVALID_REQUEST" });
+        return this.#json(res, 200, await this.service.rollback(ownerId, decodeRouteParam(match[1]!), body.expectedVersionId));
+      }
       match = /^\/api\/dev\/sites\/([^/]+)\/versions\/([^/]+)\/preview$/.exec(path);
       if (method === "POST" && match)
         return this.#json(
@@ -400,10 +415,19 @@ export class PlaygroundHttpServer {
           normalized.code === "SOURCE_FILE_NOT_FOUND" ||
           normalized.code === "TEMPLATE_NOT_FOUND"
           ? 404
+          // An ended preview session is recoverable, unlike a missing project.
+          : normalized.code === "PREVIEW_EXPIRED"
+            ? 410
+          : normalized.code === "PREVIEW_SOURCE_UNAVAILABLE"
+            ? 422
+          : normalized.code === "PREVIEW_RESTORE_FAILED"
+            ? 503
           : normalized.code === "SUBSCRIPTION_REQUIRED"
             ? 402
-            : normalized.code === "DEV_JOB_BUSY"
+            : normalized.code === "DEV_JOB_BUSY" || normalized.code === "VERSION_CONFLICT" || normalized.code === "ROLLBACK_UNAVAILABLE"
               ? 409
+              : normalized.code === "ROLLBACK_SOURCE_UNAVAILABLE"
+                ? 422
               : normalized.code === "REQUEST_TOO_LARGE"
                 ? 413
                 : normalized.code === "DEV_REQUEST_FAILED"

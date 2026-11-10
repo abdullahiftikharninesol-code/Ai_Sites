@@ -49,6 +49,35 @@ describe("General-purpose deterministic request corpus", () => {
   it.each(["Implement a live payment processing system.", "Process real payments and charge credit cards.", "Add live reservations."])("rejects unconfigured transactions: %s", prompt => {
     expect(() => assertFunctionalBackendSupport(functionalRequirements(prompt))).toThrow(/no configured implementation/);
   });
+  it.each([
+    "Build a bakery store with a demo checkout (no real payments).",
+    "An online shop with a mock checkout, not real payments.",
+    "A salon site with a booking form; it doesn't need to take live bookings yet.",
+    "Restaurant website with a reservation form instead of real reservations.",
+    "Add a contact form without sending real emails or a real backend.",
+    "Show a pricing page. Real payments are not needed.",
+  ])("a negated mention of real transactions is not a request for them: %s", prompt => {
+    const requirements = functionalRequirements(prompt);
+    expect(requirements).toMatchObject({ unsupportedTransactions: false, backendRequired: false });
+    expect(() => assertFunctionalBackendSupport(requirements)).not.toThrow();
+  });
+  it("names the requested phrase and a demo alternative when real transactions are required", () => {
+    expect(() => assertFunctionalBackendSupport(functionalRequirements("A store with a demo catalog that must process real payments."))).toThrow(
+      /asks for real backend behavior \("process real payments"\), which has no configured implementation.*demo checkout with no real payments/);
+    // Negating one phrase does not cancel an independent request in another clause.
+    expect(functionalRequirements("No real backend, but accept live payments.")).toMatchObject({ unsupportedTransactions: true, backendPhrases: ["live payments"] });
+  });
+  it("request-review failures carry plain-language items the UI can show (no raw text needed)", () => {
+    const capture = (fn: () => void) => { try { fn(); } catch (error) { return error as { code?: string; metadata?: Record<string, unknown> }; } return undefined; };
+    expect(capture(() => assertFunctionalBackendSupport(functionalRequirements("A bakery that must process real payments and send real emails.")))).toMatchObject({
+      code: "UNSUPPORTED_SITE_REQUIREMENT",
+      metadata: { failureStage: "REQUEST_REVIEW", requestIssue: "UNSUPPORTED_FEATURES", matchedPhrases: ["process real payments", "send real emails"],
+        unsupportedFeatures: ["Real payment processing (charging actual money)", "Sending real emails"] },
+    });
+    expect(capture(() => assertFunctionalBackendSupport(functionalRequirements("Add a search bar. No search.")))).toMatchObject({
+      metadata: { requestIssue: "CONFLICTING_INSTRUCTIONS", conflictingFeatures: ["search"] },
+    });
+  });
   it("does not treat a ban on real transactions as a request for them", () => {
     expect(() => assertFunctionalBackendSupport(functionalRequirements("Add a contact form. Do not send real emails. Do not charge cards. Use honest local demo feedback."))).not.toThrow();
   });

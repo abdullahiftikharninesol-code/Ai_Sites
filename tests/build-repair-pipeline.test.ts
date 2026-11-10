@@ -67,11 +67,17 @@ describe("Real scratch pipeline, compiler repair and unchanged QA gates", () => 
   it("replays the exact failed Vertex request/source, preserves six fields and passes real five-page responsive QA without a model repair", async () => {
     const h = await harness(retainedVertexBundle, () => rejectedVertexRepair, { prompt: retainedVertexPrompt, useRealPlanner: true });
     const result = await h.product.pipeline.generate({ ...request, prompt: retainedVertexPrompt, retainPreview: false });
-    expect(result.build.success).toBe(true); expect(result.browserQA?.status).toBe("PASS");
+    // Static prompt-requirement advisories are reported as a WARNING by the usable
+    // generation policy; they are not browser defects. Every executed check passes.
+    expect(result.build.success).toBe(true); expect(result.browserQA?.status).not.toBe("FAIL");
+    expect(result.browserQA?.checks.filter(check => check.status !== "PASS" && check.status !== "SKIPPED").map(check => check.checkId)).toEqual(["generation.requirement-advisories"]);
     expect(result.browserQA?.checks.filter(check => check.status === "FAIL")).toEqual([]);
     expect(result.browserQA?.checks.filter(check => check.checkId === "runtime.page-error" && check.status !== "PASS")).toEqual([]);
     expect(new Set(result.browserQA?.routes)).toEqual(new Set(["/", "/services", "/work", "/about", "/contact"]));
-    expect(new Set(result.browserQA?.viewports.map(viewport => viewport.id))).toEqual(new Set(["DESKTOP", "MOBILE", "TABLET"]));
+    // Adaptive generation QA: every route at desktop and mobile (tablet no longer exhaustive).
+    expect(new Set(result.browserQA?.viewports.map(viewport => viewport.id))).toEqual(new Set(["DESKTOP", "MOBILE"]));
+    expect(result.browserQA?.checks.filter(check => check.checkId === "page-readiness" && check.status === "PASS")).toHaveLength(10);
+    expect(result.qaVerification?.outcome).toBe("VERIFIED");
     expect(h.requests).toHaveLength(1); expect(result.inference?.stages.BUILD_REPAIR.logicalRequests).toBe(0);
     const source = JSON.parse(Buffer.from((await h.product.artifacts.get(result.sourceArtifactRef))!).toString()) as { files: Record<string, string> };
     expect(source.files["src/App.tsx"]).toBe(redundantJsxClosingRepair("src/App.tsx", retainedVertexBundle.files.find(file => file.path === "src/App.tsx")!.content)!.content);
@@ -123,7 +129,8 @@ describe("Real scratch pipeline, compiler repair and unchanged QA gates", () => 
       expect(result.browserQA?.status).toBe("PASS");
       expect(result.browserQA?.checks.filter(check => check.status === "FAIL" && check.severity === "ERROR")).toEqual([]);
       expect(new Set(result.browserQA?.checks.map(check => check.route))).toEqual(new Set(vertexPages.map(page => page.path)));
-      expect(new Set(result.browserQA?.checks.map(check => check.viewport?.id))).toEqual(new Set(["DESKTOP", "TABLET", "MOBILE"]));
+      // Adaptive generation QA: desktop and mobile (tablet is no longer exhaustive by default).
+      expect(new Set(result.browserQA?.checks.map(check => check.viewport?.id))).toEqual(new Set(["DESKTOP", "MOBILE"]));
       expect(result.browserQA?.checks.filter(check => check.checkId === "runtime.page-error" && check.status === "FAIL")).toEqual([]);
       const source = JSON.parse(Buffer.from((await h.product.artifacts.get(result.sourceArtifactRef))!).toString()) as { files: Record<string, string> };
       expect(source.files["src/App.tsx"]).toContain(compilerReplacement);

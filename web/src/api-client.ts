@@ -114,7 +114,6 @@ export interface LocalInstanceStatus {
   siteId: string;
   versionId: string;
   environmentId: string;
-  workspacePath: string;
   previewUrl: string;
   status: "RUNNING";
   processCount: number;
@@ -157,14 +156,15 @@ export class PlaygroundApiClient {
     } catch {
       throw new PlaygroundApiConnectionError(this.baseUrl);
     }
-    let value: T & { error?: { message: string } };
+    let value: T & { error?: { code?: string; message: string } };
     try {
-      value = (await response.json()) as T & { error?: { message: string } };
+      value = (await response.json()) as T & { error?: { code?: string; message: string } };
     } catch {
       throw new Error(`Invalid API response (HTTP ${response.status})`);
     }
     if (!response.ok)
-      throw new Error(value?.error?.message ?? `Request failed (${response.status})`);
+      // Keep the server error code so callers can tell an ended preview from a missing project.
+      throw Object.assign(new Error(value?.error?.message ?? `Request failed (${response.status})`), { code: value?.error?.code });
     return value;
   }
   health() {
@@ -251,12 +251,19 @@ export class PlaygroundApiClient {
       previewSessionId: string;
       previewUrl: string;
       environmentId: string;
-      workspacePath: string;
     }>(
       `/api/dev/sites/${encodeURIComponent(siteId)}/versions/${encodeURIComponent(versionId)}/preview`,
       { method: "POST" },
     );
   }
+  /** Keeps a viewed preview from idle cleanup; rejects with code PREVIEW_EXPIRED once it has ended. */
+
+  async touchPreview(id: string): Promise<void> {
+
+    await this.#request<LocalInstanceStatus>(`/api/dev/previews/${encodeURIComponent(id)}`);
+
+  }
+
   previewInstance(id: string) {
     return this.#request<LocalInstanceStatus>(`/api/dev/previews/${encodeURIComponent(id)}`);
   }

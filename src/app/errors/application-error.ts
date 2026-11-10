@@ -49,6 +49,12 @@ export type ErrorCode =
   | "TEMPLATE_BUILD_FAILED"
   | "PREVIEW_INVALID"
   | "TEMPLATE_BROWSER_QA_FAILED"
+  /** Browser verification could not complete (infrastructure/timeout); not a site defect. */
+  | "BROWSER_QA_INCONCLUSIVE"
+  /** Version recovery: concurrent change, nothing to restore, or unusable saved source. */
+  | "VERSION_CONFLICT"
+  | "ROLLBACK_UNAVAILABLE"
+  | "ROLLBACK_SOURCE_UNAVAILABLE"
   | "TEMPLATE_PREVIEW_CAPTURE_FAILED"
   | "TEMPLATE_PREVIEW_SERVER_FAILED"
   | "TEMPLATE_VERSION_EXISTS"

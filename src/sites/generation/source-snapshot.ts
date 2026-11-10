@@ -23,7 +23,8 @@ export interface SiteSourceSnapshot {
   readonly manifest: SiteSourceManifest;
   readonly files: Readonly<Record<string, string>>;
 }
-const included = (path: string): boolean =>
+/** Paths a source snapshot captures (everything else in a workspace is derived). */
+export const isSnapshotSourcePath = (path: string): boolean =>
   path === "package.json" ||
   path === "package-lock.json" ||
   path === "index.html" ||
@@ -50,7 +51,7 @@ export class SiteSourceSnapshotService {
     const files: Record<string, string> = {};
     const manifestFiles: SiteSourceManifestFile[] = [];
     for (const entry of await execution.listFiles(environmentId)) {
-      if (entry.type !== "FILE" || !included(entry.path)) continue;
+      if (entry.type !== "FILE" || !isSnapshotSourcePath(entry.path)) continue;
       const content = await execution.readFileBytes(environmentId, entry.path);
       const binary = !Buffer.from(content.toString("utf8")).equals(content);
       files[entry.path] = content.toString(binary ? "base64" : "utf8");
@@ -94,6 +95,16 @@ export class SiteSourceSnapshotService {
     environmentId: string,
     artifactRef: string,
   ): Promise<SiteSourceSnapshot> {
+    const { snapshot, restored } = await this.#verified(artifactRef);
+    for (const [path, content] of restored)
+      await execution.writeFileBytes(environmentId, path, content);
+    return snapshot;
+  }
+  /** Full integrity check (shape, safe paths, per-file size and SHA-256) without writing anything. */
+  async verify(artifactRef: string): Promise<SiteSourceSnapshot> {
+    return (await this.#verified(artifactRef)).snapshot;
+  }
+  async #verified(artifactRef: string): Promise<{ readonly snapshot: SiteSourceSnapshot; readonly restored: ReadonlyMap<string, Buffer> }> {
     const artifact = await this.artifacts.get(artifactRef);
     if (!artifact)
       throw new ApplicationError(
@@ -143,9 +154,7 @@ export class SiteSourceSnapshotService {
         );
       restored.set(file.path, content);
     }
-    for (const [path, content] of restored)
-      await execution.writeFileBytes(environmentId, path, content);
-    return snapshot;
+    return { snapshot, restored };
   }
 }
 export interface SiteChangeSummary {

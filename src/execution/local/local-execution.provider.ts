@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { access } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -22,6 +23,7 @@ interface EnvironmentState {
   readonly workspace: string;
   readonly metrics: MutableMetrics;
   latestPreview?: PreviewResult;
+  previewProcess?: ChildProcess;
   lastBuildSuccess?: boolean;
   lastBuildResult?: CommandResult;
 }
@@ -149,40 +151,55 @@ export class LocalExecutionProvider implements ExecutionProvider {
   }
   async startPreview(id: string, request: PreviewRequest): Promise<PreviewResult> {
     const state = this.#state(id);
+    // A free port can be taken between allocation and bind. Vite runs with
+    // --strictPort so a conflict fails fast instead of silently moving to a port
+    // the returned URL does not name; one bounded retry uses a fresh port.
+    const first = await this.#startPreviewOnce(id, state, request);
+    const result = first === "PORT_CONFLICT" ? await this.#startPreviewOnce(id, state, request) : first;
+    if (result === "PORT_CONFLICT")
+      throw new ApplicationError("PREVIEW_FAILED", "Local preview could not bind a free port");
+    return result;
+  }
+  async #startPreviewOnce(id: string, state: EnvironmentState, request: PreviewRequest): Promise<PreviewResult | "PORT_CONFLICT"> {
     const port = await allocateLocalPort(this.config.previewHost);
     const command = request.command ?? {
       executable: "npm",
-      args: ["run", "dev", "--", "--host", this.config.previewHost, "--port", String(port)],
+      args: ["run", "dev", "--", "--host", this.config.previewHost, "--port", String(port), "--strictPort"],
     };
     this.#validateCommand(command, true);
     const started = Date.now();
     // Spawn Vite directly for the fixed local profile. On Windows an npm wrapper can
     // detach its child, leaving the workspace locked after the wrapper is killed.
-    const previewCommand =
-      command.executable === "npm" && command.args?.[0] === "run" && command.args[1] === "dev"
-        ? {
-            executable: process.execPath,
-            args: [
-              resolve(state.workspace, "node_modules/vite/bin/vite.js"),
-              "--host",
-              this.config.previewHost,
-              "--port",
-              String(port),
-            ],
-          }
-        : command;
+    const vite = command.executable === "npm" && command.args?.[0] === "run" && command.args[1] === "dev";
+    const previewCommand = vite
+      ? {
+          executable: process.execPath,
+          args: [
+            resolve(state.workspace, "node_modules/vite/bin/vite.js"),
+            "--host",
+            this.config.previewHost,
+            "--port",
+            String(port),
+            "--strictPort",
+          ],
+        }
+      : command;
     const child = this.#processes.start(id, state.workspace, previewCommand);
     const url = `http://${this.config.previewHost}:${port}`;
     const deadline = started + this.config.previewStartTimeoutMs;
     while (Date.now() < deadline) {
-      if (child.exitCode !== null)
-        throw new ApplicationError(
-          "PREVIEW_FAILED",
-          `Preview exited before readiness: ${(await this.readLogs(id)).slice(-5).join("\n")}`,
-        );
+      if (child.exitCode !== null) {
+        // 'exit' can precede the final stderr chunk; let stdio drain (bounded).
+        await Promise.race([new Promise((resolve) => child.once("close", resolve)), new Promise((resolve) => setTimeout(resolve, 500))]);
+        const logs = (await this.readLogs(id)).slice(-5).join("\n");
+        if (/already in use|EADDRINUSE/i.test(logs)) return "PORT_CONFLICT";
+        throw new ApplicationError("PREVIEW_FAILED", `Preview exited before readiness: ${logs}`);
+      }
       try {
-        const response = await fetch(url, { signal: AbortSignal.timeout(1000) });
-        if (response.ok) {
+        // Readiness must come from this workspace's Vite server, not another
+        // process that happens to answer on the same port.
+        const response = await fetch(vite ? `${url}/@vite/client` : url, { signal: AbortSignal.timeout(1000) });
+        if (response.ok && child.exitCode === null) {
           const ready = Date.now();
           state.metrics.previewStartupMs += ready - started;
           state.metrics.previewHttpReadyMs += ready - started;
@@ -194,6 +211,13 @@ export class LocalExecutionProvider implements ExecutionProvider {
             httpReadyMs: ready - started,
           };
           state.latestPreview = preview;
+          state.previewProcess = child;
+          // A terminated preview must not keep advertising its URL.
+          child.once("exit", () => {
+            if (state.previewProcess !== child) return;
+            delete state.previewProcess;
+            if (state.latestPreview === preview) delete state.latestPreview;
+          });
           return preview;
         }
       } catch {
@@ -206,6 +230,21 @@ export class LocalExecutionProvider implements ExecutionProvider {
       "PREVIEW_FAILED",
       `Local preview did not become ready within ${this.config.previewStartTimeoutMs}ms`,
     );
+  }
+  /** Environments this process currently owns (never cleanup candidates). */
+  activeEnvironmentIds(): ReadonlySet<string> {
+    return new Set(this.#environments.keys());
+  }
+  /** Labels a workspace as serving a saved version (used by startup reconciliation). */
+  async annotateEnvironment(id: string, annotation: { readonly purpose: "PREVIEW"; readonly siteId: string; readonly versionId: string }): Promise<void> {
+    this.#state(id);
+    await this.#workspace.annotate(id, annotation);
+  }
+  /** True only while this environment's ready preview process is still running. */
+  isPreviewRunning(id: string): boolean {
+    const state = this.#environments.get(id);
+    const child = state?.previewProcess;
+    return !!state?.latestPreview && !!child && child.exitCode === null && child.signalCode === null;
   }
   getUsageMetrics(id: string): ExecutionUsageMetrics {
     return { ...this.#state(id).metrics };

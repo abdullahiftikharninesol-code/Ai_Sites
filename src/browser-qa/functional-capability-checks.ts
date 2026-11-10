@@ -10,6 +10,7 @@ import { closeControlledPanel, closeVisibleDialog, probeSizeSelection } from "./
 import { probeAccordionBehavior } from "./accordion-behavior.js";
 import { probeTabs } from "./functional-surfaces.js";
 import { probeDialogBehavior } from "./dialog-behavior.js";
+import { probeCalculation, probeComparison, probeFiltering, probeMultiStep, probeSearchMatching, probeSorting, statedUnitPrice, verifyCartTotal } from "./behavior-probes.js";
 
 async function requireVisible(locator: Locator, message: string): Promise<Locator> {
   const target = locator.first();
@@ -40,11 +41,36 @@ async function expectChange(page: Page, before: string, message: string) {
   }
   throw new FunctionalValidationError(message);
 }
-async function demoForm(page: Page, capability: "newsletter" | "form", surface: Page | Locator = page) {
+const HONEST_CONFIRMATION = /demo|mock|not (?:sent|subscribed)|in this view|local(?:ly)? only/i;
+/** Fields the form itself marks required must block an empty submission (native or custom validation). */
+async function rejectsEmptyRequired(page: Page, form: Locator, capability: string): Promise<string | undefined> {
+  const empty = await form.evaluate(element => [...element.querySelectorAll("input,textarea,select")].filter(field =>
+    ((field as HTMLInputElement).required || field.getAttribute("aria-required") === "true") && field.getClientRects().length > 0 &&
+    !["checkbox", "radio", "hidden"].includes((field as HTMLInputElement).type) && !(field as HTMLInputElement).value).length);
+  if (!empty) return undefined;
+  const submit = form.locator('button[type="submit"],button:not([type]),input[type="submit"]').first();
+  if (!(await submit.count()) || !(await submit.isVisible())) return undefined;
+  const before = (await page.locator("body").innerText()).split("\n");
+  const blocked: string[] = [];
+  const guard = async (route: Route) => {
+    if (route.request().isNavigationRequest() || ["fetch", "xhr"].includes(route.request().resourceType())) { blocked.push("network"); await route.abort(); } else await route.fallback();
+  };
+  await page.route("**/*", guard);
+  try {
+    await submit.click({ timeout: 800 });
+    await page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done()))));
+    const added = (await page.locator("body").innerText()).split("\n").filter(line => !before.includes(line));
+    if (blocked.length || added.some(line => HONEST_CONFIRMATION.test(line) && !/required|invalid|please|enter|missing|error/i.test(line)))
+      throw new FunctionalValidationError(`${capability} accepts a submission with ${empty} empty required field(s)`);
+  } finally { await page.unroute("**/*", guard); }
+  return `empty submission with ${empty} required field(s) rejected`;
+}
+async function demoForm(page: Page, capability: "newsletter" | "form", surface: Page | Locator = page): Promise<string> {
   const managed = surface.locator(`form[data-sites-capability="${capability}"]`);
   const form = await requireVisible((await managed.count()) ? managed : surface.locator("form").filter({ has: page.locator('input[type="email"]') }), `Missing ${capability} form`);
   const email = form.locator('input[type="email"]').first();
   if (!(await email.count())) throw new FunctionalValidationError(`${capability} form has no email validation`);
+  const required = await rejectsEmptyRequired(page, form, capability);
   await email.fill("not-an-email");
   if (await form.evaluate(element => (element as HTMLFormElement).checkValidity())) throw new FunctionalValidationError(`${capability} accepts invalid email`);
   for (const input of await form.locator("input:not([type=hidden]),textarea").all()) {
@@ -89,16 +115,17 @@ async function demoForm(page: Page, capability: "newsletter" | "form", surface: 
     const after = await page.locator("body").innerText();
     const feedback = await page.getByRole("status").allTextContents();
     feedback.push(...after.split("\n").filter(line => !before.split("\n").includes(line)));
-    if (blocked.length || after === before || !feedback.some(text => /demo|mock|not (?:sent|subscribed)|in this view|local(?:ly)? only/i.test(text)))
+    if (blocked.length || after === before || !feedback.some(text => HONEST_CONFIRMATION.test(text)))
       throw new FunctionalValidationError(`${capability} needs observable, honest mock confirmation without a network submission`);
   } finally { await page.unroute("**/*", guard); }
+  return `${capability}: ${required ? required + "; " : ""}invalid email rejected; valid local submission showed honest demo confirmation without network`;
 }
 
 /** Bounded observable probes. No extra AI role, no remote writes, no severity downgrade. */
 export function functionalBrowserChecks(requirements: FunctionalRequirements, routes: readonly string[], backendEnabled = false, contract?: ResolvedFunctionalContract): BrowserQACheckExecutor[] {
   const capabilities = new Set(requirements.capabilities);
   const productRoute = routes.find(route => /\/product(?:s)?(?:\/|$)/.test(route)) ?? "/";
-  type ScopedCheck = Omit<BrowserQACheckExecutor, "execute"> & { execute(context: BrowserQAPageContext, selected?: ReadonlySet<FunctionalCapability>, forceRoute?: boolean, section?: FunctionalRequirement["target"]): Promise<BrowserQACheckResult> };
+  type ScopedCheck = Omit<BrowserQACheckExecutor, "execute"> & { execute(context: BrowserQAPageContext, selected?: ReadonlySet<FunctionalCapability>, forceRoute?: boolean, section?: FunctionalRequirement["target"], requirement?: FunctionalRequirement): Promise<BrowserQACheckResult> };
   const checks: ScopedCheck[] = [{
     definition: { checkId: "functional.controls", version: 1, category: "INTERACTION", defaultSeverity: "ERROR", scope: "INTERACTION", timeoutMs: 8_000 },
     async execute(context) {
@@ -164,8 +191,10 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
     },
   }, {
     definition: { checkId: "functional.requirements", version: 1, category: "INTERACTION", defaultSeverity: "ERROR", scope: "INTERACTION", timeoutMs: 12_000 },
-    async execute(context, selected = capabilities, forceRoute = false, section) {
+    async execute(context, selected = capabilities, forceRoute = false, section, requirement) {
       const page = context.page, capabilities = selected;
+      // What each probe actually checked, recorded as requirement evidence.
+      const checked: string[] = [];
       const scoped = section?.kind === "SECTION";
       const surface = scoped ? await functionalSectionSurface(page, section) : page;
       if (forceRoute || context.route === productRoute) {
@@ -197,7 +226,10 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
           const quantityText = await increment.count() ? await increment.locator("..").innerText() : "1";
           const requestedQuantity = await quantityInput.count() ? Number(await quantityInput.inputValue()) : Number(quantityText.match(/\d+/)?.[0] ?? 1);
           const previousCount = Number(before.match(/\d+/g)?.at(-1) ?? 0);
-          await (await requireVisible(surface.getByRole("button", { name: /add to (?:cart|bag)/i }), "Requested Add to Cart is absent")).click({ timeout: 800 });
+          const add = await requireVisible(surface.getByRole("button", { name: /add to (?:cart|bag)/i }), "Requested Add to Cart is absent");
+          // Known input data only: the single price stated next to this Add to Cart control.
+          const unitPrice = await statedUnitPrice(add);
+          await add.click({ timeout: 800 });
           const after = await cartCount();
           if (after === before || Number(after.match(/\d+/g)?.at(-1)) !== previousCount + requestedQuantity)
             throw new FunctionalValidationError("Add to Cart does not update the actual cart count by the selected quantity");
@@ -216,6 +248,17 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
           const productWords = productHeading.toLowerCase().split(/\s+/).filter(word => word.length > 3);
           if (!quantities.some(value => value >= requestedQuantity) || /your cart is empty/i.test(content) ||
             !productWords.some(word => content.toLowerCase().includes(word))) throw new FunctionalValidationError("Cart does not show the added product and quantity");
+          checked.push(`cart count ${previousCount}→${previousCount + requestedQuantity}`);
+          // Subtotal is asserted only for an initially empty cart with a stated unit price.
+          if (previousCount === 0 && unitPrice !== undefined) checked.push(await verifyCartTotal(panel, unitPrice, requestedQuantity));
+          const remove = panel.getByRole("button", { name: /^(?:remove|delete)\b/i }).filter({ visible: true });
+          if (previousCount === 0 && await remove.count() === 1) {
+            await remove.first().click({ timeout: 800 });
+            await page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done()))));
+            const remaining = Number((await cartCount()).match(/\d+/g)?.at(-1) ?? 0);
+            if (remaining !== 0) throw new FunctionalValidationError(`Removing the only cart item leaves the cart count at ${remaining} instead of 0`);
+            checked.push("removing the item emptied the cart");
+          }
           await (await requireVisible(panel.getByRole("button", { name: /close (?:cart|bag|shopping)/i }).last(), "Cart has no Close control")).click({ timeout: 800 });
           if (await panel.isVisible()) throw new FunctionalValidationError("Cart Close control does not close its panel");
         }
@@ -229,6 +272,7 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
           const search = await requireVisible(searches, "Requested search is absent");
           const before = await page.locator("body").innerText(); await search.fill("__no_matching_demo_product__");
           if (await page.locator("body").innerText() === before) throw new FunctionalValidationError("Search does not update visible results");
+          checked.push(await probeSearchMatching(page, surface, search));
         }
         if (capabilities.has("mobile-nav") && (context.viewport.id === "MOBILE" || await page.getByRole("button", { name: /^(?:menu|(?:open |close )?(?:menu|navigation))$/i }).first().isVisible().catch(() => false))) await probeMobileNavigation(page);
         if (capabilities.has("tabs")) await probeTabs(page, surface);
@@ -237,11 +281,18 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
         }
         if (capabilities.has("dialog")) await probeDialogBehavior(page, surface);
         if (!requirements.backendRequired && !backendEnabled) {
-          if (capabilities.has("newsletter")) await demoForm(page, "newsletter", surface);
-          if (capabilities.has("form")) await demoForm(page, "form", surface);
+          if (capabilities.has("newsletter")) checked.push(await demoForm(page, "newsletter", surface));
+          if (capabilities.has("form")) checked.push(await demoForm(page, "form", surface));
         }
+        // Phase 5 behavior families: objective expectations only (see behavior-probes.ts).
+        if (capabilities.has("sort")) checked.push(await probeSorting(page, surface));
+        if (capabilities.has("filter")) checked.push(await probeFiltering(page, surface));
+        if (capabilities.has("calculator")) checked.push(await probeCalculation(page, surface, requirement?.formula));
+        if (capabilities.has("multi-step")) checked.push(await probeMultiStep(page, surface));
+        if (capabilities.has("comparison")) checked.push(await probeComparison(page, surface));
       }
-      return createBrowserQACheckResult({ checkId: "functional.requirements", category: "INTERACTION", status: "PASS", severity: "ERROR", route: context.route, viewport: context.viewport, message: "Requested scoped functional behavior passed observable probes" });
+      return createBrowserQACheckResult({ checkId: "functional.requirements", category: "INTERACTION", status: "PASS", severity: "ERROR", route: context.route, viewport: context.viewport,
+        message: checked.length ? checked.join("; ").slice(0, 600) : "Requested scoped functional behavior passed observable probes" });
     },
   }];
   if (contract) {
@@ -249,9 +300,8 @@ export function functionalBrowserChecks(requirements: FunctionalRequirements, ro
     checks[1] = { ...probe, appliesTo: (route, viewport) => contract.requirements.some(requirement =>
       (requirement.capability !== "mobile-nav" || viewport.id === "MOBILE") &&
       (requirement.target.kind === "SITE" ? requirement.routes?.includes(route) : requirement.routes?.[0] === route)),
-      execute: context => runRouteRequirements(context, contract, async requirement => {
-      await probe.execute(context, new Set([requirement.capability]), true, requirement.target);
-    }) };
+      execute: context => runRouteRequirements(context, contract, async requirement =>
+        (await probe.execute(context, new Set([requirement.capability]), true, requirement.target, requirement)).message) };
     checks.push({ definition: { checkId: "functional.navigation", version: 1, category: "INTERACTION", defaultSeverity: "ERROR", scope: "PAGE", timeoutMs: 12_000 },
       appliesTo: route => route === "/" && contract.pages.length > 0,
       execute: context => context.route === "/" ? probeRequiredNavigation(context, contract) : Promise.resolve(createBrowserQACheckResult({ checkId: "functional.navigation", category: "ROUTING", status: "SKIPPED", severity: "ERROR", route: context.route, viewport: context.viewport, message: "Requested navigation is exercised from the site entry route" })),

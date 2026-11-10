@@ -1,6 +1,7 @@
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { FileEntry } from "../execution-types.js";
+import { writeWorkspaceMarker } from "./workspace-ownership.js";
 export class LocalWorkspaceManager {
   constructor(readonly rootDirectory: string) {}
   environmentDirectory(id: string): string {
@@ -12,7 +13,13 @@ export class LocalWorkspaceManager {
   async create(id: string): Promise<string> {
     const project = this.projectDirectory(id);
     await mkdir(project, { recursive: true });
+    // Ownership lets startup reconciliation tell a live server's workspace from a crash leftover.
+    await writeWorkspaceMarker(this.environmentDirectory(id), id);
     return project;
+  }
+  /** Records what a workspace serves (outside the project directory). */
+  annotate(id: string, annotation: { readonly purpose: "PREVIEW"; readonly siteId: string; readonly versionId: string }): Promise<void> {
+    return writeWorkspaceMarker(this.environmentDirectory(id), id, annotation);
   }
   async destroy(id: string): Promise<void> {
     await rm(this.environmentDirectory(id), {

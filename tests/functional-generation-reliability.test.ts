@@ -218,12 +218,16 @@ describe("Real offline source → recovery → static validation → build → t
       :file.content.replace('onClick={()=>{}}',kind==="runtime-handler-error"?'onClick={()=>{throw new Error("broken control")}}':'onClick={()=>{const unused=42;void unused;}}')})};
     const h=await harness(candidate,true),siteId=("adversarial-"+kind) as SiteId;
     const request={userId:"offline-functional-owner" as UserId,prompt:ecommercePrompt,planningMode:"deterministic" as const,agentProvider:h.provider.id,browserQAEnabled:true,retainPreview:false,templateReference:{templateKey:"ecommerce-store",version:1},referenceGenerationSiteId:siteId};
-    if(kind==='fake-newsletter'||kind==='no-effect-handler'){
+    // Phase 2: the recognized, requested Cart trigger is now a blocking browser assertion,
+    // so a Cart button with a no-effect handler is a confirmed functional defect.
+    if(kind==='fake-newsletter'){
       const result=await h.api.pipeline.generate(request);expect(result.browserQA?.status).not.toBe('FAIL');expect(h.provider.callCount).toBe(1);expect(h.billing.finalizeSuccessfulJob).toHaveBeenCalledOnce();
     }else{
-      await expect(h.api.pipeline.generate(request)).rejects.toMatchObject({code:kind==='missing-state'?'REPAIR_LIMIT_REACHED':'VALIDATION_FAILED'});expect(h.provider.callCount).toBe(kind==='missing-state'?2:1);expect(h.billing.finalizeSuccessfulJob).not.toHaveBeenCalled();
-      expect((await h.api.versions.listBySite(siteId)).items).toHaveLength(0);const names=await readdir(h.diagnostics.root);expect(names).toHaveLength(1);const retained=await readFile(join(h.diagnostics.root,names[0]!),"utf8");
-      expect(retained).toContain(kind==='missing-state'?'TS2304':'runtime.page-error');
+      await expect(h.api.pipeline.generate(request)).rejects.toMatchObject({code:kind==='missing-state'?'REPAIR_LIMIT_REACHED':'VALIDATION_FAILED'});expect(h.provider.callCount).toBe(kind==='runtime-handler-error'?1:2);expect(h.billing.finalizeSuccessfulJob).not.toHaveBeenCalled();
+      expect((await h.api.versions.listBySite(siteId)).items).toHaveLength(0);const names=await readdir(h.diagnostics.root);
+      // One retained candidate per attempt; the no-effect case spends the existing single functional-repair allowance.
+      expect(names).toHaveLength(kind==='no-effect-handler'?2:1);const retained=(await Promise.all(names.map(name=>readFile(join(h.diagnostics.root,name),"utf8")))).join("\n");
+      expect(retained).toContain(kind==='missing-state'?'TS2304':kind==='no-effect-handler'?'Cart does not open a meaningful cart view':'runtime.page-error');
     }
   },300_000);
   it.each([
@@ -238,7 +242,11 @@ describe("Real offline source → recovery → static validation → build → t
     try {
       expect(result.build.success).toBe(true); expect(result.browserQA?.status).not.toBe("FAIL");
       expect(result.browserQA?.checks.filter(check=>check.status==="FAIL"&&check.severity==="ERROR")).toEqual([]);
-      expect(result.browserQA?.checks.filter(check=>check.checkId==="runtime.page-error").map(check=>check.status)).toEqual(Array<string>(result.siteSpec.requirements.pages.length*3).fill("PASS"));
+      // Adaptive generation QA visits every route at desktop and mobile.
+      expect(result.browserQA?.checks.filter(check=>check.checkId==="runtime.page-error").map(check=>check.status)).toEqual(Array<string>(result.siteSpec.requirements.pages.length*2).fill("PASS"));
+      // Source-recognized requested behavior is asserted in the browser, not just smoke-tested.
+      expect(result.qaVerification?.outcome).toBe("VERIFIED");
+      expect(result.qaVerification?.requirements.filter(item=>item.policy==="REQUIRED").every(item=>item.status==="VERIFIED")).toBe(true);
       expect(h.provider.callCount).toBe(1); expect(result.inference?.physicalRequests).toBe(1);
       expect(result.inference?.stages.BUILD_REPAIR.logicalRequests).toBe(0); expect(result.inference?.stages.TARGETED_EDIT.logicalRequests).toBe(0);
       expect(h.requests[0]?.messages[0]?.content).toContain("Functional capability contract v1");
