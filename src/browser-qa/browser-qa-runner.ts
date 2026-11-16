@@ -291,8 +291,22 @@ export class BrowserQARunner {
     let page: Page | undefined;
     const pageChecks: BrowserQACheckResult[] = [];
     let expired = false;
+    // Settles when the route deadline fires. Playwright can leave a call that
+    // was in flight when its context closed (notably context.newPage) pending
+    // forever, so browser calls without their own timeout race against it.
+    let reachDeadline!: (error: Error) => void;
+    const deadlineReached = new Promise<never>((_, reject) => { reachDeadline = reject; });
+    deadlineReached.catch(() => undefined);
+    const untilDeadline = <T>(operation: Promise<T>): Promise<T> => {
+      operation.catch(() => undefined);
+      return Promise.race([operation, deadlineReached]);
+    };
     // Cancel outstanding browser actions, not just the Promise awaiting them.
-    const deadline = setTimeout(() => { expired = true; void context.close().catch(() => undefined); }, Math.max(1, input.budgetMs - (Date.now() - pageStarted)));
+    const deadline = setTimeout(() => {
+      expired = true;
+      reachDeadline(new BrowserQATimeoutError("Browser QA route deadline reached"));
+      void context.close().catch(() => undefined);
+    }, Math.max(1, input.budgetMs - (Date.now() - pageStarted)));
     const deadlineResult = () => ({ checks: [...pageChecks, createBrowserQACheckResult({
       checkId: input.runBudget ? "qa.run-budget" : "qa.page-budget", category: "RUNTIME", status: "FAIL", severity: "ERROR",
       failureKind: input.runBudget ? "RUN_DEADLINE_EXCEEDED" : "ROUTE_DEADLINE_EXCEEDED", route: input.route, viewport: input.viewport,
@@ -309,7 +323,7 @@ export class BrowserQARunner {
         events.blockedRequests.push(networkEvidence(request, undefined, "Blocked by Browser QA origin policy"));
         await route.abort("blockedbyclient");
       });
-      page = await context.newPage();
+      page = await untilDeadline(context.newPage());
       this.#metrics.pagesOpened++;
       context.on("page", (popup) => {
         if (popup === page || openingProbe) return;
@@ -337,7 +351,7 @@ export class BrowserQARunner {
       });
       };
       observe(page);
-      await page.emulateMedia({ reducedMotion: input.policy.reducedMotion ? "reduce" : "no-preference" });
+      await untilDeadline(page.emulateMedia({ reducedMotion: input.policy.reducedMotion ? "reduce" : "no-preference" }));
       const destination = new URL(input.route, input.baseUrl);
       if (destination.origin !== input.baseUrl.origin) throw new BrowserQAPolicyError("Browser QA routes must remain on the preview origin");
       try {
@@ -414,12 +428,12 @@ export class BrowserQARunner {
           // abort a timed-out check without its pending clicks affecting the next.
           if (check.definition.category === "INTERACTION" || check.definition.category === "FORM") {
             openingProbe = true;
-            try { probe = await context.newPage(); this.#metrics.pagesOpened++; } finally { openingProbe = false; }
+            try { probe = await untilDeadline(context.newPage()); this.#metrics.pagesOpened++; } finally { openingProbe = false; }
             observe(probe);
-            await probe.emulateMedia({ reducedMotion: input.policy.reducedMotion ? "reduce" : "no-preference" });
+            await untilDeadline(probe.emulateMedia({ reducedMotion: input.policy.reducedMotion ? "reduce" : "no-preference" }));
             const response = await probe.goto(destination.toString(), { waitUntil: "load", timeout: input.policy.navigationTimeoutMs });
             if (!response?.ok()) throw new Error(`Interaction route failed to load (${response?.status() ?? "no response"})`);
-            await probe.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done()))));
+            await untilDeadline(probe.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done())))));
           }
           const remainingMs = input.budgetMs - (Date.now() - pageStarted) - Math.min(250, input.budgetMs / 10);
           if (remainingMs <= 0) { expired = true; return deadlineResult(); }

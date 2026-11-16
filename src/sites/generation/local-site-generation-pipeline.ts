@@ -652,6 +652,8 @@ export class LocalSiteGenerationPipeline {
     }
     const environment = await this.deps.execution.createEnvironment({});
     let retainEnvironment = false;
+    // Like generation: a failure after the provider ran reports that session's model and usage.
+    let editSession: CliAgentSessionReport | undefined;
     try {
       const before = await this.#snapshots.restore(
         this.deps.execution,
@@ -689,6 +691,7 @@ export class LocalSiteGenerationPipeline {
           await this.#authorizeBilling(request.userId, request.agentProvider);
         },
       );
+      editSession = session;
       await validateRequiredUserAssetReferences(this.deps.execution, environment.id, request.assetManifest);
       const editedSource = await readEditRequirementFiles(this.deps.execution, environment.id);
       const parentSource = new Map(Object.entries(before.files).filter(([path]) => isEditableRequirementPath(path)));
@@ -849,7 +852,9 @@ export class LocalSiteGenerationPipeline {
       };
     } catch (cause) {
       request.onIntelligence?.([
-        this.#failureTelemetry("TARGETED_EDIT", request.agentProvider, cause),
+        editSession
+          ? this.#failedSessionTelemetry("TARGETED_EDIT", editSession, cause)
+          : this.#failureTelemetry("TARGETED_EDIT", request.agentProvider, cause),
       ]);
       throw cause;
     } finally {

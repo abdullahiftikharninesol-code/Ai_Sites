@@ -37,6 +37,12 @@ export interface CommandRequest {
   readonly cwd?: string;
   readonly timeoutMs?: number;
   readonly environment?: Readonly<Record<string, string>>;
+  /**
+   * Run with only an allow-listed OS/npm environment instead of the server's
+   * (minus known secret suffixes). Used where untrusted generated code runs
+   * outside generation, e.g. publishing builds.
+   */
+  readonly isolatedEnvironment?: boolean;
 }
 export interface CommandResult {
   readonly exitCode: number | null;

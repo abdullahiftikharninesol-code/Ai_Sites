@@ -393,6 +393,16 @@ export class PlaygroundService {
       }),
     );
   }
+  /** Same ownership rule as every site route; another owner's site is "not owned". */
+  async ownsSite(ownerId: string, siteId: string): Promise<boolean> {
+    try {
+      await this.#project(ownerId, siteId);
+      return true;
+    } catch (error) {
+      if ((error as { code?: unknown }).code === "SITE_NOT_FOUND") return false;
+      throw error;
+    }
+  }
   async siteDetail(ownerId: string, siteId: string) {
     const project = await this.#project(ownerId, siteId);
     const current = project.latestVersionId

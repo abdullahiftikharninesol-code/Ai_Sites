@@ -196,8 +196,11 @@ describe("Sites generation reliability recovery", () => {
   it("gives every site a theme toggle and splash primitives", () => {
     expect(DEFAULT_MAIN_TSX).toContain("<ThemeToggle />");
     expect(DEFAULT_MAIN_TSX).toContain('aria-label={theme === "dark"');
+    // The toggle is styled through its managed attribute, not a class generated
+    // code could also use (renamed from `.theme-toggle` in the scaffold).
+    expect(DEFAULT_MAIN_TSX).toContain('data-sites-managed="theme-toggle"');
     const sheet = styleSheetForSeed("any");
-    for (const utility of [".splash-stage", ".splash", ".splash--ring", ".theme-toggle"])
+    for (const utility of [".splash-stage", ".splash", ".splash--ring", '[data-sites-managed="theme-toggle"]'])
       expect(sheet).toContain(utility);
     // Splash colour is a token so a near-black accent cannot smear the light theme.
     expect(sheet).toContain("var(--splash-color)");

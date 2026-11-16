@@ -472,9 +472,17 @@ describe("cancelled history routes and current-only project access", () => {
     expect((await h.request(`${prefix}/${project.id}/versions/old/restore`, {
       method: "POST", as: h.userA,
     })).status).toBe(404);
-    expect((await h.request(`${prefix}/${project.id}/rollback`, {
+    const rollbackToPrevious = vi.spyOn(h.service.product.pipeline, "rollbackToPreviousVersion");
+    const legacyRollback = await h.request(`${prefix}/${project.id}/rollback`, {
       method: "POST", as: h.userA, body: { deploymentId: "old" },
-    })).status).toBe(404);
+    });
+    // /api/dev/sites/:id/rollback is the one-step current-version recovery
+    // (expectedVersionId only). A deployment-history rollback is never honored.
+    if (prefix === "/api/dev/sites") {
+      expect(legacyRollback.status).toBe(400);
+      expect(legacyRollback.body).toMatchObject({ error: { code: "INVALID_REQUEST" } });
+    } else expect(legacyRollback.status).toBe(404);
+    expect(rollbackToPrevious).not.toHaveBeenCalled();
     expect(h.editWebsite).not.toHaveBeenCalled();
     expect(h.generateWebsite).not.toHaveBeenCalled();
   });
@@ -915,6 +923,8 @@ describe("SiteProject ownership", () => {
     };
     vi.spyOn(h.service.previews, "list").mockReturnValue([session]);
     vi.spyOn(h.service.previews, "get").mockReturnValue(session);
+    // The service now returns only a live session (resolve() checks the preview process).
+    vi.spyOn(h.service.previews, "resolve").mockImplementation(async (id) => (id === session.id ? session : undefined));
     const stop = vi.spyOn(h.service.previews, "stop").mockResolvedValue(true);
     const execution = h.service.product.execution;
     vi.spyOn(execution, "readLogs").mockResolvedValue([]);
@@ -922,9 +932,12 @@ describe("SiteProject ownership", () => {
     vi.spyOn(execution, "ownedProcessCount").mockReturnValue(1);
 
     const foreignGet = await h.request("/api/dev/previews/preview-a", { as: h.userB });
-    expect(foreignGet.body).toEqual({
-      error: { code: "INVALID_REQUEST", message: "Preview instance was not found" },
-    });
+    const missingGet = await h.request("/api/dev/previews/no-such-preview", { as: h.userB });
+    // Another owner's preview is indistinguishable from a missing (ended) one;
+    // since the preview-reliability contract that response is PREVIEW_EXPIRED.
+    expect(foreignGet.status).toBe(missingGet.status);
+    expect(foreignGet.body).toEqual(missingGet.body);
+    expect(foreignGet.body).toMatchObject({ error: { code: "PREVIEW_EXPIRED" } });
     expect(foreignGet.text).not.toContain("env-a");
     const foreignStop = await h.request("/api/dev/previews/preview-a", {
       method: "DELETE",

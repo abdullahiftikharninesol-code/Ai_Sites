@@ -22,6 +22,29 @@ import {
   parseTemplateVersion,
   validateTemplateKey,
 } from "../templates/http/template-catalog-query.js";
+import {
+  createVercelConnectionService,
+  type VercelConnectionService,
+} from "../integrations/vercel/vercel-connection-service.js";
+import {
+  handleVercelAccountRoute,
+  handleVercelCallback,
+  isVercelCallback,
+  VERCEL_ROUTE_PREFIX,
+} from "../integrations/vercel/vercel-integration-routes.js";
+import { loadVercelIntegrationConfig } from "../integrations/vercel/vercel-integration-config.js";
+import type { PublishPreparationService } from "../publishing/publish-preparation-service.js";
+import {
+  createPublishPreparationService,
+  createVercelPublishService,
+} from "../publishing/create-publish-preparation-service.js";
+import { isLivePublishingEnabled, isPublishReconcileEnabled, type VercelPublishService } from "../publishing/vercel-publish-service.js";
+import { PublishReconcileScheduler, loadReconcileSchedule } from "../publishing/publish-reconcile-scheduler.js";
+import { MongoVercelPublishRepository } from "../publishing/vercel-publish-repository.js";
+import {
+  handlePublishPreparationRoute,
+  isPublishPreparationRoute,
+} from "../publishing/publish-preparation-routes.js";
 
 export function normalizePlaygroundPrompt(value: unknown): string {
   if (typeof value !== "string" || value.trim().length < 3 || value.length > 20_000)
@@ -115,10 +138,17 @@ export class PlaygroundHttpServer {
   #socketServer: SocketIoServer | undefined;
   readonly #authUser: AuthUserMiddleware;
   readonly #readsJwtKeyFromEnv: boolean;
+  #vercel: VercelConnectionService | undefined;
+  #publishing: PublishPreparationService | undefined;
+  #vercelPublishing: VercelPublishService | undefined;
+  #reconciler: PublishReconcileScheduler | undefined;
   constructor(
     config = loadPlaygroundConfig(),
     service?: PlaygroundService,
     authUser?: AuthUserMiddleware,
+    vercel?: VercelConnectionService,
+    publishing?: PublishPreparationService,
+    vercelPublishing?: VercelPublishService,
   ) {
     if (!["127.0.0.1", "localhost", "::1"].includes(config.host))
       throw new Error("The unauthenticated playground must bind to a loopback address");
@@ -126,10 +156,45 @@ export class PlaygroundHttpServer {
     this.service = service ?? new PlaygroundService(config);
     this.#authUser = authUser ?? createAuthUser({ identities: this.service.identities });
     this.#readsJwtKeyFromEnv = !authUser;
+    this.#vercel = vercel;
+    this.#publishing = publishing;
+    this.#vercelPublishing = vercelPublishing;
+  }
+  /** Live publishing (Stage 3); refuses to deploy unless the live flags are enabled. */
+  get vercelPublishing(): VercelPublishService {
+    return (this.#vercelPublishing ??= createVercelPublishService({
+      connection: this.service.product.database.connection,
+      projects: this.service.product.projects,
+      preparations: this.publishing,
+      vercel: this.vercel,
+    }));
+  }
+  /** Publishing preparation (Stage 2): production builds only; never deploys. */
+  get publishing(): PublishPreparationService {
+    return (this.#publishing ??= createPublishPreparationService({
+      connection: this.service.product.database.connection,
+      projects: this.service.product.projects,
+      versions: this.service.product.versions,
+      artifacts: this.service.product.artifacts,
+      execution: this.service.product.execution,
+      vercel: this.vercel,
+    }));
+  }
+  /** Created on first use so servers that never reach Vercel routes need no database. */
+  get vercel(): VercelConnectionService {
+    return (this.#vercel ??= createVercelConnectionService(
+      this.service.product.database.connection,
+      (ownerId, siteId) => this.service.ownsSite(ownerId, siteId),
+      // Disconnect asks before stopping running publishes (Stage 5C).
+      (ownerId) => new MongoVercelPublishRepository(this.service.product.database.connection).countActiveForOwner(ownerId),
+    ));
   }
   async start() {
     if (this.#readsJwtKeyFromEnv && !process.env.JWTKEY)
       console.warn("[sites][auth] JWTKEY is not configured; authenticated routes will fail closed");
+    const vercelConfig = this.#vercel?.configuration() ?? loadVercelIntegrationConfig();
+    if (!vercelConfig.configured)
+      console.warn(`[sites][vercel] integration disabled: ${vercelConfig.problems.join("; ")}`);
     await this.service.start();
     this.#server = createServer((req, res) => void this.#handle(req, res));
     // The Socket.IO playground keeps its development identity until the
@@ -161,7 +226,20 @@ export class PlaygroundHttpServer {
       throw error;
     }
     const address = this.#server.address() as { port: number };
+    this.#startReconciler();
     return `http://${this.config.host}:${address.port}`;
+  }
+  /** The internal reconciliation schedule (undefined unless enabled); never reachable over HTTP. */
+  get publishReconciler(): PublishReconcileScheduler | undefined {
+    return this.#reconciler;
+  }
+  #startReconciler() {
+    // Never constructs the publisher (or its database connections) for this unless reconciliation is enabled.
+    const enabled = this.#vercelPublishing ? this.#vercelPublishing.reconcileEnabled : isPublishReconcileEnabled() && isLivePublishingEnabled();
+    if (!enabled || this.#reconciler) return;
+    const publisher = this.vercelPublishing;
+    this.#reconciler = new PublishReconcileScheduler({ enabled: publisher.reconcileEnabled, pass: (options) => publisher.reconcilePass(options), ...loadReconcileSchedule() });
+    this.#reconciler.start();
   }
   async close() {
     const server = this.#server;
@@ -177,6 +255,12 @@ export class PlaygroundHttpServer {
         server.close((error) => (error ? reject(error) : resolve()));
         server.closeAllConnections();
       });
+    // No new reconciliation pass starts; one in flight stops at its next item once the publisher closes.
+    const reconciling = this.#reconciler?.stop();
+    // Publishes wait on preparations; running builds own execution workspaces. Drain both first.
+    await this.#vercelPublishing?.close();
+    await reconciling;
+    await this.#publishing?.close();
     await this.service.close();
   }
   async #handle(req: AuthenticatedRequest, res: ServerResponse) {
@@ -212,11 +296,24 @@ export class PlaygroundHttpServer {
           executionProvider: "local",
           database: this.service.databaseStatus(),
         });
+      // Vercel's Redirect URL is a browser redirect without a bearer token; it
+      // is bound to the user by the single-use state issued by /connect.
+      if (isVercelCallback(method, path)) return await handleVercelCallback(url, res, this.vercel);
       // Every route below is user-scoped. Ownership is derived only from the
       // authenticated req.user; ownerId/userId/user/createdBy and similar
       // fields in the body, query or headers are never read.
       const ownerId = await this.#authenticate(req, res);
       if (!ownerId) return;
+      if (
+        path.startsWith(VERCEL_ROUTE_PREFIX) &&
+        (await handleVercelAccountRoute(req, res, path, ownerId, this.vercel))
+      )
+        return;
+      if (
+        isPublishPreparationRoute(path) &&
+        (await handlePublishPreparationRoute(method, path, res, ownerId, this.publishing, () => this.vercelPublishing))
+      )
+        return;
       if (method === "GET" && path === "/api/site-templates")
         return this.#json(
           res,

@@ -288,6 +288,8 @@ export class LocalExecutionProvider implements ExecutionProvider {
       "npm --version",
       "npm ci",
       "npm ci --prefer-offline --no-audit --no-fund",
+      // Publishing builds: locked install without dependency lifecycle scripts.
+      "npm ci --prefer-offline --no-audit --no-fund --ignore-scripts",
       "npm install",
       // Installing an approved optional package after generation, with the same
       // flags as the starter install.
