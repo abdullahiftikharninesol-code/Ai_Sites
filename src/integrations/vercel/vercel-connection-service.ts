@@ -12,6 +12,7 @@ import {
 } from "./vercel-connection-repository.js";
 import { createVercelOAuthClient, type VercelOAuthClient } from "./vercel-oauth-client.js";
 import { decryptVercelToken, encryptVercelToken } from "./vercel-token-cipher.js";
+import { countVercelPublishingActivity } from "./vercel-publishing-activity.js";
 import {
   createVercelAccountVerifier,
   type VercelAccountVerification,
@@ -53,6 +54,7 @@ const ERROR_MESSAGES = {
   VERCEL_NOT_CONNECTED: "Connect a Vercel account before publishing",
   VERCEL_TOKEN_UNAVAILABLE: "The stored Vercel authorization can no longer be used. Reconnect Vercel.",
   VERCEL_DISCONNECT_BLOCKED: "A website is being published with this Vercel connection. Wait for it to finish, or confirm disconnecting anyway.",
+  VERCEL_DISCONNECT_UNAVAILABLE: "Publishing activity could not be verified. Try disconnecting Vercel again later.",
 } as const;
 
 /** Server-side credentials for one owner's active connection. Never serialized to clients or logs. */
@@ -201,12 +203,20 @@ export class VercelConnectionService {
     const now = this.#now().getTime();
     const cached = connection.verification;
     const stale = !cached || now - cached.checkedAt.getTime() >= VERCEL_VERIFICATION_TTL_MS;
-    const refreshAllowed = options.refresh === true && now - (this.#lastRefresh.get(ownerId) ?? 0) >= VERCEL_REFRESH_MIN_INTERVAL_MS;
+    const identity = this.#connectionIdentity(connection);
+    const refreshAllowed = options.refresh === true && now - (this.#lastRefresh.get(identity) ?? 0) >= VERCEL_REFRESH_MIN_INTERVAL_MS;
     let verification: VercelAccountVerification | undefined = cached;
     if (configured && this.#verifier && (stale || refreshAllowed)) {
-      if (refreshAllowed) this.#lastRefresh.set(ownerId, now);
+      if (refreshAllowed) this.#lastRefresh.set(identity, now);
       verification = (await this.#verify(connection)) ?? cached;
     }
+    // Never serialize an older account's verification as the new connection's state.
+    const current = await this.#repository.findActiveConnection(ownerId);
+    if (!current) return { configured, connected: false, state: "DISCONNECTED" };
+    if (this.#connectionIdentity(current) !== identity) return {
+      configured, connected: true, state: "VERIFICATION_UNAVAILABLE",
+      connection: { connectedAt: current.connectedAt.toISOString(), accountType: current.teamId ? "team" : "personal" },
+    };
     const accountType = connection.teamId ? "team" : "personal";
     const state: VercelConnectionStatus["state"] = !configured || !verification || verification.state === "UNAVAILABLE"
       ? "VERIFICATION_UNAVAILABLE"
@@ -226,9 +236,13 @@ export class VercelConnectionService {
     };
   }
 
-  /** One in-flight verification per owner; the result is stored only for the same active connection. */
+  #connectionIdentity(connection: { ownerId: string; configurationId: string; encryptedAccessToken: string }) {
+    return createHash("sha256").update(JSON.stringify([connection.ownerId, connection.configurationId, connection.encryptedAccessToken])).digest("hex");
+  }
+  /** One in-flight verification per exact encrypted connection, including same-installation renewals. */
   #verify(connection: { ownerId: string; configurationId: string; teamId: string | null; vercelUserId: string; encryptedAccessToken: string }) {
-    const running = this.#verifying.get(connection.ownerId);
+    const identity = this.#connectionIdentity(connection);
+    const running = this.#verifying.get(identity);
     if (running) return running;
     const job = (async (): Promise<VercelAccountVerification | undefined> => {
       const config = this.#requireConfig();
@@ -243,12 +257,12 @@ export class VercelConnectionService {
       const verification: VercelAccountVerification = accessToken && this.#verifier
         ? await this.#verifier.verify({ auth: { accessToken, teamId: connection.teamId }, configurationId: connection.configurationId, accountId: connection.teamId ?? connection.vercelUserId, now })
         : { state: "REAUTHORIZATION_REQUIRED", problem: "TOKEN_UNREADABLE", accountType, checkedAt: now };
-      await this.#repository.saveVerification(connection.ownerId, connection.configurationId, verification).catch(() => undefined);
+      await this.#repository.saveVerification(connection.ownerId, connection.configurationId, verification, connection.encryptedAccessToken).catch(() => undefined);
       return verification;
     })()
       .catch(() => undefined)
-      .finally(() => this.#verifying.delete(connection.ownerId));
-    this.#verifying.set(connection.ownerId, job);
+      .finally(() => this.#verifying.delete(identity));
+    this.#verifying.set(identity, job);
     return job;
   }
 
@@ -285,14 +299,17 @@ export class VercelConnectionService {
     const state = randomBytes(32).toString("base64url");
     const createdAt = this.#now();
     const expiresAt = new Date(createdAt.getTime() + VERCEL_STATE_TTL_MS);
-    await this.#repository.expireOpenStates(ownerId, createdAt);
+    const lifecycleId = hashState(state);
     await this.#repository.createState({
       stateHash: hashState(state),
       ownerId,
       ...(isSiteId(siteId) ? { siteId } : {}),
       createdAt,
       expiresAt,
+      lifecycleId,
     });
+    // Single owner-row mutation defines the ordering of concurrent starts.
+    await this.#repository.beginAuthorization(ownerId, lifecycleId, createdAt);
     const installUrl = new URL(
       `https://vercel.com/integrations/${encodeURIComponent(config.slug)}/new`,
     );
@@ -327,7 +344,7 @@ export class VercelConnectionService {
     // Consumed first so a replayed or cancelled callback can never exchange
     // later; the consumed state also identifies where to return.
     const consumed = await this.#repository.consumeState(hashState(state), this.#now());
-    if (!consumed) throw fail("state_invalid");
+    if (!consumed?.lifecycleId || !(await this.#repository.isCurrentAuthorization(consumed.ownerId, consumed.lifecycleId))) throw fail("state_invalid");
     const { ownerId } = consumed;
     const context: VercelReturnContext = consumed;
     // A callback without a code means the user did not finish authorizing.
@@ -359,7 +376,7 @@ export class VercelConnectionService {
 
     const now = this.#now();
     try {
-      await this.#repository.saveConnection({
+      const saved = await this.#repository.saveConnection({
         ownerId,
         configurationId,
         vercelUserId: exchange.userId,
@@ -372,8 +389,10 @@ export class VercelConnectionService {
         status: "active",
         connectedAt: now,
         updatedAt: now,
-      });
+      }, consumed.lifecycleId);
+      if (!saved) throw fail("state_invalid", context);
     } catch (error) {
+      if (error instanceof VercelIntegrationError) throw error;
       throw fail(
         error instanceof VercelConfigurationConflictError
           ? "configuration_conflict"
@@ -383,7 +402,7 @@ export class VercelConnectionService {
     }
 
     // One connection per user: release the replaced installation on Vercel.
-    if (previous && previous.configurationId !== configurationId)
+    if (previous && previous.configurationId !== configurationId && await this.#repository.isCurrentAuthorization(ownerId, consumed.lifecycleId))
       await this.#removeRemote(config, previous).catch(() => false);
     return consumed.siteId
       ? { ownerId, configurationId, siteId: consumed.siteId }
@@ -428,9 +447,17 @@ export class VercelConnectionService {
    */
   async disconnect(ownerId: string, options: { readonly allowActivePublishing?: boolean } = {}): Promise<VercelDisconnectResult> {
     const connection = await this.#repository.findActiveConnection(ownerId);
-    if (!connection) return { disconnected: false, remoteRevoked: false, revocation: "NOT_ATTEMPTED", interruptedPublishes: 0 };
-    const running = (await this.#activePublishes?.(ownerId).catch(() => 0)) ?? 0;
+    let running: number;
+    try {
+      if (!this.#activePublishes) throw new Error("Missing activity check");
+      running = await this.#activePublishes(ownerId);
+      if (!Number.isSafeInteger(running) || running < 0) throw new Error("Incomplete activity check");
+    } catch { throw new VercelIntegrationError("VERCEL_DISCONNECT_UNAVAILABLE"); }
     if (running > 0 && options.allowActivePublishing !== true) throw new VercelIntegrationError("VERCEL_DISCONNECT_BLOCKED");
+    if (!connection) {
+      await this.#repository.invalidatePendingAuthorization(ownerId);
+      return { disconnected: false, remoteRevoked: false, revocation: "NOT_ATTEMPTED", interruptedPublishes: 0 };
+    }
     const result = this.#config();
     let accessToken: string | undefined;
     if (result.configured)
@@ -440,8 +467,7 @@ export class VercelConnectionService {
         accessToken = undefined;
       }
     const now = this.#now();
-    await this.#repository.expireOpenStates(ownerId, now);
-    const disconnected = await this.#repository.markDisconnected(ownerId, connection.configurationId, now);
+    const disconnected = await this.#repository.markDisconnected(ownerId, connection.configurationId, now, connection.encryptedAccessToken);
     // Lost a race (already disconnected or replaced by a new authorization): leave Vercel alone.
     if (!disconnected) return { disconnected: false, remoteRevoked: false, revocation: "NOT_ATTEMPTED", interruptedPublishes: 0 };
     const remoteRevoked = accessToken
@@ -501,5 +527,5 @@ export const createVercelConnectionService = (
     repository: new MongoVercelIntegrationRepository(connection),
     verifier: createVercelAccountVerifier(),
     ...(siteOwnership ? { siteOwnership } : {}),
-    ...(activePublishes ? { activePublishes } : {}),
+    activePublishes: activePublishes ?? ((ownerId) => countVercelPublishingActivity(connection, ownerId)),
   });

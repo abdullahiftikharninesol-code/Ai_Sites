@@ -28,6 +28,12 @@ export interface ReconciliationEntry {
   readonly versionId?: string;
   readonly previewProcesses: number;
   readonly stoppedProcesses: number;
+  /**
+   * Any process attributable to this workspace (npm, Vite, build tools, their
+   * descendants, or a child the dead owner left running). Counted to protect
+   * the workspace only: never stopped.
+   */
+  readonly workspaceProcesses?: number;
 }
 export interface ReconciliationReport {
   readonly schemaVersion: 1;
@@ -36,10 +42,48 @@ export interface ReconciliationReport {
   readonly scanned: number;
   readonly truncated: boolean;
   readonly processScan: "OK" | "UNAVAILABLE";
+  /** UNVERIFIED: some listed process has no parent PID, so a dead owner's running children cannot be ruled out. */
+  readonly processOwnership?: "OK" | "UNVERIFIED";
   readonly counts: Readonly<Record<WorkspaceState, number>> & { readonly stoppedProcesses: number; readonly untrackedPreviewProcesses: number };
   readonly entries: readonly ReconciliationEntry[];
 }
-export interface ProcessInfo { readonly pid: number; readonly commandLine: string }
+export interface ProcessInfo {
+  readonly pid: number;
+  readonly commandLine: string;
+  /** Parent PID when the platform reports it (Windows keeps a dead parent's PID). */
+  readonly ppid?: number;
+}
+
+const normalizeCommandPath = (value: string) => {
+  const slashed = value.replace(/\\/g, "/");
+  return process.platform === "win32" ? slashed.toLowerCase() : slashed;
+};
+
+/**
+ * Processes attributable to one workspace, for protection only:
+ *   - the command line names a path inside it (npm, node, Vite, tsc, esbuild, shells...);
+ *   - the parent is the workspace's owner, when that owner is dead (its orphaned build/install children);
+ *   - and every descendant of those.
+ * `deadOwnerPid` must be omitted while the owner is alive or is this process.
+ */
+export function workspaceProcessIds(executionRoot: string, environmentId: string, processes: readonly ProcessInfo[], deadOwnerPid?: number): number[] {
+  const workspace = `${normalizeCommandPath(resolve(executionRoot)).replace(/\/+$/, "")}/${normalizeCommandPath(environmentId)}`;
+  const attributed = new Set<number>();
+  for (const info of processes) {
+    const line = normalizeCommandPath(info.commandLine);
+    if (line.includes(`${workspace}/`) || line.includes(`${workspace}"`) || line.endsWith(workspace) || (deadOwnerPid !== undefined && info.ppid === deadOwnerPid))
+      attributed.add(info.pid);
+  }
+  for (let grew = attributed.size > 0; grew;) {
+    grew = false;
+    for (const info of processes)
+      if (info.ppid !== undefined && attributed.has(info.ppid) && !attributed.has(info.pid)) { attributed.add(info.pid); grew = true; }
+  }
+  return [...attributed].sort((a, b) => a - b);
+}
+
+/** Whether every listed process reports its parent (needed to rule out a dead owner's children). */
+export const processOwnershipVerifiable = (processes: readonly ProcessInfo[]) => processes.every(info => Number.isInteger(info.ppid));
 export interface ReconcileOptions {
   readonly root: string;
   /** Whether a saved site version still exists (no source is read or modified). */
@@ -96,13 +140,16 @@ export async function reconcileExecutionWorkspaces(options: ReconcileOptions): P
       for (const pid of pids) { try { stop(pid); stopped++; } catch { /* already gone */ } }
     if (state === "RECOVERABLE" || state === "ORPHANED")
       await writeFile(join(directory, ORPHAN_CANDIDATE_MARKER), JSON.stringify({ detectedAt: new Date().toISOString(), state, reason }), "utf8").catch(() => undefined);
+    // Protection only (never stopped). A preview stopped above still counts until the next scan: the safe direction.
+    const users = workspaceProcessIds(root, environmentId, processes, state === "RECOVERABLE" || state === "ORPHANED" ? marker?.ownerPid : undefined);
     entries.push({ environmentId, state, reason, ...(marker?.purpose ? { purpose: marker.purpose } : {}),
       ...(marker?.siteId ? { siteId: marker.siteId } : {}), ...(marker?.versionId ? { versionId: marker.versionId } : {}),
-      previewProcesses: pids.length, stoppedProcesses: stopped });
+      previewProcesses: pids.length, stoppedProcesses: stopped, workspaceProcesses: users.length });
   }
   const count = (state: WorkspaceState) => entries.filter(entry => entry.state === state).length;
   const report: ReconciliationReport = {
     schemaVersion: 1, startedAt: new Date(started).toISOString(), durationMs: Date.now() - started, scanned: entries.length, truncated, processScan,
+    processOwnership: processScan === "OK" && processOwnershipVerifiable(processes) ? "OK" : "UNVERIFIED",
     // Vite processes whose workspace no longer exists have no provable owner: recorded only.
     counts: { ACTIVE: count("ACTIVE"), RECOVERABLE: count("RECOVERABLE"), ORPHANED: count("ORPHANED"), UNKNOWN: count("UNKNOWN"),
       stoppedProcesses: entries.reduce((sum, entry) => sum + entry.stoppedProcesses, 0),
@@ -135,7 +182,8 @@ function viteEnvironment(root: string, commandLine: string): string | undefined 
 
 export function isProcessAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+  // Only a missing process proves that its workspace owner is gone.
+  catch (error) { return (error as NodeJS.ErrnoException | undefined)?.code !== "ESRCH"; }
 }
 
 /**
@@ -147,17 +195,20 @@ export function listNodeProcesses(timeoutMs: number, options: { readonly allProc
     const windows = process.platform === "win32";
     const filter = options.allProcesses ? "" : " -Filter \"Name='node.exe'\"";
     const [command, args] = windows
-      ? ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `Get-CimInstance Win32_Process${filter} | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`]] as const
-      : ["ps", ["-axo", "pid=,args="]] as const;
+      ? ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `Get-CimInstance Win32_Process${filter} | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress`]] as const
+      : ["ps", ["-axo", "pid=,ppid=,args="]] as const;
     execFile(command, [...args], { timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (error, stdout) => {
       if (error) { reject(error instanceof Error ? error : new Error("Process listing failed")); return; }
       try {
         if (windows) {
-          const parsed = stdout.trim() ? JSON.parse(stdout) as { ProcessId: number; CommandLine: string | null } | { ProcessId: number; CommandLine: string | null }[] : [];
-          resolvePromise((Array.isArray(parsed) ? parsed : [parsed]).filter(item => item.CommandLine).map(item => ({ pid: item.ProcessId, commandLine: item.CommandLine! })));
+          type Row = { ProcessId: number; ParentProcessId?: number | null; CommandLine: string | null };
+          const parsed = stdout.trim() ? JSON.parse(stdout) as Row | Row[] : [];
+          // Processes without a readable command line (other users, system) still count as children of a dead owner.
+          resolvePromise((Array.isArray(parsed) ? parsed : [parsed]).filter(item => item.CommandLine || options.allProcesses)
+            .map(item => ({ pid: item.ProcessId, commandLine: item.CommandLine ?? "", ...(Number.isInteger(item.ParentProcessId) ? { ppid: item.ParentProcessId! } : {}) })));
         } else {
-          resolvePromise(stdout.split("\n").map(line => /^\s*(\d+)\s+(.*)$/.exec(line)).filter((match): match is RegExpExecArray => !!match && (options.allProcesses || /node/.test(match[2]!)))
-            .map(match => ({ pid: Number(match[1]), commandLine: match[2]! })));
+          resolvePromise(stdout.split("\n").map(line => /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line)).filter((match): match is RegExpExecArray => !!match && (options.allProcesses || /node/.test(match[3]!)))
+            .map(match => ({ pid: Number(match[1]), ppid: Number(match[2]), commandLine: match[3]! })));
         }
       } catch (cause) { reject(cause instanceof Error ? cause : new Error(String(cause))); }
     });

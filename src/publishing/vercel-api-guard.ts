@@ -1,6 +1,7 @@
 import { VercelApiError, type VercelAuth } from "../integrations/vercel/vercel-projects-client.js";
 import type { VercelDeploymentsClient } from "../integrations/vercel/vercel-deployments-client.js";
 import { PublishingError } from "./publishing-errors.js";
+import type { VercelRequestStats } from "./publish-diagnostics.js";
 
 export interface VercelApiGuardOptions {
   /** Hard cap on Vercel requests for one attempt (every retry counts). */
@@ -35,8 +36,30 @@ const transient = (error: unknown) =>
  *   - writes (upload, create, promote, rollback, cancel) are never retried
  *     here: their callers reconcile instead of repeating them blindly.
  */
-export function guardVercelDeployments(client: VercelDeploymentsClient, options: VercelApiGuardOptions): VercelDeploymentsClient & { readonly used: () => number } {
+export function guardVercelDeployments(
+  client: VercelDeploymentsClient,
+  options: VercelApiGuardOptions,
+): VercelDeploymentsClient & { readonly used: () => number; readonly stats: () => VercelRequestStats } {
   let used = 0;
+  // Diagnostics only: fixed counters, never request details.
+  const counts = { uploads: 0, retries: 0, rateLimited: 0, serverErrors: 0, timeouts: 0, networkErrors: 0, retryWaitMs: 0 };
+  const observe = (error: unknown) => {
+    if (!(error instanceof VercelApiError)) return;
+    if (error.status === 429) counts.rateLimited++;
+    else if (error.status !== undefined && error.status >= 500) counts.serverErrors++;
+    else if (error.status === undefined) {
+      if (error.timedOut) counts.timeouts++;
+      else counts.networkErrors++;
+    }
+  };
+  const observed = async <R>(call: () => Promise<R>): Promise<R> => {
+    try {
+      return await call();
+    } catch (error) {
+      observe(error);
+      throw error;
+    }
+  };
   const spend = () => {
     if (used >= options.budget) throw new VercelRequestBudgetError(options.budget);
     used++;
@@ -44,7 +67,7 @@ export function guardVercelDeployments(client: VercelDeploymentsClient, options:
   const write = <A extends [VercelAuth, ...unknown[]], R>(call: (...args: A) => Promise<R>, checked = true) => async (...args: A) => {
     if (checked) await options.beforeRequest?.(args[0]);
     spend();
-    return call(...args);
+    return observed(() => call(...args));
   };
   const read = <A extends [VercelAuth, ...unknown[]], R>(call: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
     for (let attempt = 0; ; attempt++) {
@@ -53,16 +76,24 @@ export function guardVercelDeployments(client: VercelDeploymentsClient, options:
       try {
         return await call(...args);
       } catch (error) {
+        observe(error);
         if (!transient(error) || attempt >= options.readRetries) throw error;
         const hinted = (error as VercelApiError).retryAfterMs;
         if (hinted !== undefined && hinted > options.maxRetryAfterMs) throw error;
-        await options.sleep(hinted ?? 1_000 * 2 ** attempt);
+        const wait = hinted ?? 1_000 * 2 ** attempt;
+        counts.retries++;
+        counts.retryWaitMs += wait;
+        await options.sleep(wait);
       }
     }
   };
   return {
     // Uploads are bounded by the artifact's file count and per-file retries, not by this budget.
-    uploadFile: async (...args: Parameters<VercelDeploymentsClient["uploadFile"]>) => (await options.beforeRequest?.(args[0]), client.uploadFile(...args)),
+    uploadFile: async (...args: Parameters<VercelDeploymentsClient["uploadFile"]>) => {
+      await options.beforeRequest?.(args[0]);
+      counts.uploads++;
+      return observed(() => client.uploadFile(...args));
+    },
     createDeployment: write((...args: Parameters<VercelDeploymentsClient["createDeployment"]>) => client.createDeployment(...args)),
     promoteDeployment: write((...args: Parameters<VercelDeploymentsClient["promoteDeployment"]>) => client.promoteDeployment(...args)),
     rollbackDeployment: write((...args: Parameters<VercelDeploymentsClient["rollbackDeployment"]>) => client.rollbackDeployment(...args)),
@@ -73,5 +104,6 @@ export function guardVercelDeployments(client: VercelDeploymentsClient, options:
     getProductionDeploymentId: read((...args: Parameters<VercelDeploymentsClient["getProductionDeploymentId"]>) => client.getProductionDeploymentId(...args)),
     getAliasDeploymentId: read((...args: Parameters<VercelDeploymentsClient["getAliasDeploymentId"]>) => client.getAliasDeploymentId(...args)),
     used: () => used,
+    stats: () => ({ requests: used, ...counts }),
   };
 }

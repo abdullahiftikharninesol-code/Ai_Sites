@@ -5,6 +5,14 @@ import type { SiteId, VersionId } from "../shared/types.js";
 import { VercelIntegrationError, type VercelConnectionService } from "../integrations/vercel/vercel-connection-service.js";
 import type { LinkedVercelProject } from "../integrations/vercel/vercel-project-provider.js";
 import { PublishingError, boundedMetadata } from "./publishing-errors.js";
+import {
+  DiagnosticThrottle,
+  emitDiagnostic,
+  resolveDiagnosticsSink,
+  resources,
+  type AdmissionRejectReason,
+  type PublishDiagnosticsSink,
+} from "./publish-diagnostics.js";
 import type { ProductionBuildResult, ProductionBuildInput } from "./production-build-service.js";
 import { verifyPublishableSource } from "./production-build-service.js";
 import {
@@ -59,7 +67,7 @@ export interface PublishPreparationServiceOptions {
   readonly buildAccess: PublishBuildAccess;
   readonly repository: PublishPreparationRepository;
   readonly projects: { getOwnedById(id: SiteId, ownerId: string): Promise<SiteProject | undefined> };
-  readonly versions: { getById(id: VersionId): Promise<SiteVersion | undefined> };
+  readonly versions: { getById(id: VersionId, ownerId?: string): Promise<SiteVersion | undefined> };
   readonly artifacts: ArtifactStore;
   readonly builder: { build(input: ProductionBuildInput): Promise<ProductionBuildResult>; cancelAll?(): Promise<void> };
   readonly connections: Pick<VercelConnectionService, "credentials">;
@@ -73,6 +81,8 @@ export interface PublishPreparationServiceOptions {
   /** How long a READY artifact may be consumed for deployment. */
   readonly readyTtlMs?: number;
   readonly now?: () => Date;
+  /** Structured diagnostics (default: console JSON lines; false disables). See publish-diagnostics.ts. */
+  readonly diagnostics?: PublishDiagnosticsSink | false;
 }
 
 /** What the browser sees: no artifact location, token, workspace path or public URL. */
@@ -125,10 +135,13 @@ export class PublishPreparationService {
   readonly #leaseMs: number;
   readonly #readyTtlMs: number;
   readonly #linkProjects: boolean;
+  readonly #diagnostics: PublishDiagnosticsSink;
+  readonly #rejections = new DiagnosticThrottle();
   #closed = false;
 
   constructor(options: PublishPreparationServiceOptions) {
     this.#options = options;
+    this.#diagnostics = resolveDiagnosticsSink(options.diagnostics);
     this.#now = options.now ?? (() => new Date());
     this.#maxConcurrent = options.maxConcurrent ?? intEnv("SITES_PUBLISH_MAX_CONCURRENT", 1, 1, 4);
     this.#maxAttempts = options.maxAttempts ?? 5;
@@ -247,7 +260,7 @@ export class PublishPreparationService {
     if (record.status !== "READY_TO_DEPLOY" || !record.artifact || (record.expiresAt && record.expiresAt <= this.#now()))
       throw new PublishingError("PUBLISH_ARTIFACT_UNAVAILABLE", "This site has no ready production build. Prepare it again.");
     const project = await this.#ownedProject(ownerId, record.siteId);
-    const version = await this.#options.versions.getById(record.versionId as VersionId);
+    const version = await this.#options.versions.getById(record.versionId as VersionId, ownerId);
     if (project.latestVersionId !== record.versionId || !version || version.sourceArtifactRef !== record.sourceArtifactRef)
       throw new PublishingError("PUBLISH_VERSION_NOT_CURRENT", "The site changed after this build was prepared. Prepare it again.");
     const source = await this.#options.artifacts.get(record.sourceArtifactRef);
@@ -283,9 +296,14 @@ export class PublishPreparationService {
    * returned release is idempotent and must run in a finally block.
    */
   #reserve(key: string): () => void {
-    if (this.#closed) throw new PublishingError("PUBLISH_PREPARATION_BUSY", "Publishing preparation is shutting down.");
-    if (this.#admissions.has(key) || this.#running.size + this.#admissions.size >= this.#maxConcurrent)
+    if (this.#closed) {
+      this.#rejected("CLOSED");
+      throw new PublishingError("PUBLISH_PREPARATION_BUSY", "Publishing preparation is shutting down.");
+    }
+    if (this.#admissions.has(key) || this.#running.size + this.#admissions.size >= this.#maxConcurrent) {
+      this.#rejected(this.#admissions.has(key) ? "DUPLICATE" : "CAPACITY");
       throw new PublishingError("PUBLISH_PREPARATION_BUSY", "Other sites are being prepared for publishing right now. Try again in a minute.");
+    }
     let settle!: () => void;
     const admission = new Promise<void>((resolve) => (settle = resolve));
     this.#admissions.set(key, admission);
@@ -293,6 +311,16 @@ export class PublishPreparationService {
       if (this.#admissions.get(key) === admission) this.#admissions.delete(key);
       settle();
     };
+  }
+
+  /** Throttled: at most one event per reason per minute, carrying the count dropped meanwhile. */
+  #rejected(reason: AdmissionRejectReason) {
+    const suppressed = this.#rejections.admit(reason);
+    if (suppressed === undefined) return;
+    emitDiagnostic(this.#diagnostics, {
+      event: "build_admission_rejected", reason, active: this.#running.size, admitting: this.#admissions.size, maxConcurrent: this.#maxConcurrent,
+      ...(suppressed ? { suppressed } : {}),
+    });
   }
 
   #start(record: PublishPreparationRecord, input: ProductionBuildInput & { ownerId: string; sourceSha256: string }) {
@@ -307,12 +335,38 @@ export class PublishPreparationService {
   async #run(record: PublishPreparationRecord, input: ProductionBuildInput & { ownerId: string; sourceSha256: string }) {
     const { preparationId, attempt } = record;
     let project: PublishPreparationProject = { status: "NOT_LINKED" };
+    const started = Date.now();
+    let stage = "BUILD";
+    let reused = false;
+    let metrics: PublishPreparationRecord["metrics"];
+    const finished = (outcome: "READY" | "FAILED", failure?: PublishPreparationFailure) => {
+      const meta = failure?.metadata;
+      emitDiagnostic(this.#diagnostics, {
+        event: "build_finished", preparationId, siteId: input.siteId, attempt, outcome, stage,
+        ...(typeof meta?.stage === "string" ? { buildStage: meta.stage } : {}),
+        ...(typeof meta?.exitCode === "number" ? { exitCode: meta.exitCode } : {}),
+        ...(failure ? { code: failure.code, retryable: failure.retryable } : {}),
+        reused, durationMs: Date.now() - started,
+        ...(metrics ? { installMs: metrics.installMs, buildMs: metrics.buildMs } : {}),
+        active: this.#running.size, maxConcurrent: this.#maxConcurrent,
+        ...resources(),
+      });
+    };
     try {
-      const artifact = (await this.#reusableArtifact(record)) ?? (await this.#buildArtifact(record, input));
+      const existing = await this.#reusableArtifact(record);
+      reused = !!existing;
+      let artifact = existing;
+      if (!artifact) ({ artifact, metrics } = await this.#buildArtifact(record, input, () => (stage = "ARTIFACT")));
+      await this.#assertPreparationCurrent(record);
+      stage = "LINK";
       if (this.#linkProjects) {
         const linked = await this.#options.projectProvider!.ensureProject(input.ownerId, input.siteId);
+        if (linked.configurationId !== record.connection.configurationId || linked.accountId !== (record.connection.teamId ?? record.connection.vercelUserId))
+          throw new PublishingError("VERCEL_ACCOUNT_MISMATCH", "The Vercel account changed during preparation. Prepare again using the intended account.");
         project = { status: "LINKED", projectId: linked.projectId, projectName: linked.projectName, accountId: linked.accountId };
       }
+      stage = "COMPLETE";
+      await this.#assertPreparationCurrent(record);
       const completedAt = this.#now();
       await this.#options.repository.complete(preparationId, attempt, {
         status: "READY_TO_DEPLOY",
@@ -321,9 +375,11 @@ export class PublishPreparationService {
         expiresAt: new Date(completedAt.getTime() + this.#readyTtlMs),
       });
       console.info(`[sites][publish] prepared site=${input.siteId} version=${input.versionId} files=${artifact.fileCount} bytes=${artifact.totalBytes} attempt=${attempt}`);
+      finished("READY");
     } catch (error) {
       const failure = this.#failure(error);
       console.warn(`[sites][publish] preparation failed site=${input.siteId} version=${input.versionId} code=${failure.code} attempt=${attempt}`);
+      finished("FAILED", failure);
       await this.#options.repository.complete(preparationId, attempt, {
         status: "PREPARATION_FAILED",
         project,
@@ -346,8 +402,13 @@ export class PublishPreparationService {
     }
   }
 
-  async #buildArtifact(record: PublishPreparationRecord, input: ProductionBuildInput & { sourceSha256: string }): Promise<PublishPreparationArtifact> {
+  async #buildArtifact(
+    record: PublishPreparationRecord,
+    input: ProductionBuildInput & { sourceSha256: string },
+    built: () => void,
+  ): Promise<{ artifact: PublishPreparationArtifact; metrics: ProductionBuildResult["metrics"] }> {
     const result = await this.#options.builder.build(input);
+    built();
     const serialized = serializePreparedArtifact({
       siteId: record.siteId,
       versionId: record.versionId,
@@ -372,7 +433,7 @@ export class PublishPreparationService {
       summary: result.summary,
     };
     await this.#options.repository.saveArtifact(record.preparationId, record.attempt, artifact, result.metrics, this.#now());
-    return artifact;
+    return { artifact, metrics: result.metrics };
   }
 
   #failure(error: unknown): PublishPreparationFailure {
@@ -387,7 +448,7 @@ export class PublishPreparationService {
   async #ownedProject(ownerId: string, siteId: string): Promise<SiteProject> {
     if (typeof ownerId !== "string" || !ownerId) throw Object.assign(new Error("An authenticated owner is required"), { code: "AUTHENTICATION_REQUIRED" });
     const project = await this.#options.projects.getOwnedById(siteId as SiteId, ownerId);
-    if (!project) throw siteNotFound();
+    if (!project || project.id !== siteId || project.ownerId !== ownerId) throw siteNotFound();
     return project;
   }
 
@@ -397,7 +458,7 @@ export class PublishPreparationService {
     // Only the current saved version may be prepared: never an older or different one.
     if (versionId !== project.latestVersionId)
       throw new PublishingError("PUBLISH_VERSION_NOT_CURRENT", "Only the site's current saved version can be published. Reload the editor and try again.");
-    const version = await this.#options.versions.getById(versionId as VersionId);
+    const version = await this.#options.versions.getById(versionId as VersionId, ownerId);
     if (!version || version.siteId !== project.id) throw Object.assign(new Error("Version not found"), { code: "VERSION_NOT_FOUND" });
     const qaAccepted =
       version.browserQAStatus === "PASSED" ||
@@ -429,38 +490,23 @@ export class PublishPreparationService {
     }
   }
 
+  async #assertPreparationCurrent(record: PublishPreparationRecord) {
+    if (this.#closed) throw new PublishingError("PUBLISH_INTERRUPTED", "Publishing preparation was interrupted by shutdown. Try again.");
+    const { version } = await this.#currentVersion(record.ownerId, record.siteId, record.versionId);
+    if (version.sourceArtifactRef !== record.sourceArtifactRef) throw new PublishingError("PUBLISH_VERSION_NOT_CURRENT", "The saved source changed during preparation. Prepare again.");
+    const source = await this.#options.artifacts.get(record.sourceArtifactRef);
+    if (!source || createHash("sha256").update(source).digest("hex") !== record.sourceSha256)
+      throw new PublishingError("PUBLISH_VERSION_NOT_CURRENT", "The saved source changed during preparation. Prepare again.");
+    const currentRecord = await this.#options.repository.findOwned(record.ownerId, record.preparationId);
+    if (!currentRecord || currentRecord.attempt !== record.attempt || currentRecord.status !== "PREPARING")
+      throw new PublishingError("PUBLISH_INTERRUPTED", "This preparation attempt was replaced. Check its current status.");
+    const current = await this.#connection(record.ownerId), expected = record.connection;
+    if (current.configurationId !== expected.configurationId || current.teamId !== expected.teamId || current.vercelUserId !== expected.vercelUserId)
+      throw new PublishingError("VERCEL_ACCOUNT_MISMATCH", "The Vercel connection changed during preparation. Prepare again using the intended account.");
+  }
+
   #view(record: PublishPreparationRecord, project: SiteProject): PublishPreparationView {
-    const now = this.#now();
-    const expired = record.status === "READY_TO_DEPLOY" && !!record.expiresAt && record.expiresAt <= now;
-    // A crashed server's attempt: its lease lapsed and nothing here is building it.
-    const abandoned = record.status === "PREPARING" && !!record.leaseExpiresAt && record.leaseExpiresAt <= now && !this.#running.has(record.preparationId);
-    if (abandoned)
-      record = {
-        ...record,
-        status: "PREPARATION_FAILED",
-        failure: { code: "PUBLISH_PREPARATION_FAILED", message: "Publishing preparation was interrupted. Try again.", retryable: record.attempt < this.#maxAttempts },
-      };
-    return {
-      preparationId: record.preparationId,
-      siteId: record.siteId,
-      versionId: record.versionId,
-      versionNumber: record.versionNumber,
-      status: expired ? "EXPIRED" : record.status,
-      published: false,
-      isCurrentVersion: project.latestVersionId === record.versionId,
-      attempt: record.attempt,
-      ...(record.artifact && record.status === "READY_TO_DEPLOY"
-        ? { artifact: { fileCount: record.artifact.fileCount, totalBytes: record.artifact.totalBytes, routing: record.artifact.routing, sha256: record.artifact.sha256 } }
-        : {}),
-      project: record.project
-        ? { status: record.project.status, ...(record.project.projectId ? { projectId: record.project.projectId } : {}), ...(record.project.projectName ? { projectName: record.project.projectName } : {}) }
-        : { status: "NOT_LINKED" },
-      ...(record.failure ? { failure: record.failure } : {}),
-      ...(record.metrics ? { metrics: record.metrics } : {}),
-      createdAt: record.createdAt.toISOString(),
-      updatedAt: record.updatedAt.toISOString(),
-      ...(record.completedAt ? { completedAt: record.completedAt.toISOString() } : {}),
-      ...(record.expiresAt ? { expiresAt: record.expiresAt.toISOString() } : {}),
-    };
+    return preparationStatusView(record, project, { now: this.#now(), maxAttempts: this.#maxAttempts, isRunning: id => this.#running.has(id) });
   }
 }
+import { preparationStatusView } from "./publishing-status-views.js";

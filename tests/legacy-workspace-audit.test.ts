@@ -7,7 +7,7 @@ import { auditLegacyWorkspaces, type LegacyAuditInputs, type LegacyWorkspaceFind
 import { loadLegacyStoreSiteIds, withLegacyStoreReferences } from "../src/storage/legacy-store-references.js";
 import { executeCleanupPlan, planStorageCleanup, type ExecuteOptions } from "../src/storage/storage-cleanup-planner.js";
 import { describeDatabase, EXPECTED_DATA_ROOT_ENV, EXPECTED_DATABASE_ENV, verifyStorageEnvironment } from "../src/storage/storage-environment.js";
-import { unavailableReferences, type StorageReferenceSnapshot } from "../src/storage/storage-references.js";
+import { emptyPublishingReferences, unavailableReferences, type StorageReferenceSnapshot } from "../src/storage/storage-references.js";
 import { reconcileExecutionWorkspaces, type ProcessInfo } from "../src/execution/local/workspace-reconciliation.js";
 import { WORKSPACE_MARKER } from "../src/execution/local/workspace-ownership.js";
 import { LocalArtifactStore } from "../src/persistence/local-artifact-store.js";
@@ -53,7 +53,7 @@ async function fixture() {
     await write(`execution/${id}/project/dist/index.html`, "<html></html>");
     await age(join(root, "execution", id), days);
   };
-  let references: StorageReferenceSnapshot = { available: true, retainedSourceRefs: new Map(), knownSiteIds: new Set(), activeSiteIds: new Set() };
+  let references: StorageReferenceSnapshot = { available: true, retainedSourceRefs: new Map(), knownSiteIds: new Set(), activeSiteIds: new Set(), publishing: emptyPublishingReferences() };
   let processes: ProcessInfo[] = [];
   let scanFails = false;
   const listProcesses = vi.fn(async () => { if (scanFails) throw new Error("scan failed"); return processes; });
@@ -78,7 +78,7 @@ async function fixture() {
     failScan: () => { scanFails = true; } };
 }
 const refs = (entries: Record<string, string[]>, active: string[] = []): StorageReferenceSnapshot =>
-  ({ available: true, retainedSourceRefs: new Map(Object.entries(entries)), knownSiteIds: new Set(Object.keys(entries)), activeSiteIds: new Set(active) });
+  ({ available: true, retainedSourceRefs: new Map(Object.entries(entries)), knownSiteIds: new Set(Object.keys(entries)), activeSiteIds: new Set(active), publishing: emptyPublishingReferences() });
 const by = (findings: readonly LegacyWorkspaceFinding[]) => new Map(findings.map(finding => [finding.environmentId, finding]));
 
 describe("Legacy workspace classification (read-only, evidence-based)", () => {

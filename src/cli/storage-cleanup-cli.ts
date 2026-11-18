@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import { MongoConnectionManager } from "../persistence/mongodb/mongo-connection.js";
 import { createMongoModels } from "../persistence/mongodb/mongo-models.js";
 import { planStorageCleanup } from "../storage/storage-cleanup-planner.js";
-import { MongoStorageReferenceSource, unavailableReferences } from "../storage/storage-references.js";
+import { MongoStorageReferenceSource, mongoPublishingReferenceReader, unavailableReferences } from "../storage/storage-references.js";
 import { withLegacyStoreReferences } from "../storage/legacy-store-references.js";
 import { describeDatabase, verifyStorageEnvironment } from "../storage/storage-environment.js";
 
@@ -18,7 +18,7 @@ const dataRoot = resolve(at >= 0 && args[at + 1] ? args[at + 1]! : process.env.S
 const mongo = new MongoConnectionManager(process.env.DATABASE);
 const connected = await mongo.connect().then(() => true, () => false);
 const references = connected
-  ? new MongoStorageReferenceSource(createMongoModels(mongo.connection), () => Number(mongo.connection.readyState) === 1)
+  ? new MongoStorageReferenceSource(createMongoModels(mongo.connection), () => Number(mongo.connection.readyState) === 1, mongoPublishingReferenceReader(mongo.connection))
   : { load: () => Promise.resolve(unavailableReferences("MONGODB_UNAVAILABLE")) };
 try {
   const plan = await planStorageCleanup({ dataRoot, references: withLegacyStoreReferences(references, dataRoot) });

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { executeCleanupPlan, planStorageCleanup, recoverInterruptedCleanup, type CleanupPlan, type ExecuteOptions, type PlanInputs } from "../src/storage/storage-cleanup-planner.js";
 import { EXPECTED_DATA_ROOT_ENV, EXPECTED_DATABASE_ENV } from "../src/storage/storage-environment.js";
-import { MongoStorageReferenceSource, unavailableReferences, type StorageReferenceSnapshot } from "../src/storage/storage-references.js";
+import { MongoStorageReferenceSource, emptyPublishingReferences, unavailableReferences, type StorageReferenceSnapshot } from "../src/storage/storage-references.js";
 import { reconcileExecutionWorkspaces, type ProcessInfo } from "../src/execution/local/workspace-reconciliation.js";
 import { PROCESS_BOOT_ID, WORKSPACE_MARKER } from "../src/execution/local/workspace-ownership.js";
 import type { MongoModels } from "../src/persistence/mongodb/mongo-models.js";
@@ -45,7 +45,7 @@ async function fixture() {
     if (marker) await write(`execution/${id}/${WORKSPACE_MARKER}`, JSON.stringify({ schemaVersion: 1, environmentId: id, createdAt: new Date(0).toISOString(), ...marker }));
     await age(join(root, "execution", id), days);
   };
-  let references: StorageReferenceSnapshot = { available: true, retainedSourceRefs: new Map(), knownSiteIds: new Set(), activeSiteIds: new Set() };
+  let references: StorageReferenceSnapshot = { available: true, retainedSourceRefs: new Map(), knownSiteIds: new Set(), activeSiteIds: new Set(), publishing: emptyPublishingReferences() };
   let processes: ProcessInfo[] = [];
   let scanFails = false;
   // Execution requires the explicitly configured local environment (single local MongoDB + this data root).
@@ -68,7 +68,7 @@ async function fixture() {
     failScan: () => { scanFails = true; } };
 }
 const refs = (entries: Record<string, string[]>, active: string[] = []): StorageReferenceSnapshot =>
-  ({ available: true, retainedSourceRefs: new Map(Object.entries(entries)), knownSiteIds: new Set(Object.keys(entries)), activeSiteIds: new Set(active) });
+  ({ available: true, retainedSourceRefs: new Map(Object.entries(entries)), knownSiteIds: new Set(Object.keys(entries)), activeSiteIds: new Set(active), publishing: emptyPublishingReferences() });
 const byPath = (plan: CleanupPlan) => new Map(plan.candidates.map(candidate => [candidate.path, candidate]));
 const viteOf = (root: string, env: string) => `"node.exe" "${join(root, "execution", env, "project", "node_modules", "vite", "bin", "vite.js")}" --port 5000`;
 
@@ -122,7 +122,7 @@ describe("Reference-aware storage planning (dry run)", () => {
     await f.workspace("env-preview-broken", 2, { ownerPid: DEAD, ownerBootId: "crashed", purpose: "PREVIEW", siteId: "broken", versionId: "broken:v1" });
     await f.write("artifacts/sites/broken/versions/b1/source/source.json", "{corrupt");
     f.setReferences(refs({ site: [current.ref], broken: ["sites/broken/versions/b1/source/source.json"] }));
-    f.setProcesses([{ pid: 9, commandLine: viteOf(f.root, "env-orphan-running") }]);
+    f.setProcesses([{ pid: 9, ppid: 4, commandLine: viteOf(f.root, "env-orphan-running") }]);
     const plan = await planStorageCleanup(f.inputs({ activeEnvironmentIds: new Set(["env-orphan-in-use"]) }));
     const workspaces = plan.candidates.filter(candidate => candidate.path.startsWith("execution/"));
     expect(workspaces.map(candidate => [candidate.path, candidate.category]).sort()).toEqual([

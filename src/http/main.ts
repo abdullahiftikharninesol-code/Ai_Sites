@@ -1,9 +1,9 @@
 import { createSitesVersionApi } from "./create-sites-version-api.js";
+import { productionStartupFailure } from "./production-readiness.js";
 
 async function main() {
   const api = createSitesVersionApi();
-  const url = await api.start();
-  console.log(`Sites HTTP API: ${url}`);
+  await api.start();
   let closing = false;
   const close = async () => {
     if (closing) return;
@@ -22,9 +22,7 @@ async function main() {
   });
 }
 
-void main().catch(() => {
-  console.error(
-    "[sites][http] Unable to start Sites HTTP API; check configuration and Mongo connectivity",
-  );
+void main().catch((error: unknown) => {
+  productionStartupFailure(error);
   process.exitCode = 1;
 });

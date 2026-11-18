@@ -16,6 +16,26 @@ export interface AuthUserOptions {
   readonly jwtKey?: () => string | undefined;
 }
 
+/** undefined: absent/empty; null: malformed or ambiguous. Inspect raw fields before Node's duplicate-header normalization. */
+function bearerCredential(req: AuthenticatedRequest): string | null | undefined {
+  const header = req.headers.authorization;
+  if (header !== undefined && typeof header !== "string") return null;
+  if (req.rawHeaders !== undefined) {
+    if (!Array.isArray(req.rawHeaders) || req.rawHeaders.length % 2 !== 0) return null;
+    let count = 0, raw: string | undefined;
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const name = req.rawHeaders[i], value = req.rawHeaders[i + 1];
+      if (typeof name !== "string" || typeof value !== "string") return null;
+      if (name.toLowerCase() === "authorization") { count++; raw = value; }
+    }
+    if (count > 1 || raw !== header) return null;
+  }
+  if (header === undefined || /^[ \t]*(?:Bearer[ \t]*)?$/i.test(header)) return undefined;
+  // HTTP field OWS may surround the value; Bearer credentials require one or more SP separators, never HTAB.
+  const match = /^[ \t]*Bearer +([A-Za-z0-9._~+/-]+=*)[ \t]*$/i.exec(header);
+  return match?.[0] === header ? match[1]! : null;
+}
+
 /**
  * GetChatly `authUser` (src/middleware/authentication.middleware.js) for the
  * Sites node:http server. It establishes identity only; resource ownership is
@@ -25,9 +45,9 @@ export function createAuthUser(options: AuthUserOptions): AuthUserMiddleware {
   const jwtKey = options.jwtKey ?? (() => process.env.JWTKEY);
   return async (req, res, next) => {
     try {
-      const authorizationHeader = req.headers.authorization;
-      const token = authorizationHeader ? authorizationHeader.slice(7) : null;
-      if (!token) return sendResponse(res, 401, "No Token. Access Denied", false);
+      const token = bearerCredential(req);
+      if (token === undefined) return sendResponse(res, 401, "No Token. Access Denied", false);
+      if (token === null) return sendResponse(res, 401, "Invalid Authorization. Access Denied", false);
 
       const secret = jwtKey();
       if (!secret) {
@@ -37,7 +57,10 @@ export function createAuthUser(options: AuthUserOptions): AuthUserMiddleware {
 
       let decodedUser: unknown;
       try {
-        decodedUser = jwt.verify(token, secret);
+        decodedUser = jwt.verify(token, secret, { algorithms: ["HS256"] });
+        const exp = decodedUser && typeof decodedUser === "object" ? (decodedUser as { exp?: unknown }).exp : undefined;
+        if (typeof exp !== "number" || !Number.isFinite(exp))
+          return sendResponse(res, 401, "Invalid Authorization. Access Denied", false);
       } catch {
         return sendResponse(res, 401, "Invalid Authorization. Access Denied", false);
       }

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { SiteProject } from "../sites/domain/entities.js";
 import type { SiteId } from "../shared/types.js";
-import { VercelIntegrationError, type VercelConnectionService } from "../integrations/vercel/vercel-connection-service.js";
+import { VercelIntegrationError, type VercelConnectionService, type VercelCredentials } from "../integrations/vercel/vercel-connection-service.js";
 import type { LinkedVercelProject } from "../integrations/vercel/vercel-project-provider.js";
 import { classifyVercelApiError } from "../integrations/vercel/vercel-api-errors.js";
 import { VercelApiError, type VercelAuth } from "../integrations/vercel/vercel-projects-client.js";
@@ -12,8 +12,16 @@ import { HOSTING_CONFIG_VERSION, type PreparedArtifactDocument } from "./static-
 import { publicOriginFor, verifyPublicDeployment, type PublicVerificationResult } from "./public-site-verifier.js";
 import { VercelRequestBudgetError, guardVercelDeployments } from "./vercel-api-guard.js";
 import {
-  IN_PROGRESS_STATUSES,
-  SETTLED_DEPLOYMENT_STATES,
+  DiagnosticThrottle,
+  emitDiagnostic,
+  errorCode,
+  resolveDiagnosticsSink,
+  resources,
+  type AdmissionRejectReason,
+  type PublishDiagnosticsSink,
+  type VercelRequestStats,
+} from "./publish-diagnostics.js";
+import {
   type PublishOperationRecord,
   type PublishOperationStatus,
   type SitePublicationRecord,
@@ -85,6 +93,10 @@ export interface VercelPublishServiceOptions {
   /** isActiveConfiguration/activeAccount (Stage 5C) are optional so narrow test doubles keep working. */
   readonly connections: Pick<VercelConnectionService, "credentials"> & Partial<Pick<VercelConnectionService, "isActiveConfiguration" | "activeAccount">>;
   readonly deployments: VercelDeploymentsClient;
+  /** Production checks the exact connection/token before every provider request, without cached verification. */
+  readonly assertConnection?: (ownerId: string, expected: VercelCredentials) => Promise<void>;
+  /** Production transport cancellation, including public verification of an in-flight reconciliation item. */
+  readonly shutdownSignal?: AbortSignal;
   readonly liveEnabled?: boolean;
   readonly verify?: (origin: string, artifact: PreparedArtifactDocument) => Promise<PublicVerificationResult>;
   readonly limits?: Partial<VercelPublishLimits>;
@@ -93,6 +105,8 @@ export interface VercelPublishServiceOptions {
   /** Observe-only reconciliation of unverified operations (off unless SITES_PUBLISH_RECONCILE_ENABLED=true). */
   readonly reconcileEnabled?: boolean;
   readonly reconcileLimits?: Partial<PublishReconcileLimits>;
+  /** Structured diagnostics (default: console JSON lines; false disables). See publish-diagnostics.ts. */
+  readonly diagnostics?: PublishDiagnosticsSink | false;
 }
 
 /** Bounds of one reconciliation pass (see docs/PUBLISHING_RELIABILITY.md). */
@@ -229,8 +243,6 @@ interface VercelSession {
   readonly api: VercelDeploymentsClient;
 }
 
-/** Deployment states after which Vercel no longer changes production on its own. */
-const SETTLED_STATES = SETTLED_DEPLOYMENT_STATES;
 /** Failures whose effect on the live site is known regardless of later observations. */
 const DEFINITIVE_FAILURES = new Set(["VERCEL_DEPLOYMENT_FAILED", "PUBLISH_UPDATE_ROLLED_BACK", "PUBLISH_PRODUCTION_CHANGED"]);
 const RECONCILE_DELAYS_MS = [2_000, 5_000, 10_000];
@@ -261,8 +273,7 @@ const cannotChangeProduction = (deployment: VercelDeploymentInfo) =>
   (deployment.readyState === "READY" &&
     (deployment.readySubstate === "PROMOTED" || deployment.readySubstate === "STAGED" || (deployment.readySubstate === undefined && deployment.aliasAssigned === true)));
 
-export const deploymentMayStillGoLive = (op: Pick<PublishOperationRecord, "deploymentRequestedAt" | "deploymentId" | "deploymentState">) =>
-  !!(op.deploymentRequestedAt || op.deploymentId) && (!op.deploymentId || !SETTLED_STATES.includes(op.deploymentState ?? ""));
+export const deploymentMayStillGoLive = pendingDeployment;
 /** Another attempt took over this operation; stop without writing. */
 class StaleAttemptError extends Error {}
 
@@ -301,10 +312,14 @@ export class VercelPublishService {
   readonly #liveEnabled: boolean;
   readonly #reconcileEnabled: boolean;
   readonly #reconcileLimits: PublishReconcileLimits;
+  readonly #diagnostics: PublishDiagnosticsSink;
+  readonly #rejections = new DiagnosticThrottle();
   #closed = false;
+  #reconciling: Promise<PublishReconcileSummary> | undefined;
 
   constructor(options: VercelPublishServiceOptions) {
     this.#o = options;
+    this.#diagnostics = resolveDiagnosticsSink(options.diagnostics);
     this.#limits = {
       ...DEFAULT_VERCEL_PUBLISH_LIMITS,
       maxConcurrentPublishes: intEnv("SITES_PUBLISH_MAX_CONCURRENT_DEPLOYS", 1, 1, 4),
@@ -332,6 +347,7 @@ export class VercelPublishService {
       this.#o.repository.findLatest(ownerId, project.id),
       this.#o.repository.findPublication(project.id),
     ]);
+    if (latest && (latest.ownerId !== ownerId || latest.siteId !== project.id) || publication && (publication.ownerId !== ownerId || publication.siteId !== project.id)) throw siteNotFound();
     // Repairs a crash between "operation PUBLISHED" and "publication saved".
     const repaired = latest?.status === "PUBLISHED" && (!publication || (publication.operationId !== latest.operationId && publication.publishedAt < (latest.completedAt ?? latest.updatedAt)))
       ? await this.#savePublication(latest)
@@ -348,6 +364,7 @@ export class VercelPublishService {
       throw new PublishingError("PUBLISH_VERSION_NOT_CURRENT", "Only the site's current saved version can be published. Reload the editor and try again.");
 
     const active = await this.#o.repository.findActive(project.id);
+    if (active && (active.ownerId !== ownerId || active.siteId !== project.id)) throw siteNotFound();
     if (active) {
       const abandoned = !this.#running.has(active.operationId) && !!active.leaseExpiresAt && active.leaseExpiresAt <= this.#now();
       if (!abandoned) {
@@ -360,6 +377,7 @@ export class VercelPublishService {
     // Already live with exactly this version: nothing to deploy again (unless a check found production changed).
     const publication = await this.#o.repository.findPublication(project.id);
     const latest = await this.#o.repository.findLatest(ownerId, project.id);
+    if (publication && (publication.ownerId !== ownerId || publication.siteId !== project.id) || latest && (latest.ownerId !== ownerId || latest.siteId !== project.id)) throw siteNotFound();
     if (!active && publication?.versionId === versionId && latest?.status === "PUBLISHED" && latest.versionId === versionId && !publicationChanged(publication) && !hostingOutdated(publication))
       return this.#view(project, latest, publication);
 
@@ -375,7 +393,17 @@ export class VercelPublishService {
       return this.publish(ownerId, project.id, versionId);
     }
     // No await between this check and the reservation, so admission is atomic within this process.
-    const release = this.#reserve(project.id);
+    let release: () => void;
+    try { release = this.#reserve(project.id); }
+    catch (error) {
+      // An identical admission may have finished inserting since this request's initial read.
+      // Share that operation rather than reporting global capacity for the same deployment.
+      if (error instanceof PublishingError && error.code === "PUBLISH_PREPARATION_BUSY" && !this.#closed) {
+        const winner = await this.#o.repository.findActive(project.id);
+        if (winner?.ownerId === ownerId && winner.siteId === project.id && winner.versionId === versionId) return this.status(ownerId, project.id);
+      }
+      throw error;
+    }
     try {
       return await this.#admit(ownerId, project, versionId, active, latest, publication, preparation);
     } finally {
@@ -448,6 +476,7 @@ export class VercelPublishService {
     // An admission already past its reservation starts its attempt (which stops at its first wait) or gives up.
     await Promise.allSettled([...this.#admissions.values()]);
     await Promise.allSettled([...this.#running.values()]);
+    await this.#reconciling?.catch(() => undefined);
   }
 
   /** A wait that ends early (InterruptedError) when the service shuts down. */
@@ -472,9 +501,14 @@ export class VercelPublishService {
    * returned release is idempotent and must run in a finally block.
    */
   #reserve(siteId: string): () => void {
-    if (this.#closed) throw new PublishingError("PUBLISH_PREPARATION_BUSY", "Publishing is shutting down. Try again shortly.");
-    if (this.#admissions.has(siteId) || this.#running.size + this.#admissions.size >= this.#limits.maxConcurrentPublishes)
+    if (this.#closed) {
+      this.#rejected("CLOSED");
+      throw new PublishingError("PUBLISH_PREPARATION_BUSY", "Publishing is shutting down. Try again shortly.");
+    }
+    if (this.#admissions.has(siteId) || this.#running.size + this.#admissions.size >= this.#limits.maxConcurrentPublishes) {
+      this.#rejected(this.#admissions.has(siteId) ? "DUPLICATE" : "CAPACITY");
       throw new PublishingError("PUBLISH_PREPARATION_BUSY", "Other sites are being published right now. Try again in a minute.");
+    }
     let settle!: () => void;
     const admission = new Promise<void>((resolve) => (settle = resolve));
     this.#admissions.set(siteId, admission);
@@ -482,6 +516,29 @@ export class VercelPublishService {
       if (this.#admissions.get(siteId) === admission) this.#admissions.delete(siteId);
       settle();
     };
+  }
+
+  /** Throttled: at most one event per reason per minute, carrying the count dropped meanwhile. */
+  #rejected(reason: AdmissionRejectReason) {
+    const suppressed = this.#rejections.admit(reason);
+    if (suppressed === undefined) return;
+    emitDiagnostic(this.#diagnostics, {
+      event: "publish_admission_rejected", reason, active: this.#running.size, admitting: this.#admissions.size, maxConcurrent: this.#limits.maxConcurrentPublishes,
+      ...(suppressed ? { suppressed } : {}),
+    });
+  }
+
+  /** One event per finished attempt; ages come from the record's clock, durations from wall time. */
+  #finished(op: PublishOperationRecord, status: string, stage: string, started: number, vercel: VercelRequestStats | undefined, code?: string) {
+    const unconfirmedAgeMs = op.deploymentRequestedAt && !op.deploymentId ? Math.max(0, this.#now().getTime() - op.deploymentRequestedAt.getTime()) : undefined;
+    emitDiagnostic(this.#diagnostics, {
+      event: "publish_finished", operationId: op.operationId, preparationId: op.preparationId, siteId: op.siteId, attempt: op.attempt,
+      status, stage, ...(code ? { code } : {}), durationMs: Date.now() - started,
+      ...(status !== "PUBLISHED" && deploymentMayStillGoLive(op) ? { pendingDeployment: true } : {}),
+      ...(unconfirmedAgeMs !== undefined ? { unconfirmedAgeMs } : {}),
+      ...(vercel ? { vercel } : {}),
+      ...resources(),
+    });
   }
 
   #start(record: PublishOperationRecord) {
@@ -495,6 +552,8 @@ export class VercelPublishService {
     const { operationId, attempt, ownerId, siteId } = initial;
     let op = initial;
     let session: VercelSession | undefined;
+    const started = Date.now();
+    let stats: (() => VercelRequestStats) | undefined;
     const set = async (update: Partial<PublishOperationRecord>, unset: (keyof PublishOperationRecord)[] = []) => {
       const now = this.#now();
       const full = { ...update, updatedAt: now, ...(update.active === false ? {} : { leaseExpiresAt: new Date(now.getTime() + this.#limits.leaseMs) }) };
@@ -515,8 +574,11 @@ export class VercelPublishService {
 
       // An update: the verified publication it replaces stays the live record until the new one is verified.
       const previous = await this.#o.repository.findPublication(siteId);
+      if (previous && (previous.ownerId !== ownerId || previous.siteId !== siteId)) throw siteNotFound();
       const credentials = await this.#credentials(ownerId);
       const accountId = credentials.teamId ?? credentials.vercelUserId;
+      if (prepared.connection.configurationId !== credentials.configurationId || prepared.connection.vercelUserId !== credentials.vercelUserId || prepared.connection.teamId !== credentials.teamId)
+        throw new PublishingError("VERCEL_ACCOUNT_MISMATCH", "The prepared build belongs to a different Vercel connection. Prepare again.");
       if (previous && previous.accountId !== accountId) throw accountMismatchError(previous);
       if (op.accountId && op.accountId !== accountId) throw accountMismatchError({ ...op, accountId: op.accountId });
       // The provider pins a published site to its project: reused, never replaced by a second one.
@@ -525,6 +587,8 @@ export class VercelPublishService {
         throw new PublishingError("VERCEL_ACCOUNT_MISMATCH", "The Vercel project does not belong to the account you authorized. Reconnect Vercel.");
       if (previous && linked.projectId !== previous.projectId)
         throw new PublishingError("VERCEL_PROJECT_UNAVAILABLE", "This website is published to a different Vercel project than the one AI Sites can reach now. Nothing was deployed.");
+      if (prepared.project?.status === "LINKED" && (prepared.project.projectId !== linked.projectId || prepared.project.accountId !== linked.accountId))
+        throw new PublishingError("VERCEL_PROJECT_UNAVAILABLE", "The prepared build belongs to a different Vercel project. Prepare again.");
       if (op.projectId && linked.projectId !== op.projectId)
         throw new PublishingError("VERCEL_PROJECT_UNAVAILABLE", "This publishing attempt belongs to a different Vercel project. Reconnect its original account to check it again.");
       const vercelAuth: VercelAuth = { accessToken: credentials.accessToken, teamId: credentials.teamId };
@@ -534,12 +598,15 @@ export class VercelPublishService {
         budget: this.#limits.requestBudget, readRetries: this.#limits.readRetries, maxRetryAfterMs: this.#limits.maxRetryAfterMs, sleep: (ms) => this.#sleep(ms),
         // A disconnected or replaced connection is never used again by this attempt (checked at most once a second).
         beforeRequest: async () => {
+          if (this.#shutdown.signal.aborted) throw new InterruptedError();
+          if (this.#o.assertConnection) { await this.#o.assertConnection(ownerId, credentials); return; }
           if (!this.#o.connections.isActiveConfiguration || Date.now() - connectionCheckedAt < 1_000) return;
           if (!(await this.#o.connections.isActiveConfiguration(ownerId, credentials.configurationId)))
             throw new PublishingError("VERCEL_NOT_CONNECTED", "The Vercel connection this update started with was disconnected or replaced, so it was stopped. Reconnect Vercel and publish again.");
           connectionCheckedAt = Date.now();
         },
       });
+      stats = api.stats;
       const accountLabel = (await this.#o.connections.activeAccount?.(ownerId))?.displayName;
       const current: VercelSession = { auth: vercelAuth, api };
       session = current;
@@ -568,7 +635,7 @@ export class VercelPublishService {
 
       deployment = await this.#awaitReady(current, run, deployment);
       const origin = await this.#goLive(current, run, deployment, previous);
-      const verification = await (this.#o.verify ?? ((o, a) => verifyPublicDeployment(o, a, { sleep: (ms) => this.#sleep(ms) })))(origin, artifact);
+      const verification = await this.#verify(origin, artifact);
       const checkedAt = this.#now();
       await set({ publicUrl: origin, verification: { checkedAt, checks: verification.checks.slice(0, 20), ...(verification.coverage ? { coverage: verification.coverage } : {}) } });
       if (!verification.ok) {
@@ -586,14 +653,20 @@ export class VercelPublishService {
       await set({ status: "PUBLISHED", active: false, completedAt: this.#now() }, ["leaseExpiresAt", "failure"]);
       await this.#savePublication(op);
       console.info(`[sites][publish] published site=${siteId} version=${op.versionId} deployment=${op.deploymentId}`);
+      this.#finished(op, "PUBLISHED", "DEPLOYING", started, stats?.());
     } catch (error) {
-      if (error instanceof StaleAttemptError) return;
+      const stage = op.status;
+      if (error instanceof StaleAttemptError) {
+        this.#finished(op, "STALE_ATTEMPT", stage, started, stats?.());
+        return;
+      }
       const failure = this.#failure(error);
       // For an update, read back what production serves now; never assume the previous site is still live.
       const observed = this.#shutdown.signal.aborted ? { update: {}, unset: [], known: false } : await this.#observeProduction(session, op);
       const status = this.#outcomeStatus(error, op, observed.known);
       console.warn(`[sites][publish] ${status.toLowerCase()} site=${siteId} version=${op.versionId} code=${failure.code} attempt=${attempt}`);
       await set({ status, active: false, failure, completedAt: this.#now(), ...observed.update }, ["leaseExpiresAt", ...observed.unset]).catch(() => undefined);
+      this.#finished(op, status, stage, started, stats?.(), failure.code);
     }
   }
 
@@ -639,7 +712,11 @@ export class VercelPublishService {
         if (uploaded % 10 === 0 || uploaded === unique.length) await progress(Math.min(files.length, uploaded));
       }
     };
-    await Promise.all(Array.from({ length: Math.min(this.#limits.uploadConcurrency, unique.length) }, worker));
+    // A failed worker must not detach its siblings from the tracked publishing attempt:
+    // shutdown waits for every in-flight upload before disconnecting persistence.
+    const workers = await Promise.allSettled(Array.from({ length: Math.min(this.#limits.uploadConcurrency, unique.length) }, worker));
+    const failed = workers.find(result => result.status === "rejected");
+    if (failed) throw failed.reason;
     await progress(files.length);
   }
 
@@ -1032,6 +1109,9 @@ export class VercelPublishService {
   async #assertCurrentVersion(op: PublishOperationRecord) {
     if (!(await this.#isCurrentVersion(op)))
       throw new PublishingError("PUBLISH_VERSION_NOT_CURRENT", "This website was edited while it was being published, so that older version was not put live. Publish again to publish the latest version.");
+    const { record } = await this.#o.preparations.loadReadyArtifact(op.ownerId, op.preparationId);
+    if (record.siteId !== op.siteId || record.versionId !== op.versionId || record.sourceSha256 !== op.sourceSha256 || record.artifact?.sha256 !== op.artifactSha256)
+      throw new PublishingError("PUBLISH_ARTIFACT_UNAVAILABLE", "The prepared build changed during publishing. Nothing new was deployed.");
   }
 
   async #savePublication(op: PublishOperationRecord): Promise<SitePublicationRecord | undefined> {
@@ -1088,7 +1168,7 @@ export class VercelPublishService {
   async #ownedProject(ownerId: string, siteId: string): Promise<SiteProject> {
     if (typeof ownerId !== "string" || !ownerId) throw Object.assign(new Error("An authenticated owner is required"), { code: "AUTHENTICATION_REQUIRED" });
     const project = await this.#o.projects.getOwnedById(siteId as SiteId, ownerId);
-    if (!project) throw siteNotFound();
+    if (!project || project.id !== siteId || project.ownerId !== ownerId) throw siteNotFound();
     return project;
   }
 
@@ -1102,7 +1182,14 @@ export class VercelPublishService {
    * creates, promotes or rolls back deployments and never retries a create.
    * It also re-checks what live publications' addresses actually serve.
    */
-  async reconcilePass(options: { readonly timeoutMs?: number } = {}): Promise<PublishReconcileSummary> {
+  reconcilePass(options: { readonly timeoutMs?: number } = {}): Promise<PublishReconcileSummary> {
+    if (this.#reconciling) return this.#reconciling;
+    const task = this.#reconcilePass(options); this.#reconciling = task;
+    void task.finally(() => { if (this.#reconciling === task) this.#reconciling = undefined; }).catch(() => undefined);
+    return task;
+  }
+
+  async #reconcilePass(options: { readonly timeoutMs?: number }): Promise<PublishReconcileSummary> {
     const summary: PublishReconcileSummary = {
       enabled: this.reconcileEnabled, operationsChecked: 0, published: 0, failed: 0, cancelled: 0, unverified: 0,
       publicationsChecked: 0, publicationsChanged: 0, requests: 0, truncated: false,
@@ -1110,74 +1197,124 @@ export class VercelPublishService {
     if (!summary.enabled || this.#closed) return summary;
     const limits = this.#reconcileLimits;
     const now = this.#now();
-    const deadline = options.timeoutMs === undefined ? undefined : now.getTime() + options.timeoutMs;
+    const timeoutMs = Math.min(600_000, Math.max(0, Math.floor(options.timeoutMs ?? 120_000)));
+    const deadline = now.getTime() + timeoutMs, wallDeadline = Date.now() + timeoutMs;
+    const signal = AbortSignal.timeout(timeoutMs);
+    const expired = () => signal.aborted || this.#now().getTime() >= deadline || Date.now() >= wallDeadline;
     // Checked before each item (an item in flight is bounded by its request budget and request timeouts).
     const stop = () => {
-      if (this.#closed || (deadline !== undefined && this.#now().getTime() >= deadline)) summary.truncated = true;
+      if (this.#closed || expired()) summary.truncated = true;
       return summary.truncated;
     };
+    // A current item may drain within its deadline; shutdown admits no further items.
+    // Production additionally aborts its deployment transport when closing.
+    const check = () => { if (expired()) { summary.truncated = true; throw new InterruptedError(); } };
     const candidates = await this.#o.repository.findReconcilable({
       now, createdAfter: new Date(now.getTime() - limits.maxAgeMs), maxCount: limits.maxChecksPerOperation, limit: limits.maxOperations,
     });
     for (const candidate of candidates) {
       if (stop()) return summary;
       if (this.#running.has(candidate.operationId)) continue;
-      const claimed = await this.#o.repository.claimReconcile(candidate.operationId, candidate.attempt, now, new Date(now.getTime() + limits.leaseMs));
-      if (!claimed) continue;
+      const claimed = await this.#o.repository.claimReconcile(candidate.operationId, candidate.attempt, this.#now(), new Date(this.#now().getTime() + limits.leaseMs));
+      if (!claimed?.reconcileLeaseToken) continue;
+      const token = claimed.reconcileLeaseToken;
+      const renew = async () => {
+        check();
+        if (!await this.#o.repository.renewReconcile(claimed.operationId, claimed.attempt, token, this.#now(), new Date(this.#now().getTime() + limits.leaseMs))) throw new StaleAttemptError();
+        check();
+      };
       summary.operationsChecked++;
-      const api = this.#reconcileApi(claimed.ownerId, claimed.accountId);
-      const outcome = await this.#reconcileOperation(claimed, api).catch((error: unknown) => {
+      const api = this.#reconcileApi(claimed.ownerId, claimed.accountId, renew);
+      let failure: unknown;
+      const outcome = await this.#reconcileOperation(claimed, api, renew, signal).catch((error: unknown) => {
+        failure = error;
         console.warn("[sites][publish] reconciliation failed", { operationId: claimed.operationId, name: (error as Error)?.name });
         return "UNVERIFIED" as const;
+      }).finally(async () => {
+        if (failure && !this.#closed && !expired()) {
+          const failedAt = this.#now();
+          // Preserve the existing failed-item delay while releasing only this claim's token.
+          await this.#o.repository.updateReconcile(claimed.operationId, claimed.attempt, token, failedAt, {
+            nextReconcileAt: new Date(failedAt.getTime() + limits.leaseMs),
+          }).catch(() => false);
+        }
+        await this.#o.repository.releaseReconcile(claimed.operationId, claimed.attempt, token);
       });
       summary.requests += api.used();
+      const code = errorCode(failure);
+      emitDiagnostic(this.#diagnostics, {
+        event: "reconcile_item", operationId: claimed.operationId, attempt: claimed.attempt, outcome,
+        checks: (claimed.reconcileCount ?? 0) + 1, ageMs: Math.max(0, now.getTime() - claimed.createdAt.getTime()),
+        ...(claimed.deploymentRequestedAt && !claimed.deploymentId ? { unconfirmedAgeMs: Math.max(0, now.getTime() - claimed.deploymentRequestedAt.getTime()) } : {}),
+        ...(code ? { code } : failure ? { error: (failure as Error)?.name ?? "Error" } : {}),
+        vercel: api.stats(),
+      });
       if (outcome === "PUBLISHED") summary.published++;
       else if (outcome === "FAILED") summary.failed++;
       else if (outcome === "CANCELLED") summary.cancelled++;
       else summary.unverified++;
     }
+    if (stop()) return summary;
     for (const publication of await this.#o.repository.findPublicationsToCheck(new Date(now.getTime() - limits.publicationCheckIntervalMs), limits.maxPublications)) {
       if (stop()) return summary;
-      const api = this.#reconcileApi(publication.ownerId, publication.accountId);
+      const token = await this.#o.repository.claimPublicationCheck(publication.siteId, publication.operationId, this.#now(), new Date(this.#now().getTime() + limits.leaseMs), new Date(now.getTime() - limits.publicationCheckIntervalMs));
+      if (!token) continue;
+      const renew = async () => {
+        check();
+        if (!await this.#o.repository.renewPublicationCheck(publication.siteId, publication.operationId, token, this.#now(), new Date(this.#now().getTime() + limits.leaseMs))) throw new StaleAttemptError();
+        check();
+      };
+      const api = this.#reconcileApi(publication.ownerId, publication.accountId, renew);
       try {
+        await renew(); await this.#ownedProject(publication.ownerId, publication.siteId); await renew();
         const credentials = await this.#credentials(publication.ownerId);
         // Another connected account can't see this project's aliases: its view is not a production change.
         if (publication.accountId !== (credentials.teamId ?? credentials.vercelUserId)) continue;
         const host = hostOf(publication.publicUrl);
         if (!host) continue;
         const observed = (await api.getAliasDeploymentId({ accessToken: credentials.accessToken, teamId: credentials.teamId }, host, publication.projectId)) ?? null;
-        await this.#assertReconcileConnection(publication.ownerId, publication.accountId, { accessToken: credentials.accessToken, teamId: credentials.teamId });
-        await this.#o.repository.recordPublicationCheck(publication.siteId, publication.operationId, { checkedAt: now, observedDeploymentId: observed });
+        await renew(); await this.#assertReconcileConnection(publication.ownerId, publication.accountId, { accessToken: credentials.accessToken, teamId: credentials.teamId });
+        await renew();
+        if (!await this.#o.repository.recordPublicationCheck(publication.siteId, publication.operationId, { checkedAt: this.#now(), observedDeploymentId: observed }, { token, now: this.#now() })) continue;
         summary.publicationsChecked++;
         if (observed !== publication.deploymentId) {
           summary.publicationsChanged++;
           console.warn(`[sites][publish] production changed outside AI Sites site=${publication.siteId} expected=${publication.deploymentId} observed=${observed ?? "none"}`);
         }
-      } catch {
+      } catch (error) {
         // Not checkable now (credentials, Vercel unavailable): left for the next pass.
+        const code = errorCode(error);
+        emitDiagnostic(this.#diagnostics, {
+          event: "reconcile_publication_unchecked", siteId: publication.siteId, operationId: publication.operationId,
+          ...(code ? { code } : { error: (error as Error)?.name ?? "Error" }),
+        });
       } finally {
         summary.requests += api.used();
+        await this.#o.repository.releasePublicationCheck(publication.siteId, publication.operationId, token);
       }
     }
     return summary;
   }
 
-  #reconcileApi(ownerId: string, accountId: string | undefined) {
+  #reconcileApi(ownerId: string, accountId: string | undefined, renew: () => Promise<void>) {
     return guardVercelDeployments(this.#o.deployments, {
       budget: this.#reconcileLimits.requestsPerItem, readRetries: 0, maxRetryAfterMs: 0, sleep: (ms) => this.#sleep(ms),
-      beforeRequest: (auth) => this.#assertReconcileConnection(ownerId, accountId, auth),
+      beforeRequest: async auth => { await renew(); await this.#assertReconcileConnection(ownerId, accountId, auth); await renew(); },
       checkCancellation: true,
     });
   }
 
   /** Pin an item's requests and observations to the connection it started with, including cancellation. */
   async #assertReconcileConnection(ownerId: string, accountId: string | undefined, auth: VercelAuth) {
+    this.#o.shutdownSignal?.throwIfAborted();
     const credentials = await this.#credentials(ownerId);
+    this.#o.shutdownSignal?.throwIfAborted();
     if (!accountId || accountId !== (credentials.teamId ?? credentials.vercelUserId) || credentials.teamId !== auth.teamId || credentials.accessToken !== auth.accessToken)
       throw new PublishingError("VERCEL_ACCOUNT_MISMATCH", "The Vercel connection changed while this publishing outcome was being checked. Reconnect the original account to check again.");
   }
 
-  async #reconcileOperation(op: PublishOperationRecord, api: VercelDeploymentsClient): Promise<"PUBLISHED" | "FAILED" | "CANCELLED" | "UNVERIFIED"> {
+  async #reconcileOperation(op: PublishOperationRecord, api: VercelDeploymentsClient, renew: () => Promise<void>, signal: AbortSignal): Promise<"PUBLISHED" | "FAILED" | "CANCELLED" | "UNVERIFIED"> {
+    await renew(); await this.#ownedProject(op.ownerId, op.siteId);
     const limits = this.#reconcileLimits;
     const now = this.#now();
     const count = (op.reconcileCount ?? 0) + 1;
@@ -1185,8 +1322,11 @@ export class VercelPublishService {
     // Fenced by attempt: if a publish request resumed the operation meanwhile, nothing is written.
     let session: VercelSession | undefined;
     const write = async (update: Partial<PublishOperationRecord>, unset: (keyof PublishOperationRecord)[] = []) => {
+      await renew();
       if (session) await this.#assertReconcileConnection(op.ownerId, op.accountId, session.auth);
-      return this.#o.repository.update(op.operationId, op.attempt, { ...bookkeeping, ...update, updatedAt: now }, [...unset, "reconcileLeaseExpiresAt"]);
+      await renew();
+      if (!await this.#o.repository.updateReconcile(op.operationId, op.attempt, op.reconcileLeaseToken!, this.#now(), { ...bookkeeping, ...update, updatedAt: this.#now() }, unset)) throw new StaleAttemptError();
+      return true;
     };
     // An abandoned in-progress attempt is only observed; its status belongs to whoever resumes it.
     const settle = async (update: Partial<PublishOperationRecord>, unset: (keyof PublishOperationRecord)[] = []) =>
@@ -1202,6 +1342,7 @@ export class VercelPublishService {
       return "UNVERIFIED";
     }
     try {
+      await renew();
       const credentials = await this.#credentials(op.ownerId);
       if (op.accountId !== (credentials.teamId ?? credentials.vercelUserId)) {
         await write({});
@@ -1244,7 +1385,9 @@ export class VercelPublishService {
     }
     if (deployment.readyState !== "READY") {
       // Still building: a version the user has replaced must not go live late.
-      if (!(await this.#isCurrentVersion(op)) && (await api.cancelDeployment(auth, deployment.id).catch(() => "UNKNOWN")) === "CANCELED") {
+      const project = await this.#ownedProject(op.ownerId, op.siteId);
+      if (!project.latestVersionId) { await write(observed); return "UNVERIFIED"; }
+      if (project.latestVersionId !== op.versionId && (await api.cancelDeployment(auth, deployment.id).catch(() => "UNKNOWN")) === "CANCELED") {
         await settle({ ...observed, deploymentState: "CANCELED", cancelRequestedAt: now, status: "FAILED", completedAt: now, failure: { code: "PUBLISH_VERSION_NOT_CURRENT", message: "This website was edited after this update started, so the unfinished older version was stopped before going live.", retryable: false } });
         return "CANCELLED";
       }
@@ -1276,87 +1419,34 @@ export class VercelPublishService {
       await write({ ...observed, publicUrl: origin });
       return "UNVERIFIED";
     }
-    const verification = await (this.#o.verify ?? ((o, a) => verifyPublicDeployment(o, a, { sleep: (ms) => this.#sleep(ms) })))(origin, artifact);
+    const verification = await this.#verify(origin, artifact, renew, signal);
     const checks = { checkedAt: now, checks: verification.checks.slice(0, 20) };
     if (!verification.ok) {
       await write({ ...observed, publicUrl: origin, verification: checks });
       return "UNVERIFIED";
     }
+    if ((await this.#ownedProject(op.ownerId, op.siteId)).latestVersionId !== op.versionId || await api.getAliasDeploymentId(auth, hostOf(origin)!, op.projectId) !== deployment.id) {
+      await write(observed); return "UNVERIFIED";
+    }
     if (!(await write({ ...observed, publicUrl: origin, verification: checks, status: "PUBLISHED", completedAt: now }, ["failure"]))) return "UNVERIFIED";
+    await renew();
     await this.#savePublication({ ...op, ...observed, deploymentId: deployment.id, publicUrl: origin, status: "PUBLISHED", completedAt: now });
     console.info(`[sites][publish] reconciled late publication site=${op.siteId} version=${op.versionId} deployment=${deployment.id}`);
     return "PUBLISHED";
   }
 
-  #view(project: SiteProject, latest: PublishOperationRecord | undefined, publication: SitePublicationRecord | undefined, connected?: { readonly accountId: string }): VercelPublishView {
-    const now = this.#now();
-    let operation = latest;
-    // A crashed server's attempt: its lease lapsed and nothing here is running it.
-    if (operation?.active && IN_PROGRESS_STATUSES.includes(operation.status) && operation.leaseExpiresAt && operation.leaseExpiresAt <= now && !this.#running.has(operation.operationId))
-      operation = { ...operation, status: "VERIFICATION_INCONCLUSIVE", failure: { code: "PUBLISH_INTERRUPTED", message: "Publishing was interrupted. Publish again; AI Sites checks Vercel before deploying again.", retryable: true } };
-    const history = publication?.history ?? [];
-    const before = history.length >= 2 && history.at(-1)?.operationId === publication?.operationId ? history.at(-2) : undefined;
-    const published = publication
-      ? {
-          url: publication.publicUrl,
-          versionId: publication.versionId,
-          versionNumber: publication.versionNumber,
-          deploymentId: publication.deploymentId,
-          publishedAt: publication.publishedAt.toISOString(),
-          isCurrentVersion: publication.versionId === project.latestVersionId,
-          urlChanged: !!before && before.publicUrl !== publication.publicUrl,
-          // Verified when published; CHANGED once a later check found the address serving another deployment.
-          liveState: publicationChanged(publication) ? ("CHANGED" as const) : ("VERIFIED" as const),
-          checkedAt: (publication.checkedAt ?? publication.publishedAt).toISOString(),
-          // Which kind of account updates need; its name only when Vercel reported one. No IDs.
-          account: { type: publication.accountId.startsWith("team_") ? ("team" as const) : ("personal" as const), ...(publication.accountLabel ? { label: publication.accountLabel } : {}) },
-          // Republishing (even the same version) regenerates its hosting configuration.
-          ...(hostingOutdated(publication) ? { hostingOutdated: true as const } : {}),
-          // Known only while a connection exists: false means updates need the account this site was published with.
-          ...(connected ? { connectedAccountMatches: connected.accountId === publication.accountId } : {}),
-        }
-      : undefined;
-    // An unverified attempt started after the live publication is an update of it.
-    const liveImpact = operation && publication && operation.status !== "PUBLISHED" && operation.createdAt > publication.publishedAt
-      ? this.#liveImpact(operation, publication, operation !== latest)
-      : undefined;
-    // An active attempt, or a finished one newer than the live publication, describes the site;
-    // otherwise the last verified publication does. A failed attempt never hides `published`.
-    const newerThanPublication = !!operation && (!publication || operation.createdAt > publication.publishedAt);
-    const status: PublishStatus = operation && (operation.active || newerThanPublication)
-      ? operation.status
-      : published ? "PUBLISHED" : "NOT_PUBLISHED";
-    return {
-      liveEnabled: this.#liveEnabled,
-      status,
-      draft: { versionId: project.latestVersionId ?? null, hasUnpublishedChanges: !!publication && publication.versionId !== project.latestVersionId },
-      ...(published ? { published } : {}),
-      ...(operation
-        ? {
-            operation: {
-              operationId: operation.operationId,
-              versionId: operation.versionId,
-              status: operation.status,
-              attempt: operation.attempt,
-              ...(operation.progress ? { progress: operation.progress } : {}),
-              ...(operation.status === "PUBLISHED" && operation.publicUrl ? { publicUrl: operation.publicUrl } : {}),
-              ...(operation.failure ? { failure: { code: operation.failure.code, message: operation.failure.message, retryable: operation.failure.retryable } } : {}),
-              ...(liveImpact ? { liveImpact } : {}),
-              // Vercel may still finish this deployment and assign it to production on its own.
-              ...(operation.status !== "PUBLISHED" && deploymentMayStillGoLive(operation) ? { pendingDeployment: true } : {}),
-              updatedAt: operation.updatedAt.toISOString(),
-            },
-          }
-        : {}),
-    };
+  async #verify(origin: string, artifact: PreparedArtifactDocument, guard: () => Promise<void> = () => { if (this.#closed) throw new InterruptedError(); return Promise.resolve(); }, signal: AbortSignal = this.#shutdown.signal) {
+    const verificationSignal = this.#o.shutdownSignal ? AbortSignal.any([signal, this.#o.shutdownSignal]) : signal;
+    await guard();
+    verificationSignal.throwIfAborted();
+    const result = this.#o.verify ? await this.#o.verify(origin, artifact) : await verifyPublicDeployment(origin, artifact, {
+      signal: verificationSignal, sleep: ms => this.#sleep(ms), fetchImpl: async (input, init) => { await guard(); verificationSignal.throwIfAborted(); return globalThis.fetch(input, init); },
+    });
+    await guard(); verificationSignal.throwIfAborted(); return result;
   }
 
-  #liveImpact(operation: PublishOperationRecord, publication: SitePublicationRecord, interrupted: boolean): LiveImpact {
-    if (!operation.deploymentRequestedAt && !operation.deploymentId) return "UNCHANGED";
-    // An interrupted attempt's last observation may be outdated.
-    if (interrupted || !operation.productionDeploymentId) return "UNKNOWN";
-    if (operation.productionDeploymentId === publication.deploymentId) return operation.rollbackRequestedAt ? "PREVIOUS_RESTORED" : "PREVIOUS_LIVE";
-    if (operation.productionDeploymentId === operation.deploymentId) return "NEW_UNVERIFIED";
-    return "UNKNOWN";
+  #view(project: SiteProject, latest: PublishOperationRecord | undefined, publication: SitePublicationRecord | undefined, connected?: { readonly accountId: string }): VercelPublishView {
+    return publicationStatusView(project, latest, publication, connected, { now: this.#now(), liveEnabled: this.#liveEnabled, hostingConfigVersion: HOSTING_CONFIG_VERSION, isRunning: id => this.#running.has(id) });
   }
 }
+import { publicationStatusView, deploymentMayStillGoLive as pendingDeployment } from "./publishing-status-views.js";

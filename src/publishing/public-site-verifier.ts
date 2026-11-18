@@ -35,6 +35,7 @@ export interface PublicVerificationResult {
 export const SYNTHETIC_DEEP_LINKS = ["/__ai-sites-verify/deep/link", "/__ai-sites-verify/a/b/c/d/"];
 export const MISSING_ASSET_PROBE = "/assets/__ai-sites-verify-missing.js";
 export interface PublicVerifierOptions {
+  readonly signal?: AbortSignal;
   readonly fetchImpl?: typeof fetch;
   readonly attempts?: number;
   readonly delayMs?: number;
@@ -114,14 +115,16 @@ export async function verifyPublicDeployment(
 
   let last: PublicVerificationResult = { ok: false, reason: "UNREACHABLE", checks: [] };
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    options.signal?.throwIfAborted();
     const checks: PublicCheck[] = [];
     let reason: PublicVerificationResult["reason"];
     for (const target of targets) {
+      options.signal?.throwIfAborted();
       try {
         const response = await fetchImpl(`${origin}${target.path}`, {
           redirect: "manual",
           headers: { "cache-control": "no-cache" },
-          signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
+          signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs ?? 10_000)]) : AbortSignal.timeout(options.timeoutMs ?? 10_000),
         });
         if (response.status === 401 || response.status === 403) {
           checks.push({ path: target.path, kind: target.kind, ok: false, detail: `HTTP ${response.status}` });

@@ -1,4 +1,7 @@
 import { Schema, type Connection, type Model } from "mongoose";
+import { randomUUID } from "node:crypto";
+import { IN_PROGRESS_STATUSES, SETTLED_DEPLOYMENT_STATES } from "./publishing-status-views.js";
+export { IN_PROGRESS_STATUSES, SETTLED_DEPLOYMENT_STATES } from "./publishing-status-views.js";
 
 /**
  * Live publishing state. An operation is one attempt to publish one exact
@@ -9,7 +12,6 @@ import { Schema, type Connection, type Model } from "mongoose";
  * or overwrites the site that is already live.
  */
 export type PublishOperationStatus = "PREPARING" | "UPLOADING" | "DEPLOYING" | "PUBLISHED" | "FAILED" | "VERIFICATION_INCONCLUSIVE";
-export const IN_PROGRESS_STATUSES: readonly PublishOperationStatus[] = ["PREPARING", "UPLOADING", "DEPLOYING"];
 
 export interface PublishOperationRecord {
   readonly operationId: string;
@@ -54,6 +56,7 @@ export interface PublishOperationRecord {
   readonly reconcileCount?: number;
   readonly nextReconcileAt?: Date;
   readonly reconcileLeaseExpiresAt?: Date;
+  readonly reconcileLeaseToken?: string;
   readonly reconciledAt?: Date;
   readonly verification?: {
     readonly checkedAt: Date;
@@ -78,6 +81,8 @@ export interface PublicationHistoryEntry {
   readonly publishedAt: Date;
 }
 export const PUBLICATION_HISTORY_LIMIT = 20;
+export const PUBLISH_OPERATIONS_COLLECTION = "sites_publish_operations";
+export const SITE_PUBLICATIONS_COLLECTION = "sites_site_publications";
 export const historyEntryOf = (record: SitePublicationRecord): PublicationHistoryEntry => ({
   operationId: record.operationId, versionId: record.versionId, versionNumber: record.versionNumber,
   deploymentId: record.deploymentId, publicUrl: record.publicUrl, publishedAt: record.publishedAt,
@@ -108,10 +113,11 @@ export interface SitePublicationRecord {
   /** Last time reconciliation read what the public hostname serves, and what it found (null: nothing). */
   readonly checkedAt?: Date;
   readonly observedDeploymentId?: string | null;
+  readonly reconcileLeaseExpiresAt?: Date;
+  readonly reconcileLeaseToken?: string;
 }
 
 /** Deployment states after which a deployment can no longer go live by itself. */
-export const SETTLED_DEPLOYMENT_STATES: readonly string[] = ["READY", "ERROR", "CANCELED", "DELETED", "BLOCKED"];
 
 type OperationUpdate =Partial<Omit<PublishOperationRecord, "operationId" | "ownerId" | "siteId" | "createdAt">>;
 
@@ -139,10 +145,16 @@ export interface VercelPublishRepository {
   findReconcilable(input: { readonly now: Date; readonly createdAfter: Date; readonly maxCount: number; readonly limit: number }): Promise<readonly PublishOperationRecord[]>;
   /** Takes the reconciliation lease of one attempt; undefined when another reconciler holds it or the attempt changed. */
   claimReconcile(operationId: string, attempt: number, now: Date, leaseExpiresAt: Date): Promise<PublishOperationRecord | undefined>;
+  renewReconcile(operationId: string, attempt: number, token: string, now: Date, expires: Date): Promise<boolean>;
+  updateReconcile(operationId: string, attempt: number, token: string, now: Date, update: OperationUpdate, unset?: readonly (keyof PublishOperationRecord)[]): Promise<boolean>;
+  releaseReconcile(operationId: string, attempt: number, token: string): Promise<void>;
   /** Publications not checked since `checkedBefore` (oldest first). */
   findPublicationsToCheck(checkedBefore: Date, limit: number): Promise<readonly SitePublicationRecord[]>;
   /** Records what the public hostname serves, only while this publication is still the site's current one. */
-  recordPublicationCheck(siteId: string, operationId: string, check: { readonly checkedAt: Date; readonly observedDeploymentId: string | null }): Promise<void>;
+  claimPublicationCheck(siteId: string, operationId: string, now: Date, expires: Date, checkedBefore?: Date): Promise<string | undefined>;
+  renewPublicationCheck(siteId: string, operationId: string, token: string, now: Date, expires: Date): Promise<boolean>;
+  recordPublicationCheck(siteId: string, operationId: string, check: { readonly checkedAt: Date; readonly observedDeploymentId: string | null }, lease: { readonly token: string; readonly now: Date }): Promise<boolean>;
+  releasePublicationCheck(siteId: string, operationId: string, token: string): Promise<void>;
 }
 
 const operationSchema = new Schema<PublishOperationRecord>(
@@ -182,6 +194,7 @@ const operationSchema = new Schema<PublishOperationRecord>(
     reconcileCount: Number,
     nextReconcileAt: Date,
     reconcileLeaseExpiresAt: Date,
+    reconcileLeaseToken: String,
     reconciledAt: Date,
     verification: { type: Schema.Types.Mixed, required: false },
     failure: {
@@ -192,7 +205,7 @@ const operationSchema = new Schema<PublishOperationRecord>(
     updatedAt: { type: Date, required: true },
     completedAt: Date,
   },
-  { collection: "sites_publish_operations", versionKey: false, strict: "throw" },
+  { collection: PUBLISH_OPERATIONS_COLLECTION, versionKey: false, strict: "throw" },
 );
 // One active publish operation per site, enforced by MongoDB.
 operationSchema.index({ siteId: 1 }, { unique: true, partialFilterExpression: { active: true }, name: "one_active_publish_per_site" });
@@ -236,8 +249,10 @@ const publicationSchema = new Schema<SitePublicationRecord>(
     },
     checkedAt: Date,
     observedDeploymentId: { type: String, required: false },
+    reconcileLeaseExpiresAt: Date,
+    reconcileLeaseToken: String,
   },
-  { collection: "sites_site_publications", versionKey: false, strict: "throw" },
+  { collection: SITE_PUBLICATIONS_COLLECTION, versionKey: false, strict: "throw" },
 );
 
 export const createVercelPublishModels = (connection: Connection) => ({
@@ -255,6 +270,9 @@ export class MongoVercelPublishRepository implements VercelPublishRepository {
   readonly #models: ReturnType<typeof createVercelPublishModels>;
   constructor(connection: Connection) {
     this.#models = createVercelPublishModels(connection);
+  }
+  async ready(): Promise<void> {
+    await Promise.all([this.#models.operations.createIndexes(), this.#models.publications.createIndexes()]);
   }
   async insertActive(record: PublishOperationRecord) {
     try {
@@ -285,7 +303,7 @@ export class MongoVercelPublishRepository implements VercelPublishRepository {
                 { status: { $in: IN_PROGRESS_STATUSES }, leaseExpiresAt: { $lte: input.now } },
               ],
             },
-            { $set: { active: true, leaseExpiresAt: input.leaseExpiresAt, updatedAt: input.now }, $inc: { attempt: 1 }, $unset: { failure: 1, completedAt: 1 } },
+            { $set: { active: true, leaseExpiresAt: input.leaseExpiresAt, updatedAt: input.now }, $inc: { attempt: 1 }, $unset: { failure: 1, completedAt: 1, reconcileLeaseToken: 1, reconcileLeaseExpiresAt: 1 } },
             { new: true },
           )
           .lean()
@@ -301,7 +319,7 @@ export class MongoVercelPublishRepository implements VercelPublishRepository {
     const result = await this.#models.operations
       .updateOne(
         { operationId, attempt },
-        { $set: update, ...(unset.length ? { $unset: Object.fromEntries(unset.map((key) => [key, 1])) } : {}) },
+        { $set: update, $unset: { reconcileLeaseToken: 1, reconcileLeaseExpiresAt: 1, ...Object.fromEntries(unset.map((key) => [key, 1])) } },
       )
       .exec();
     return result.modifiedCount === 1;
@@ -319,7 +337,7 @@ export class MongoVercelPublishRepository implements VercelPublishRepository {
         .updateOne(
           { siteId, $or: [{ publishedAt: { $lt: record.publishedAt } }, { operationId: record.operationId }] },
           // A new publication starts unchecked: an older drift observation never carries over.
-          { $set: fields, $setOnInsert: { siteId }, $unset: { ...("checkedAt" in fields ? {} : { checkedAt: 1, observedDeploymentId: 1 }), ...("accountLabel" in fields ? {} : { accountLabel: 1 }), ...("hostingVersion" in fields ? {} : { hostingVersion: 1 }) } },
+          { $set: fields, $setOnInsert: { siteId }, $unset: { reconcileLeaseToken: 1, reconcileLeaseExpiresAt: 1, ...("checkedAt" in fields ? {} : { checkedAt: 1, observedDeploymentId: 1 }), ...("accountLabel" in fields ? {} : { accountLabel: 1 }), ...("hostingVersion" in fields ? {} : { hostingVersion: 1 }) } },
           { upsert: true },
         )
         .exec();
@@ -375,13 +393,29 @@ export class MongoVercelPublishRepository implements VercelPublishRepository {
     return (
       (await this.#models.operations
         .findOneAndUpdate(
-          { operationId, attempt, $or: [{ reconcileLeaseExpiresAt: { $exists: false } }, { reconcileLeaseExpiresAt: { $lte: now } }] },
-          { $set: { reconcileLeaseExpiresAt: leaseExpiresAt } },
+          { operationId, attempt, $and: [
+            { $or: [{ status: "VERIFICATION_INCONCLUSIVE" }, { active: true, leaseExpiresAt: { $lte: now } }] },
+            { $or: [{ nextReconcileAt: { $exists: false } }, { nextReconcileAt: { $lte: now } }] },
+            { $or: [{ reconcileLeaseExpiresAt: { $exists: false } }, { reconcileLeaseExpiresAt: { $lte: now } }] },
+          ] },
+          { $set: { reconcileLeaseExpiresAt: leaseExpiresAt, reconcileLeaseToken: randomUUID() } },
           { new: true },
         )
         .lean()
         .exec()) ?? undefined
     );
+  }
+  async renewReconcile(operationId: string, attempt: number, token: string, now: Date, expires: Date) {
+    const result = await this.#models.operations.updateOne({ operationId, attempt, reconcileLeaseToken: token, reconcileLeaseExpiresAt: { $gt: now } }, { $set: { reconcileLeaseExpiresAt: expires } }).exec();
+    return result.matchedCount === 1;
+  }
+  async updateReconcile(operationId: string, attempt: number, token: string, now: Date, update: OperationUpdate, unset: readonly (keyof PublishOperationRecord)[] = []) {
+    const result = await this.#models.operations.updateOne({ operationId, attempt, reconcileLeaseToken: token, reconcileLeaseExpiresAt: { $gt: now } },
+      { $set: update, ...(unset.length ? { $unset: Object.fromEntries(unset.map(key => [key, 1])) } : {}) }).exec();
+    return result.matchedCount === 1;
+  }
+  async releaseReconcile(operationId: string, attempt: number, token: string) {
+    await this.#models.operations.updateOne({ operationId, attempt, reconcileLeaseToken: token }, { $unset: { reconcileLeaseToken: 1, reconcileLeaseExpiresAt: 1 } }).exec();
   }
   async findPublicationsToCheck(checkedBefore: Date, limit: number) {
     return this.#models.publications
@@ -391,7 +425,23 @@ export class MongoVercelPublishRepository implements VercelPublishRepository {
       .lean()
       .exec();
   }
-  async recordPublicationCheck(siteId: string, operationId: string, check: { readonly checkedAt: Date; readonly observedDeploymentId: string | null }) {
-    await this.#models.publications.updateOne({ siteId, operationId }, { $set: check }).exec();
+  async claimPublicationCheck(siteId: string, operationId: string, now: Date, expires: Date, checkedBefore?: Date) {
+    const token = randomUUID();
+    const result = await this.#models.publications.updateOne({ siteId, operationId, $and: [
+      { $or: [{ reconcileLeaseExpiresAt: { $exists: false } }, { reconcileLeaseExpiresAt: { $lte: now } }] },
+      ...(checkedBefore ? [{ $or: [{ checkedAt: { $exists: false } }, { checkedAt: { $lte: checkedBefore } }] }] : []),
+    ] }, { $set: { reconcileLeaseToken: token, reconcileLeaseExpiresAt: expires } }).exec();
+    return result.matchedCount === 1 ? token : undefined;
+  }
+  async renewPublicationCheck(siteId: string, operationId: string, token: string, now: Date, expires: Date) {
+    const result = await this.#models.publications.updateOne({ siteId, operationId, reconcileLeaseToken: token, reconcileLeaseExpiresAt: { $gt: now } }, { $set: { reconcileLeaseExpiresAt: expires } }).exec();
+    return result.matchedCount === 1;
+  }
+  async recordPublicationCheck(siteId: string, operationId: string, check: { readonly checkedAt: Date; readonly observedDeploymentId: string | null }, lease: { readonly token: string; readonly now: Date }) {
+    const result = await this.#models.publications.updateOne({ siteId, operationId, reconcileLeaseToken: lease.token, reconcileLeaseExpiresAt: { $gt: lease.now } }, { $set: check }).exec();
+    return result.matchedCount === 1;
+  }
+  async releasePublicationCheck(siteId: string, operationId: string, token: string) {
+    await this.#models.publications.updateOne({ siteId, operationId, reconcileLeaseToken: token }, { $unset: { reconcileLeaseToken: 1, reconcileLeaseExpiresAt: 1 } }).exec();
   }
 }

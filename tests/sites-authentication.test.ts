@@ -1,11 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import jwt from "jsonwebtoken";
 import mongoose, { Types } from "mongoose";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAuthUser, type AuthenticatedRequest } from "../src/auth/auth-user.js";
 import {
   MongoIdentityRepository,
@@ -46,9 +46,10 @@ afterEach(async () => {
 // Group A — token authentication (GetChatly authUser parity)
 // ---------------------------------------------------------------------------
 
-const invoke = async (middleware: ReturnType<typeof createAuthUser>, authorization?: string) => {
+const invoke = async (middleware: ReturnType<typeof createAuthUser>, authorization?: string, rawHeaders?: string[]) => {
   const req = {
     headers: authorization === undefined ? {} : { authorization },
+    ...(rawHeaders === undefined ? {} : { rawHeaders }),
   } as AuthenticatedRequest;
   const response: { status?: number; body?: unknown; ended?: boolean } = {};
   const res = {
@@ -128,7 +129,7 @@ describe("authUser token authentication", () => {
       });
       expect(result.next).not.toHaveBeenCalled();
     }
-    // GetChatly slices positionally, so a raw token loses its first 7 characters.
+    // An unprefixed token is not a Bearer credential.
     const raw = await invoke(testAuthUser(identities), valid);
     expect(raw.body).toEqual({ message: "Invalid Authorization. Access Denied", status: false });
   });
@@ -156,7 +157,7 @@ describe("authUser token authentication", () => {
   });
 
   it("A6 rejects a token without a userId claim", async () => {
-    const token = jwt.sign({ type: "user" }, TEST_JWT_KEY);
+    const token = jwt.sign({ type: "user" }, TEST_JWT_KEY, { expiresIn: "30d" });
     const result = await invoke(testAuthUser(new FakeIdentityRepository()), `Bearer ${token}`);
     expect(result.status).toBe(401);
     expect(result.body).toEqual({ message: "Authentication Failed!", status: false });
@@ -217,6 +218,90 @@ describe("authUser token authentication", () => {
     expect(result.status).toBe(500);
     expect(result.body).toEqual({ message: "Internal Server Error", status: false });
     expect(result.next).not.toHaveBeenCalled();
+  });
+});
+
+describe("issuer-compatible JWT and Bearer hardening", () => {
+  const now = 2_000_000_000;
+  let identities: FakeIdentityRepository;
+  let user: ReturnType<FakeIdentityRepository["addUser"]>;
+  beforeEach(() => {
+    vi.spyOn(Date, "now").mockReturnValue(now * 1000);
+    identities = new FakeIdentityRepository(); user = identities.addUser();
+  });
+  const signRaw = (payload: string) => {
+    const input = `${Buffer.from('{"alg":"HS256","typ":"JWT"}').toString("base64url")}.${Buffer.from(payload).toString("base64url")}`;
+    return `${input}.${createHmac("sha256", TEST_JWT_KEY).update(input).digest("base64url")}`;
+  };
+  const invalid = async (header: string, raw?: string[]) => {
+    const verify = vi.spyOn(jwt, "verify"), lookup = vi.spyOn(identities, "findAdmin");
+    const result = await invoke(testAuthUser(identities), header, raw);
+    expect(result.status).toBe(401); expect(result.next).not.toHaveBeenCalled();
+    expect(verify).not.toHaveBeenCalled(); expect(lookup).not.toHaveBeenCalled();
+  };
+
+  it.each(["30d", "30m", "5m", "365d"] as const)("accepts issuer lifetime %s without new issuer/audience or age rules", async lifetime => {
+    const account = lifetime === "30m" ? identities.addAdmin() : user;
+    const token = jwt.sign({ userId: account.id, type: "user" }, TEST_JWT_KEY, { algorithm: "HS256", expiresIn: lifetime });
+    const result = await invoke(testAuthUser(identities), `Bearer ${token}`);
+    expect(result.next).toHaveBeenCalledOnce(); expect(result.req.user).toBe(account); expect(ownerIdOf(result.req)).toBe(account.id);
+  });
+  it.each(["Bearer $TOKEN", "bearer $TOKEN", "BEARER $TOKEN", "bEaReR   $TOKEN", " \tBearer $TOKEN\t "])("accepts unambiguous HTTP whitespace/scheme %j", async template => {
+    const token = tokenFor(user.id), header = template.replace("$TOKEN", token);
+    const result = await invoke(testAuthUser(identities), header, ["Host", "offline", "aUtHoRiZaTiOn", header]);
+    expect(result.next).toHaveBeenCalledOnce(); expect(result.req.user).toBe(user);
+  });
+  it.each(["Basic $TOKEN", "xxxxxxx$TOKEN", "$TOKEN", "Bearer\t$TOKEN", "Bearer\n$TOKEN", "Bearer $TOKEN extra", "Bearer $TOKEN,$TOKEN", "Bearer $TOKEN, Basic other", "Bearer $TOKEN\n", "Bearer $TOKEN\r\n", "Bearer $TOKEN\v", "Bearer $TOKEN\u00a0", "Bearer $TOKEN\tother"])("rejects malformed credentials before verification %j", async template => {
+    await invalid(template.replaceAll("$TOKEN", tokenFor(user.id)));
+  });
+  it.each(["identical", "conflicting", "invalid-first"])("rejects %s raw Authorization fields despite normalized headers", async state => {
+    const header = `Bearer ${tokenFor(user.id)}`;
+    await invalid(header, ["Authorization", state === "invalid-first" ? "Basic invalid" : header, "authorization", state === "identical" ? header : "Bearer other"]);
+  });
+  it.each([{ raw: [] }, { raw: ["Authorization"] }, { raw: ["Authorization", "Bearer conflicting"] }])("rejects inconsistent raw header metadata %#", async ({ raw }) => { await invalid(`Bearer ${tokenFor(user.id)}`, raw); });
+  it("rejects header arrays and joined credentials without attempting verification", async () => {
+    const header = `Bearer ${tokenFor(user.id)}`;
+    await invalid([header, header] as unknown as string); await invalid(`${header}, ${header}`);
+  });
+  it.each([undefined, '"123"', "null", "true", "[]", "{}", '"NaN"', '"Infinity"', "NaN", "Infinity", "1e309", "-1e309"])("rejects missing/non-finite/non-numeric exp %# with sanitized errors", async exp => {
+    const token = signRaw(`{"userId":"${user.id}","type":"user","iat":${now}${exp === undefined ? "" : `,"exp":${exp}`}}`);
+    const lookup = vi.spyOn(identities, "findAdmin"), result = await invoke(testAuthUser(identities), `Bearer ${token}`);
+    expect(result.status).toBe(401); expect(result.body).toEqual({ message: "Invalid Authorization. Access Denied", status: false });
+    expect(result.next).not.toHaveBeenCalled(); expect(lookup).not.toHaveBeenCalled(); expect(JSON.stringify(result.body)).not.toContain(token);
+  });
+  it.each([-1, 0, 0.5, 1])("enforces expiry boundary with zero skew at offset %s", async offset => {
+    const token = jwt.sign({ userId: user.id, type: "user", exp: now + offset }, TEST_JWT_KEY);
+    const result = await invoke(testAuthUser(identities), `Bearer ${token}`);
+    expect(result.next).toHaveBeenCalledTimes(offset > 0 ? 1 : 0); expect(result.status).toBe(offset > 0 ? undefined : 401);
+  });
+  it.each([-1, 0, 1])("preserves nbf boundary with zero skew at offset %s", async offset => {
+    const token = jwt.sign({ userId: user.id, type: "user", nbf: now + offset }, TEST_JWT_KEY, { expiresIn: "30d" });
+    const result = await invoke(testAuthUser(identities), `Bearer ${token}`);
+    expect(result.next).toHaveBeenCalledTimes(offset <= 0 ? 1 : 0); expect(result.status).toBe(offset <= 0 ? undefined : 401);
+  });
+  it.each(["HS384", "HS512"] as const)("rejects issuer-incompatible %s signatures", async algorithm => {
+    const token = jwt.sign({ userId: user.id, type: "user" }, TEST_JWT_KEY, { algorithm, expiresIn: "30d" });
+    const result = await invoke(testAuthUser(identities), `Bearer ${token}`);
+    expect(result.status).toBe(401); expect(result.body).toEqual({ message: "Invalid Authorization. Access Denied", status: false }); expect(result.next).not.toHaveBeenCalled();
+  });
+  it("rejects an unsigned JWT", async () => {
+    const token = `${Buffer.from('{"alg":"none","typ":"JWT"}').toString("base64url")}.${Buffer.from(JSON.stringify({ userId: user.id, exp: now + 300 })).toString("base64url")}.`;
+    const result = await invoke(testAuthUser(identities), `Bearer ${token}`); expect(result.status).toBe(401); expect(result.next).not.toHaveBeenCalled();
+  });
+  it.each([undefined, null, 123, true, {}, [], "", "unknown-user"].map(userId => ({ userId })))("rejects invalid or absent identity %#", async ({ userId }) => {
+    const token = jwt.sign({ userId, type: "user" }, TEST_JWT_KEY, { expiresIn: "30d" });
+    const result = await invoke(testAuthUser(identities), `Bearer ${token}`);
+    expect(result.status).toBe(401); expect(result.body).toEqual({ message: "Authentication Failed!", status: false }); expect(result.next).not.toHaveBeenCalled();
+  });
+  it("rejects issuer refresh tokens without userId", async () => {
+    const token = jwt.sign({ uuid: "offline-refresh-id", type: "user" }, TEST_JWT_KEY, { expiresIn: "365d" });
+    const result = await invoke(testAuthUser(identities), `Bearer ${token}`); expect(result.status).toBe(401); expect(result.next).not.toHaveBeenCalled();
+  });
+  it("retains ownership from the database identity regardless of other claims", async () => {
+    const foreign = identities.addUser();
+    const token = jwt.sign({ userId: user.id, sub: foreign.id, ownerId: foreign.id, type: "admin" }, TEST_JWT_KEY, { expiresIn: "30d" });
+    const result = await invoke(testAuthUser(identities), `Bearer ${token}`);
+    expect(result.req.user).toBe(user); expect(ownerIdOf(result.req)).toBe(user.id); expect(result.next).toHaveBeenCalledOnce();
   });
 });
 

@@ -48,6 +48,8 @@ export class VercelApiError extends Error {
     readonly vercelMessage?: string,
     /** From a 429/503 Retry-After header, when Vercel sent one. */
     readonly retryAfterMs?: number,
+    /** No response: the request hit its client-side timeout (diagnostics only; classified like any network error). */
+    readonly timedOut?: boolean,
   ) {
     super(`Vercel API request failed${status ? ` (${status})` : ""}`);
     this.name = "VercelApiError";

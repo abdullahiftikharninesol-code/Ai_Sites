@@ -46,7 +46,7 @@ const versionIdFor = (siteId: string, versionNumber: number): VersionId =>
 const sourceRefFor = (siteId: string): string => `sites/${siteId}/current/source.json`;
 const manifestRefFor = (siteId: string): string => `sites/${siteId}/current/manifest.json`;
 
-const projectFrom = (record: MongoSiteProjectRecord, state: MongoRuntimeState): SiteProject => {
+export const projectFrom = (record: MongoSiteProjectRecord, state: MongoRuntimeState): SiteProject => {
   const publication = state.publications.get(record._id as SiteId);
   return {
     id: record._id as SiteId,
@@ -567,7 +567,7 @@ const isLegacyCurrentFiles = (value: unknown): value is readonly LegacyMongoCurr
         (file as Partial<LegacyMongoCurrentFile>).encoding === "base64"),
   );
 
-const versionFrom = (record: MongoSiteProjectRecord): SiteVersion => ({
+export const versionFrom = (record: MongoSiteProjectRecord): SiteVersion => ({
   id: versionIdFor(record._id, record.versionNumber),
   siteId: record._id as SiteId,
   versionNumber: record.versionNumber,

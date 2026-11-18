@@ -123,6 +123,7 @@ export function parseDeployment(body: unknown): VercelDeploymentInfo {
 export function createVercelDeploymentsClient(
   fetchImpl: typeof fetch = globalThis.fetch,
   baseUrl = VERCEL_API_BASE_URL,
+  shutdownSignal?: AbortSignal,
 ): VercelDeploymentsClient {
   const request = async (auth: VercelAuth, method: "GET" | "POST" | "PATCH", path: string, init: { query?: Record<string, string>; json?: unknown; bytes?: Uint8Array; headers?: Record<string, string>; timeoutMs?: number } = {}) => {
     const url = new URL(`${baseUrl}${path}`);
@@ -130,6 +131,7 @@ export function createVercelDeploymentsClient(
     if (auth.teamId) url.searchParams.set("teamId", auth.teamId);
     let response: Response;
     try {
+      shutdownSignal?.throwIfAborted();
       response = await fetchImpl(url, {
         method,
         headers: {
@@ -144,10 +146,10 @@ export function createVercelDeploymentsClient(
             ? { body: new Blob([Uint8Array.from(init.bytes)], { type: "application/octet-stream" }) }
             : {}),
         redirect: "error",
-        signal: AbortSignal.timeout(init.timeoutMs ?? API_TIMEOUT_MS),
+        signal: shutdownSignal ? AbortSignal.any([shutdownSignal, AbortSignal.timeout(init.timeoutMs ?? API_TIMEOUT_MS)]) : AbortSignal.timeout(init.timeoutMs ?? API_TIMEOUT_MS),
       });
-    } catch {
-      throw new VercelApiError(undefined);
+    } catch (error) {
+      throw new VercelApiError(undefined, undefined, undefined, undefined, (error as Error)?.name === "TimeoutError" || undefined);
     }
     const body = (await response.json().catch(() => undefined)) as Record<string, unknown> | undefined;
     return { status: response.status, ok: response.ok, body, retryAfterMs: retryAfterMs(response.headers.get("retry-after")) };

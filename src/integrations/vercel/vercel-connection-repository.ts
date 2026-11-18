@@ -1,4 +1,5 @@
 import { Schema, type Connection, type Model } from "mongoose";
+import { randomUUID } from "node:crypto";
 import type { VercelConnectionProblem, VercelVerificationState } from "./vercel-account-verifier.js";
 
 export interface VercelOAuthStateRecord {
@@ -10,11 +11,13 @@ export interface VercelOAuthStateRecord {
   readonly createdAt: Date;
   readonly expiresAt: Date;
   readonly consumedAt?: Date;
+  readonly lifecycleId?: string;
 }
 
 export interface ConsumedVercelState {
   readonly ownerId: string;
   readonly siteId?: string;
+  readonly lifecycleId?: string;
 }
 
 export interface VercelConnectionRecord {
@@ -29,6 +32,8 @@ export interface VercelConnectionRecord {
   readonly connectedAt: Date;
   readonly updatedAt: Date;
   readonly disconnectedAt?: Date;
+  /** Durable authorization fence; retained even when no credentials exist. */
+  readonly lifecycleId?: string;
   /** Last verification against Vercel (cached; status reads don't call Vercel every time). */
   readonly verification?: {
     readonly state: VercelVerificationState;
@@ -52,6 +57,9 @@ export class VercelConfigurationConflictError extends Error {
 }
 
 export interface VercelIntegrationRepository {
+  beginAuthorization(ownerId: string, lifecycleId: string, now: Date): Promise<void>;
+  isCurrentAuthorization(ownerId: string, lifecycleId: string): Promise<boolean>;
+  invalidatePendingAuthorization(ownerId: string): Promise<void>;
   createState(record: VercelOAuthStateRecord): Promise<void>;
   /**
    * Atomically marks an unexpired, unused state as consumed and returns its
@@ -65,11 +73,11 @@ export interface VercelIntegrationRepository {
     configurationId: string,
   ): Promise<VercelConnectionRecord | undefined>;
   /** Creates or replaces the owner's single Vercel connection. */
-  saveConnection(record: ActiveVercelConnection): Promise<void>;
+  saveConnection(record: ActiveVercelConnection, lifecycleId?: string): Promise<boolean>;
   /** Marks the connection disconnected and erases the stored token. */
-  markDisconnected(ownerId: string, configurationId: string, now: Date): Promise<boolean>;
+  markDisconnected(ownerId: string, configurationId: string, now: Date, encryptedAccessToken?: string): Promise<boolean>;
   /** Records a verification for this exact active connection (no-op if it was replaced or disconnected). */
-  saveVerification(ownerId: string, configurationId: string, verification: NonNullable<VercelConnectionRecord["verification"]>): Promise<void>;
+  saveVerification(ownerId: string, configurationId: string, verification: NonNullable<VercelConnectionRecord["verification"]>, encryptedAccessToken?: string): Promise<void>;
 }
 
 const isActive = (
@@ -86,6 +94,7 @@ const stateSchema = new Schema<VercelOAuthStateRecord>(
     // MongoDB removes expired documents; consumeState also checks expiry.
     expiresAt: { type: Date, required: true, expires: 0 },
     consumedAt: Date,
+    lifecycleId: String,
   },
   { collection: "sites_vercel_oauth_states", versionKey: false, strict: "throw" },
 );
@@ -102,6 +111,7 @@ const connectionSchema = new Schema<VercelConnectionRecord>(
     connectedAt: { type: Date, required: true },
     updatedAt: { type: Date, required: true },
     disconnectedAt: Date,
+    lifecycleId: String,
     verification: {
       type: new Schema(
         {
@@ -132,8 +142,34 @@ const isDuplicateKey = (error: unknown) => (error as { code?: unknown })?.code =
 
 export class MongoVercelIntegrationRepository implements VercelIntegrationRepository {
   readonly #models: ReturnType<typeof createVercelIntegrationModels>;
+  #ready: Promise<void> | undefined;
   constructor(connection: Connection) {
     this.#models = createVercelIntegrationModels(connection);
+  }
+  ready(): Promise<void> {
+    // Explicit even if autoIndex is disabled. Never drop/rebuild existing indexes.
+    return this.#ready ??= Promise.all(Object.values(this.#models).map(model => model.createIndexes())).then(() => undefined);
+  }
+  async beginAuthorization(ownerId: string, lifecycleId: string, now: Date) {
+    await this.ready();
+    const update = { $set: { lifecycleId }, $setOnInsert: {
+      ownerId, configurationId: `pending:${randomUUID()}`, vercelUserId: "pending", teamId: null,
+      tokenType: "Bearer", status: "disconnected", connectedAt: now, updatedAt: now,
+    } };
+    try {
+      await this.#models.connections.updateOne({ ownerId }, update, { upsert: true }).exec();
+    } catch (error) {
+      if (!isDuplicateKey(error)) throw error;
+      // Concurrent first authorizations: retry only against the row that won owner uniqueness.
+      const result = await this.#models.connections.updateOne({ ownerId }, { $set: { lifecycleId } }).exec();
+      if (result.matchedCount !== 1) throw error;
+    }
+  }
+  async isCurrentAuthorization(ownerId: string, lifecycleId: string) {
+    return !!(await this.#models.connections.exists({ ownerId, lifecycleId }).exec());
+  }
+  async invalidatePendingAuthorization(ownerId: string) {
+    await this.#models.connections.updateOne({ ownerId, status: "disconnected" }, { $set: { lifecycleId: randomUUID() } }).exec();
   }
   async createState(record: VercelOAuthStateRecord) {
     await this.#models.states.create(record);
@@ -148,9 +184,10 @@ export class MongoVercelIntegrationRepository implements VercelIntegrationReposi
       .lean()
       .exec();
     if (!record) return undefined;
-    return record.siteId
+    const context = record.siteId
       ? { ownerId: record.ownerId, siteId: record.siteId }
       : { ownerId: record.ownerId };
+    return { ...context, ...(record.lifecycleId ? { lifecycleId: record.lifecycleId } : {}) };
   }
   async expireOpenStates(ownerId: string, now: Date) {
     await this.#models.states
@@ -167,34 +204,35 @@ export class MongoVercelIntegrationRepository implements VercelIntegrationReposi
   async findConnectionByConfiguration(configurationId: string) {
     return (await this.#models.connections.findOne({ configurationId }).lean().exec()) ?? undefined;
   }
-  async saveConnection(record: ActiveVercelConnection) {
+  async saveConnection(record: ActiveVercelConnection, lifecycleId?: string) {
     try {
-      await this.#models.connections
+      const result = await this.#models.connections
         .updateOne(
-          { ownerId: record.ownerId },
+          { ownerId: record.ownerId, ...(lifecycleId ? { lifecycleId } : {}) },
           // A new or renewed authorization starts unverified.
           { $set: record, $unset: { disconnectedAt: 1, ...("verification" in record ? {} : { verification: 1 }) } },
-          { upsert: true },
+          { upsert: !lifecycleId },
         )
         .exec();
+      return result.matchedCount === 1 || result.upsertedCount === 1;
     } catch (error) {
       if (isDuplicateKey(error)) throw new VercelConfigurationConflictError();
       throw error;
     }
   }
-  async markDisconnected(ownerId: string, configurationId: string, now: Date) {
+  async markDisconnected(ownerId: string, configurationId: string, now: Date, encryptedAccessToken?: string) {
     const result = await this.#models.connections
       .updateOne(
-        { ownerId, configurationId, status: "active" },
+        { ownerId, configurationId, status: "active", ...(encryptedAccessToken ? { encryptedAccessToken } : {}) },
         {
-          $set: { status: "disconnected", disconnectedAt: now, updatedAt: now },
+          $set: { status: "disconnected", disconnectedAt: now, updatedAt: now, lifecycleId: randomUUID() },
           $unset: { encryptedAccessToken: 1 },
         },
       )
       .exec();
     return result.modifiedCount === 1;
   }
-  async saveVerification(ownerId: string, configurationId: string, verification: NonNullable<VercelConnectionRecord["verification"]>) {
-    await this.#models.connections.updateOne({ ownerId, configurationId, status: "active" }, { $set: { verification } }).exec();
+  async saveVerification(ownerId: string, configurationId: string, verification: NonNullable<VercelConnectionRecord["verification"]>, encryptedAccessToken?: string) {
+    await this.#models.connections.updateOne({ ownerId, configurationId, status: "active", ...(encryptedAccessToken ? { encryptedAccessToken } : {}) }, { $set: { verification } }).exec();
   }
 }

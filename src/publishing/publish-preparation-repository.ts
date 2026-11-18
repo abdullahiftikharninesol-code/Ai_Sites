@@ -33,6 +33,8 @@ export interface PublishPreparationFailure {
   readonly metadata?: Record<string, unknown>;
 }
 
+export const PUBLISH_PREPARATIONS_COLLECTION = "sites_publish_preparations";
+
 export interface PublishPreparationRecord {
   readonly preparationId: string;
   /** sha256(provider, owner, site, version, source digest, configuration): one preparation per exact input. */
@@ -145,7 +147,7 @@ const schema = new Schema<PublishPreparationRecord>(
     completedAt: Date,
     expiresAt: Date,
   },
-  { collection: "sites_publish_preparations", versionKey: false, strict: "throw" },
+  { collection: PUBLISH_PREPARATIONS_COLLECTION, versionKey: false, strict: "throw" },
 );
 schema.index({ ownerId: 1, siteId: 1, createdAt: -1 });
 
@@ -160,6 +162,7 @@ export class MongoPublishPreparationRepository implements PublishPreparationRepo
   constructor(connection: Connection) {
     this.#model = createPublishPreparationModel(connection);
   }
+  ready(): Promise<void> { return this.#model.createIndexes(); }
   async insert(record: PublishPreparationRecord) {
     try {
       await this.#model.create(record);

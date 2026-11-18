@@ -137,7 +137,7 @@ export async function handleVercelAccountRoute(
   } catch (error) {
     if (
       error instanceof VercelIntegrationError &&
-      error.code === "VERCEL_INTEGRATION_NOT_CONFIGURED"
+      (error.code === "VERCEL_INTEGRATION_NOT_CONFIGURED" || error.code === "VERCEL_DISCONNECT_UNAVAILABLE")
     ) {
       json(res, 503, { error: { code: error.code, message: error.message } });
       return true;

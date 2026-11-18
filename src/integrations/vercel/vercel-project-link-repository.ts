@@ -76,6 +76,7 @@ export class MongoVercelProjectLinkRepository implements VercelProjectLinkReposi
   constructor(connection: Connection) {
     this.#model = createVercelProjectLinkModel(connection);
   }
+  ready(): Promise<void> { return this.#model.createIndexes(); }
   async find(siteId: string) {
     return (await this.#model.findOne({ siteId }).lean().exec()) ?? undefined;
   }

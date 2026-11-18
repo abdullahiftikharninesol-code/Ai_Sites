@@ -6,7 +6,7 @@ import type { SiteId, UserId, VersionId } from "../shared/types.js";
 import { DevJobManager } from "./dev-job-manager.js";
 import { DevelopmentPreviewManager } from "./development-preview-manager.js";
 import { planStorageCleanup } from "../storage/storage-cleanup-planner.js";
-import { MongoStorageReferenceSource } from "../storage/storage-references.js";
+import { MongoStorageReferenceSource, mongoPublishingReferenceReader } from "../storage/storage-references.js";
 import { withLegacyStoreReferences } from "../storage/legacy-store-references.js";
 import { createMongoModels } from "../persistence/mongodb/mongo-models.js";
 import { reconcileExecutionWorkspaces, type ReconcileOptions, type ReconciliationReport } from "../execution/local/workspace-reconciliation.js";
@@ -19,6 +19,7 @@ import { ArtifactMediaStore } from "../sites/assets/media-store.js";
 import { ingestUserImage, userAssetsManifest, type UserProvidedAsset } from "../sites/assets/user-asset-ingestion.js";
 import { MongoIdentityRepository, type IdentityRepository } from "../auth/identity-repository.js";
 import { resolveTerminalJobBillingFields } from "./job-billing-result.js";
+import { normalizeSiteRename } from "../sites/application/site-rename.js";
 import type { TemplateCatalogQuery } from "../templates/http/template-catalog-query.js";
 import { reportTemplatePreviewFailure } from "../templates/application/template-instantiation-diagnostics.js";
 import { parseTemplateReference, type TemplateReferenceSelection } from "../templates/application/template-design-context.js";
@@ -189,7 +190,7 @@ export class PlaygroundService {
   planStorageCleanup() {
     return planStorageCleanup({
       dataRoot: this.config.dataRoot,
-      references: withLegacyStoreReferences(new MongoStorageReferenceSource(createMongoModels(this.product.database.connection), () => this.product.databaseStatus().connected), this.config.dataRoot),
+      references: withLegacyStoreReferences(new MongoStorageReferenceSource(createMongoModels(this.product.database.connection), () => this.product.databaseStatus().connected, mongoPublishingReferenceReader(this.product.database.connection)), this.config.dataRoot),
       activeEnvironmentIds: new Set([...this.product.execution.activeEnvironmentIds(), ...this.previews.list().map((session) => session.environmentId)]),
       protectedAssetKeys: new Set([...this.#uploadedAssets.values()].map(({ asset }) => asset.asset.storageKey)),
     });
@@ -514,8 +515,7 @@ export class PlaygroundService {
     };
   }
   async renameSite(ownerId: string, siteId: string, name: string) {
-    const trimmed = name.trim().slice(0, 60);
-    if (!trimmed) throw this.#error("INVALID_REQUEST", "A site name is required");
+    const trimmed = normalizeSiteRename(name);
     const project = await this.#project(ownerId, siteId);
     // Only the name changes; ownerId is carried over from the owner-scoped read.
     await this.product.projects.save({ ...project, name: trimmed, updatedAt: new Date() });

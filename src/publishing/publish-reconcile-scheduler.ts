@@ -1,7 +1,7 @@
 import type { PublishReconcileSummary } from "./vercel-publish-service.js";
 
 /**
- * Invokes the observe-only reconciliation pass (VercelPublishService.reconcilePass)
+ * Invokes the observation/recovery pass (VercelPublishService.reconcilePass)
  * on a fixed cadence inside the server process. Internal only: there is no
  * HTTP entry point, so nothing outside the process can trigger it.
  *
@@ -13,8 +13,10 @@ import type { PublishReconcileSummary } from "./vercel-publish-service.js";
  *   it is reached, and each item is bounded by its own Vercel request budget.
  * - Never throws: failures are recorded and the schedule continues.
  *
- * Across server instances, passes may run concurrently, but each operation is
- * reconciled under its own MongoDB lease, fenced by the attempt number.
+ * Recovery may persist a verified publication or cancel a stale unfinished deployment;
+ * it never creates, promotes or rolls back deployments. Across instances, operation
+ * and publication checks use token-fenced leases. Already-issued provider actions
+ * cannot be recalled atomically when a lease expires.
  */
 
 export type PublishReconcileTrigger = "schedule" | "manual";

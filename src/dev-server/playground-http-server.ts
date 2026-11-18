@@ -40,7 +40,7 @@ import {
 } from "../publishing/create-publish-preparation-service.js";
 import { isLivePublishingEnabled, isPublishReconcileEnabled, type VercelPublishService } from "../publishing/vercel-publish-service.js";
 import { PublishReconcileScheduler, loadReconcileSchedule } from "../publishing/publish-reconcile-scheduler.js";
-import { MongoVercelPublishRepository } from "../publishing/vercel-publish-repository.js";
+import { countVercelPublishingActivity } from "../integrations/vercel/vercel-publishing-activity.js";
 import {
   handlePublishPreparationRoute,
   isPublishPreparationRoute,
@@ -186,7 +186,7 @@ export class PlaygroundHttpServer {
       this.service.product.database.connection,
       (ownerId, siteId) => this.service.ownsSite(ownerId, siteId),
       // Disconnect asks before stopping running publishes (Stage 5C).
-      (ownerId) => new MongoVercelPublishRepository(this.service.product.database.connection).countActiveForOwner(ownerId),
+      (ownerId) => countVercelPublishingActivity(this.service.product.database.connection, ownerId),
     ));
   }
   async start() {
