@@ -40,8 +40,35 @@ import type {
  * Required, so a caller cannot forget it.
  */
 export type PublishBuildAccess =
-  | { readonly isolatedExecution: false; readonly trustedSiteIds: ReadonlySet<string> }
+  | {
+      readonly isolatedExecution: false;
+      readonly trustedSiteIds: ReadonlySet<string>;
+      /**
+       * Every owned site may build locally, without listing its ID. Set only by
+       * withLocalDevelopmentAllSites (the loopback-only development server, with an
+       * explicit opt-in); loadPublishBuildAccess and production composition never set it.
+       */
+      readonly localDevelopmentAllSites?: true;
+    }
   | { readonly isolatedExecution: "verified-cloud"; readonly isolation: { assertVerified(): Promise<unknown> } };
+
+/** Development-only opt-in; disabled unless exactly "true". Never read by production composition. */
+export const LOCAL_DEVELOPMENT_ALL_SITES_FLAG = "SITES_DEV_PUBLISH_ALLOW_ALL_LOCAL_SITES";
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "::1"]);
+
+/**
+ * Lets the trusted local development server build any owned site on this host without
+ * listing each ID in SITES_PUBLISH_TRUSTED_SITE_IDS. All of these are required; anything
+ * else returns `access` unchanged:
+ *   - local (non-isolated) build access: never applies to cloud builds;
+ *   - SITES_DEV_PUBLISH_ALLOW_ALL_LOCAL_SITES=true exactly (NODE_ENV is not consulted);
+ *   - the calling server is bound to a loopback host (the development server enforces it).
+ * Ownership, current-version, source-integrity, Vercel and publishing-flag checks are unaffected.
+ */
+export function withLocalDevelopmentAllSites(access: PublishBuildAccess, env: NodeJS.ProcessEnv, serverHost: string): PublishBuildAccess {
+  if (access.isolatedExecution !== false || env[LOCAL_DEVELOPMENT_ALL_SITES_FLAG] !== "true" || !LOOPBACK_HOSTS.has(serverHost)) return access;
+  return { ...access, localDevelopmentAllSites: true };
+}
 
 const TRUSTED_SITE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
@@ -165,7 +192,7 @@ export class PublishPreparationService {
     const access = this.#options.buildAccess;
     // Verified cloud isolation is checked live (cached briefly) and fails closed.
     if (access.isolatedExecution === "verified-cloud") await access.isolation.assertVerified();
-    else if (!access.trustedSiteIds.has(project.id))
+    else if (!access.trustedSiteIds.has(project.id) && access.localDevelopmentAllSites !== true)
       throw new PublishingError(
         "PUBLISH_SITE_NOT_TRUSTED",
         "Publishing builds on this server are limited to trusted test sites until isolated build execution is available.",

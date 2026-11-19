@@ -1,28 +1,14 @@
 import { createSitesVersionApi } from "./create-sites-version-api.js";
+import { runProductionProcess } from "./production-process.js";
 import { productionStartupFailure } from "./production-readiness.js";
 
-async function main() {
-  const api = createSitesVersionApi();
-  await api.start();
-  let closing = false;
-  const close = async () => {
-    if (closing) return;
-    closing = true;
-    await api.close();
-  };
-  process.once("SIGINT", () => {
-    void close().catch(() => {
-      process.exitCode = 1;
-    });
-  });
-  process.once("SIGTERM", () => {
-    void close().catch(() => {
-      process.exitCode = 1;
-    });
-  });
-}
-
-void main().catch((error: unknown) => {
+// Construction is synchronous (configuration validation only); signal handlers are
+// installed by runProductionProcess before any asynchronous startup work begins.
+let api: ReturnType<typeof createSitesVersionApi> | undefined;
+try {
+  api = createSitesVersionApi();
+} catch (error) {
   productionStartupFailure(error);
   process.exitCode = 1;
-});
+}
+if (api) runProductionProcess(api);

@@ -178,6 +178,9 @@ export class PlaygroundHttpServer {
       artifacts: this.service.product.artifacts,
       execution: this.service.product.execution,
       vercel: this.vercel,
+      // This server only binds to loopback (checked in the constructor); the explicit
+      // SITES_DEV_PUBLISH_ALLOW_ALL_LOCAL_SITES opt-in is still required.
+      localDevelopmentHost: this.config.host,
     }));
   }
   /** Created on first use so servers that never reach Vercel routes need no database. */

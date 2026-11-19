@@ -8,8 +8,10 @@ import { MongoVercelPublishRepository } from "./vercel-publish-repository.js";
 import { VercelPublishService, type VercelPublishServiceOptions } from "./vercel-publish-service.js";
 import { ProductionBuildService, type ProductionBuildExecution } from "./production-build-service.js";
 import {
+  LOCAL_DEVELOPMENT_ALL_SITES_FLAG,
   PublishPreparationService,
   loadPublishBuildAccess,
+  withLocalDevelopmentAllSites,
   type PublishBuildAccess,
   type PublishPreparationServiceOptions,
 } from "./publish-preparation-service.js";
@@ -49,11 +51,20 @@ export function createPublishBuildPath(input: {
   readonly execution: ProductionBuildExecution & { getCapabilities?(): { readonly secureIsolation?: boolean } };
   readonly env?: NodeJS.ProcessEnv;
   readonly cloudApis?: (config: CloudBuildConfig) => ReturnType<typeof createGoogleCloudBuildApis>;
+  /**
+   * Bind host of the calling development server. Only the loopback-only development
+   * server passes it; with SITES_DEV_PUBLISH_ALLOW_ALL_LOCAL_SITES=true, local builds then
+   * need no per-site ID. Production composition never calls this function.
+   */
+  readonly localDevelopmentHost?: string;
 }): { readonly buildAccess: PublishBuildAccess; readonly builder: PublishPreparationServiceOptions["builder"]; readonly cloud?: CloudProductionBuildService } {
   const env = input.env ?? process.env;
   if (loadPublishBuildProvider(env) === "local") {
-    const buildAccess = loadPublishBuildAccess(input.execution, env);
-    console.info(`[sites][publish] builds run on non-isolated local execution; trusted sites=${buildAccess.isolatedExecution ? 0 : buildAccess.trustedSiteIds.size} (SITES_PUBLISH_TRUSTED_SITE_IDS)`);
+    const loaded = loadPublishBuildAccess(input.execution, env);
+    const buildAccess = input.localDevelopmentHost === undefined ? loaded : withLocalDevelopmentAllSites(loaded, env, input.localDevelopmentHost);
+    if (buildAccess.isolatedExecution === false && buildAccess.localDevelopmentAllSites)
+      console.warn(`[sites][publish] local development: builds run on non-isolated local execution for every owned site (${LOCAL_DEVELOPMENT_ALL_SITES_FLAG}=true); never use this outside a trusted development machine`);
+    else console.info(`[sites][publish] builds run on non-isolated local execution; trusted sites=${buildAccess.isolatedExecution ? 0 : buildAccess.trustedSiteIds.size} (SITES_PUBLISH_TRUSTED_SITE_IDS)`);
     return { buildAccess, builder: new ProductionBuildService(input.execution) };
   }
   const loaded = loadCloudBuildConfig(env);
@@ -82,9 +93,12 @@ export function createPublishPreparationService(input: {
   readonly artifacts: ArtifactStore;
   readonly execution: ProductionBuildExecution & { getCapabilities?(): { readonly secureIsolation?: boolean } };
   readonly vercel: VercelConnectionService;
+  /** See createPublishBuildPath: passed only by the loopback-only development server. */
+  readonly localDevelopmentHost?: string;
 }): PublishPreparationService {
   const linkProjects = process.env.VERCEL_PROJECT_LINKING_ENABLED === "true";
-  const { buildAccess, builder } = createPublishBuildPath({ connection: input.connection, execution: input.execution });
+  const { buildAccess, builder } = createPublishBuildPath({ connection: input.connection, execution: input.execution,
+    ...(input.localDevelopmentHost !== undefined ? { localDevelopmentHost: input.localDevelopmentHost } : {}) });
   return new PublishPreparationService({
     buildAccess,
     repository: new MongoPublishPreparationRepository(input.connection),
