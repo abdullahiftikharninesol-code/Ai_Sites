@@ -390,7 +390,7 @@ describe("Sites DB-driven credit billing", () => {
     expect(quotas.records.get(userId)?.tokenCreditUsed).toBe(10);
   });
 
-  it("preserves a successful site when billing fails", async () => {
+  it("preserves a successful site and never reports zero credits when the debit outcome is unknown", async () => {
     const jobs = new InMemorySiteJobRepository();
     const failing: SubscriberQuotaRepository = {
       findForUser: async () => quota(),
@@ -409,13 +409,18 @@ describe("Sites DB-driven credit billing", () => {
     const value = job();
     await jobs.save(value);
     const auth = await service.preflight({ userId, provider: "openai", model: "gpt-sites" });
-    expect(await service.finalizeSuccessfulJob(value, summary(), auth)).toMatchObject({
+    const result = await service.finalizeSuccessfulJob(value, summary(), auth);
+    // "result unknown" may have debited: the job stays PENDING with its intent for
+    // recovery/review instead of claiming a false zero charge.
+    expect(result).toMatchObject({
       status: "SUCCEEDED",
       websiteGenerated: true,
-      billingStatus: "FAILED",
-      billingErrorCode: "CREDIT_DEDUCTION_FAILED",
-      creditsCharged: 0,
+      billingStatus: "PENDING",
+      billingErrorCode: "CREDIT_DEDUCTION_OUTCOME_UNKNOWN",
+      creditsCalculated: 4.8,
     });
+    expect(result.creditsCharged).toBeUndefined();
+    expect(await jobs.getById(value.id)).toMatchObject({ billingStatus: "PENDING", creditsCalculated: 4.8 });
     expect(diagnosticLogger.warn).toHaveBeenCalledWith(
       "[sites][billing] credit finalization failed",
       {

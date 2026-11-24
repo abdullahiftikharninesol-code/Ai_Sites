@@ -149,6 +149,10 @@ const contracts: Record<FunctionalCapability, string> = {
   // Verification-only families: never sent to the model.
   sort: "", filter: "", calculator: "", "multi-step": "", comparison: "",
 };
+/** The managed-runtime API line for one guided capability ("" for verification-only families). */
+export function functionalCapabilityContract(capability: FunctionalCapability): string {
+  return contracts[capability];
+}
 export function functionalGenerationContract(input: FunctionalRequirements): string {
   // Verification-only families are filtered out so the prompt is byte-identical to before.
   const optionalCapabilities = input.optionalCapabilities?.filter(guided), excludedCapabilities = input.excludedCapabilities?.filter(guided);

@@ -57,7 +57,7 @@ import {
   APPROVED_UI_PACKAGE_VERSIONS,
   materializeOptionalDependencies,
 } from "../../sites/generation/optional-dependencies.js";
-import { validateAssetReferences } from "../../sites/assets/asset-reference-validator.js";
+import { missingLocalAssetReferences, validateAssetReferences } from "../../sites/assets/asset-reference-validator.js";
 import { applyDeterministicAutofix, applyDeterministicBuildRepair } from "../../sites/generation/deterministic-autofix.js";
 import {
   SITE_CODER_FILE_BUNDLE_JSON_SCHEMA,
@@ -83,7 +83,7 @@ import {
   parseStructuredAgentResponse,
 } from "../../agents/shared/structured-response-parser.js";
 import { SITES_UI_REGISTRY } from "../../sites/generation/sites-ui-registry.js";
-import { buildCapabilityAwareGenerationContext } from "./capability-aware-generation-context.js";
+import { buildCapabilityAwareGenerationContext, editAssetContext } from "./capability-aware-generation-context.js";
 import { GENERATION_NAVIGATION_RULES } from "./reference-interaction-validator.js";
 import { templateDesignPrompt } from "../../templates/application/template-design-context.js";
 import { validateTemplateReferenceBundle } from "../../templates/application/template-reference-generation-contract.js";
@@ -113,6 +113,8 @@ import { generationInteractionAdvisories, USABLE_GENERATION_GUIDANCE } from "../
 import type { ResolvedFunctionalContract } from "../../sites/generation/functional-route-contract.js";
 import { EDIT_CONTEXT_POLICY, selectAdaptiveEditContext } from "./adaptive-edit-context.js";
 import { assessEditOutcome, type EditOutcome } from "./edit-outcome.js";
+import { editBehaviorGuidance, validateEditPreservation } from "./edit-behavior.js";
+import { FUNCTIONAL_RUNTIME_PATH } from "../../sites/generation/functional-runtime.js";
 import {
   getDefaultProfile,
   getProfile,
@@ -180,6 +182,8 @@ function requirementsForRepair(
   return {
     ...(missing.includes("rename") && requirements.rename ? { rename: requirements.rename } : {}),
     style: missing.includes("style"),
+    ...(missing.includes("behavior") && requirements.behaviors?.length ? { behaviors: requirements.behaviors } : {}),
+    ...(missing.includes("content") && requirements.visibleFields?.length ? { visibleFields: requirements.visibleFields } : {}),
   };
 }
 
@@ -197,6 +201,14 @@ function relevantRepairInstruction(
       .map((part) => part.trim())
       .filter((part) => /\b(colou?rs?|accent|palette|theme|visual\s+styl(?:e|ing)|styl(?:e|es|ing))\b/i.test(part));
     lines.push(fragments.length ? `${fragments.join(". ")}.` : "Apply the requested style change.");
+  }
+  if (missing.includes("behavior") || missing.includes("content")) {
+    // The behavior/content clauses themselves, never unrelated parts of the request.
+    const fragments = instruction
+      .split(/[.!?;\n]+/)
+      .map((part) => part.trim())
+      .filter((part) => part && (parseEditRequirements(part).behaviors?.length || parseEditRequirements(part).visibleFields?.length));
+    lines.push(fragments.length ? `${fragments.join(". ")}.` : "Implement the requested behavior and visible content.");
   }
   return lines.join("\n");
 }
@@ -365,6 +377,11 @@ export class LocalCliAgentRuntime {
         await SITES_UI_REGISTRY.materialize(this.execution, environmentId, technicalProfile);
       await materializeFunctionalRuntime(this.execution, environmentId, task.siteId);
     }
+    // An edit is judged on what it adds: a parent version that already points at
+    // a missing image (saved before this check existed) must stay editable.
+    const inheritedMissingAssets = operation === "EDIT_SITE"
+      ? new Set((await missingLocalAssetReferences(this.execution, environmentId)).map(({ reference }) => reference))
+      : undefined;
     const before = new Map<string, string>();
     const scaffoldHashes: Record<string, string> = {};
     for (const entry of (await this.execution.listFiles(environmentId)).filter(
@@ -414,6 +431,11 @@ export class LocalCliAgentRuntime {
     if (discovered.editUsesRegions) broadFunctionalEdit = false;
     const context = discovered.text;
     const functionalGuidance = operation === "GENERATE_SITE" ? functionalGenerationContract(functional) : "";
+    // Edits receive only the requested behavior families, as concrete React
+    // wiring; the managed runtime is offered only when this site ships it.
+    const editBehaviorText = operation === "EDIT_SITE"
+      ? editBehaviorGuidance(editRequirements.behaviors ?? [], before.has(FUNCTIONAL_RUNTIME_PATH))
+      : "";
 
     const promptForEstimation = [
       runtimePrompt.prompt.systemPrompt,
@@ -423,6 +445,7 @@ export class LocalCliAgentRuntime {
       projectedSiteSpec && operation === "GENERATE_SITE" ? `SiteSpec: ${JSON.stringify(projectedSiteSpec)}` : "",
       context,
       functionalGuidance,
+      editBehaviorText,
     ].join("\n");
 
     const conservativeEstimatedInput = estimateTokensConservative(promptForEstimation);
@@ -590,7 +613,7 @@ export class LocalCliAgentRuntime {
         operation === "EDIT_SITE" && broadFunctionalEdit
           ? "Return exactly one JSON object matching the SiteCoderFileBundle schema. This is a broad functional edit of the existing site: return complete contents only for editable source files you change. Preserve its design, text, and layout. Do not call tools."
           : operation === "EDIT_SITE"
-            ? "Return exactly one JSON object matching the SiteEditPatchBundle schema. Make the smallest requested source edit and do not call tools."
+            ? "Return exactly one JSON object matching the SiteEditPatchBundle schema and do not call tools. Implement every explicit part of the request completely and visibly in the affected components: new content is rendered in JSX and styled to match the existing design, and requested behavior changes what the user sees. Leave unrelated files, sections, copy and behavior untouched."
             : "Return exactly one JSON object matching the SiteCoderFileBundle schema, including a compact siteName that identifies the generated website. Do not call tools.",
         operation === "EDIT_SITE" && broadFunctionalEdit
           ? "Make the existing visible navigation and controls genuinely interactive using React state and local browser storage where appropriate. Provide working view changes, search/filtering, menus, dialogs and form actions that fit the existing UI; do not claim a remote backend exists. Keep the original JSX shell, className values, sections, and visual treatment. For functionality-only edits, never rewrite an existing stylesheet; add and import a new CSS file only if new controls need styles. Do not modify Sites-managed files or dependency manifests."
@@ -639,6 +662,7 @@ export class LocalCliAgentRuntime {
           context.slice(discovered.stableChars),
           operation === "EDIT_SITE" && discovered.editRequirementContext
             ? mandatoryEditRequirements(editRequirements, discovered.editRequirementContext) : "",
+          editBehaviorText,
           operation === "EDIT_SITE" && editRequirements.scope ? targetedEditScopeGuidance(editRequirements.scope) : "",
           operation === "GENERATE_SITE" && completionRequirements ? `Required pages/views: ${completionRequirements.requiredPages.join(", ")}\nRequired sections/features: ${completionRequirements.requiredSections.join(", ")}. Implement these semantically using appropriate React routes, state, tabs, views, or components. Legacy data-sites-page and data-sites-section attributes are optional and are not required.` : "",
           // A targeted edit works from current source, not from the original brief.
@@ -966,8 +990,12 @@ export class LocalCliAgentRuntime {
       }), { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
       directModel = response.model;
     }
-    if (requirementSource)
-      validateEditRequirements(editRequirements, requirementSource, await readEditRequirementFiles(this.execution, environmentId));
+    if (requirementSource) {
+      const candidate = await readEditRequirementFiles(this.execution, environmentId);
+      validateEditRequirements(editRequirements, requirementSource, candidate);
+      // Before any build time is spent: an edit may not silently drop sections it was not asked to touch.
+      validateEditPreservation(task.userRequest, requirementSource, candidate);
+    }
     if (requirementSource && editRequirements.scope) {
       const candidate = await readEditRequirementFiles(this.execution, environmentId);
       validateProtectedEditValues(editRequirements.scope, requirementSource, candidate);
@@ -1000,7 +1028,8 @@ export class LocalCliAgentRuntime {
       await new GeneratedImportValidator(dependencyManifest, {
         approvedPackages: APPROVED_UI_PACKAGE_VERSIONS,
       }).validate(this.execution, environmentId);
-    await validateAssetReferences(this.execution, environmentId, task.assetManifest);
+    await validateAssetReferences(this.execution, environmentId, task.assetManifest,
+      inheritedMissingAssets ? { tolerateMissingLocal: inheritedMissingAssets } : {});
     // Approved UI packages are installed only when the generated source imports
     // them, so a site that uses none is untouched: no manifest write, no install.
     const optional = await materializeOptionalDependencies(this.execution, environmentId);
@@ -1163,8 +1192,12 @@ export class LocalCliAgentRuntime {
       )
         files.push(entry.path);
     }
-    if (requirementSource)
-      validateEditRequirements(editRequirements, requirementSource, await readEditRequirementFiles(this.execution, environmentId));
+    if (requirementSource) {
+      // Build repair and deterministic autofix ran since the first check: re-prove on final source.
+      const candidate = await readEditRequirementFiles(this.execution, environmentId);
+      validateEditRequirements(editRequirements, requirementSource, candidate);
+      validateEditPreservation(task.userRequest, requirementSource, candidate);
+    }
     if (requirementSource && editRequirements.scope) {
       const candidate = await readEditRequirementFiles(this.execution, environmentId);
       validateProtectedEditValues(editRequirements.scope, requirementSource, candidate);
@@ -1405,6 +1438,7 @@ ${originals.get(file.path)!.slice(range.start, range.end)}`)].join("\n\n");
       `Sites-managed and off-limits (not shown): ${profile.files.managed.filter(path => broad || path !== "index.html").join(", ")}`,
       `Editable project files: ${source.filter(file => !broad || file.path !== "index.html").map(file => file.path).sort().join(", ")}`,
       assembled.repositoryMap,
+      ...[editAssetContext(assetManifest)].filter((text): text is string => Boolean(text)),
       broad && !patchRequired
         ? "Full source follows. Return complete contents only for editable files shown below that need functional changes; preserve their visual design."
         : "Patch only supplied source regions with exact anchors. New safe src modules may use mode create; connect them through supplied imports/routes. Never rewrite an existing file from partial context.",

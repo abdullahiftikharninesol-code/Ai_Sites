@@ -110,11 +110,24 @@ export function selectEditRepairContext(
     }
   }
 
+  if (missingRequirements.includes("behavior") || missingRequirements.includes("content")) {
+    // The components that render the targeted list/UI, current candidate text, whole
+    // files only: behavior wiring cannot be patched safely from a partial excerpt.
+    const supplied = (initialContext.behaviorPaths ?? []).filter((path) => candidate.has(path));
+    const fallback = [...candidate.keys()].filter((path) => /(?:^|\/)App\.[jt]sx$/.test(path));
+    for (const path of (supplied.length ? supplied : fallback).slice(0, 3)) {
+      const content = candidate.get(path)!;
+      if (Buffer.byteLength(content) <= maxFileBytes * 2) add(path, content);
+    }
+  }
+
   const files = Object.freeze([...selected.values()].sort((left, right) => left.path.localeCompare(right.path)));
   const missing = new Set(missingRequirements);
   const repairRequirements: EditRequirements = {
     ...(missing.has("rename") && requirements.rename ? { rename: requirements.rename } : {}),
     style: missing.has("style"),
+    ...(missing.has("behavior") && requirements.behaviors?.length ? { behaviors: requirements.behaviors } : {}),
+    ...(missing.has("content") && requirements.visibleFields?.length ? { visibleFields: requirements.visibleFields } : {}),
   };
   const requirementContext = suppliedEditRequirementContext(repairRequirements, files);
   const text = files.map((file) =>

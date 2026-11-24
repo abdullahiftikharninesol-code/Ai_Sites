@@ -2,19 +2,34 @@ import { ApplicationError } from "../../app/errors/application-error.js";
 import type { ExecutionProvider } from "../../execution/execution-provider.js";
 import { isEditableSiteEditPath } from "./site-coder-file-bundle.js";
 import { analyzeEditScope, maskProtectedEditValues, type DeterministicEditScope } from "./edit-scope.js";
+import {
+  editBehaviorLabel,
+  missingEditBehaviors,
+  missingVisibleFields,
+  requestedEditBehaviors,
+  requestedVisibleFields,
+  type EditBehavior,
+  type VisibleField,
+} from "./edit-behavior.js";
 
 export interface EditRequirements {
   readonly rename?: { readonly oldLiteral: string; readonly newLiteral: string };
   readonly style: boolean;
   readonly scope?: DeterministicEditScope;
+  /** Interactions the edit must wire as real React behavior (present only when requested). */
+  readonly behaviors?: readonly EditBehavior[];
+  /** Card/listing fields the edit must visibly render (present only when requested). */
+  readonly visibleFields?: readonly VisibleField[];
 }
 
 export interface EditRequirementContext {
   readonly renamePaths: readonly string[];
   readonly stylePaths: readonly string[];
+  /** Supplied components that render the targeted UI (present only for behavior/content requirements). */
+  readonly behaviorPaths?: readonly string[];
 }
 
-export type EditRequirementName = "rename" | "style";
+export type EditRequirementName = "rename" | "style" | "behavior" | "content";
 
 export interface EditRequirementDiagnostic {
   readonly requirement: EditRequirementName;
@@ -46,11 +61,15 @@ export function parseEditRequirements(instruction: string): EditRequirements {
   // Several distinct rename pairs are outside this small grammar.
   const uniquePairs = [...new Map(pairs.map((pair) => [JSON.stringify(pair), pair])).values()];
   const actionable = instruction.replace(/\b(?:keep|preserve|retain|without changing)\b[^.!?;\n]*/gi, "");
+  const behaviors = requestedEditBehaviors(instruction);
+  const visibleFields = requestedVisibleFields(instruction);
   return {
     ...(uniquePairs.length === 1 ? { rename: uniquePairs[0]! } : {}),
     scope: analyzeEditScope(instruction, uniquePairs.length === 1 ? uniquePairs[0]! : undefined),
     style: /\b(?:colou?rs?|accent|palette|theme|visual\s+styl(?:e|ing))\b/i.test(actionable) ||
       /\b(?:change|update|adjust)\s+(?:the\s+)?styl(?:e|es|ing)\b/i.test(actionable),
+    ...(behaviors.length ? { behaviors } : {}),
+    ...(visibleFields.length ? { visibleFields } : {}),
   };
 }
 
@@ -90,7 +109,16 @@ export function suppliedEditRequirementContext(
   files: readonly { readonly path: string; readonly content: string }[],
 ): EditRequirementContext {
   const editable = files.filter(({ path }) => isEditableRequirementPath(path));
+  // Behavior/content repairs need the components that render the targeted list or UI.
+  const behaviorPaths = requirements.behaviors?.length || requirements.visibleFields?.length
+    ? editable.filter(({ path, content }) => /\.[jt]sx$/.test(path) && /\.map\s*\(|<(?:section|ul|nav|article)\b/.test(content))
+      .map(({ path, content }) => ({ path, score: (/\.map\s*\(/.test(content) ? 2 : 0) +
+        (requirements.visibleFields ?? []).filter(field => content.toLowerCase().includes(field.slice(0, 4))).length +
+        (/product|item|card|menu|nav|shop|catalog/i.test(path) ? 1 : 0) }))
+      .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path)).slice(0, 3).map(({ path }) => path)
+    : undefined;
   return {
+    ...(behaviorPaths ? { behaviorPaths } : {}),
     renamePaths: [...new Set(editable.filter(({ content }) =>
       requirements.rename && containsRenameLiteral(content, requirements.rename.oldLiteral),
     ).map(({ path }) => path))],
@@ -105,7 +133,7 @@ export function mandatoryEditRequirements(
   requirements: EditRequirements,
   context: EditRequirementContext,
 ): string {
-  if (!requirements.rename && !requirements.style) return "";
+  if (!requirements.rename && !requirements.style && !requirements.behaviors?.length && !requirements.visibleFields?.length) return "";
   const lines = ["MANDATORY EDIT REQUIREMENTS: cover ALL in returned plan operations; omit none."];
   if (requirements.rename)
     lines.push(`RENAME ${JSON.stringify(requirements.rename.oldLiteral)} -> ${JSON.stringify(requirements.rename.newLiteral)}: cover supplied editable old-literal occurrences, including casing variants; use exact source anchors.`);
@@ -114,6 +142,10 @@ export function mandatoryEditRequirements(
     const hints = (css.length ? css : context.stylePaths).slice(0, 3);
     lines.push(`STYLE: include at least one valid edit to a supplied relevant style-bearing source.${hints.length ? ` Targets: ${hints.join(", ")}` : ""}`);
   }
+  if (requirements.behaviors?.length)
+    lines.push(`BEHAVIOR (${requirements.behaviors.map(editBehaviorLabel).join(", ")}): real React state changed by real event handlers, and the rendered output must derive from that state (render the filtered/sorted/selected result, show the open panel). Decorative chips, buttons or links without state do not count.`);
+  if (requirements.visibleFields?.length)
+    lines.push(`VISIBLE CONTENT (${requirements.visibleFields.join(", ")}): add the data where missing and render each field in the JSX of every targeted card/item, styled so it is clearly visible; data or CSS alone does not count.${context.behaviorPaths?.length ? ` Likely targets: ${context.behaviorPaths.join(", ")}` : ""}`);
   return lines.join("\n");
 }
 
@@ -194,6 +226,21 @@ export function editRequirementDiagnostics(
       requirement: "style",
       message: "The requested style change is incomplete",
       metadata: { requirement: "style" },
+    });
+  const editable = (files: ReadonlyMap<string, string>) => new Map([...files].filter(([path]) => isEditableRequirementPath(path)));
+  const missingBehaviors = requirements.behaviors?.length ? missingEditBehaviors(requirements.behaviors, editable(before), editable(after)) : [];
+  if (missingBehaviors.length)
+    missing.push({
+      requirement: "behavior",
+      message: `The requested ${missingBehaviors.map(editBehaviorLabel).join(", ")} behavior is not wired to working React state in the edited source`,
+      metadata: { requirement: "behavior", missingBehaviors },
+    });
+  const missingFields = requirements.visibleFields?.length ? missingVisibleFields(requirements.visibleFields, editable(before), editable(after)) : [];
+  if (missingFields.length)
+    missing.push({
+      requirement: "content",
+      message: `The requested ${missingFields.join(", ")} content is not rendered by the edited source`,
+      metadata: { requirement: "content", missingFields },
     });
   return Object.freeze(missing);
 }

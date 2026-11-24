@@ -60,6 +60,7 @@ import type { AgentPlanningPipeline } from "../../agents/intelligence/agent-inte
 import type { AgentTaskTelemetry } from "../../agents/intelligence/intelligence-types.js";
 import {
   createInferenceRunContext,
+  type InferenceRunContext,
   type InferenceRunSummary,
 } from "../../agents/budget/inference-run-context.js";
 import type { GenerationCompletionTelemetry } from "../../agents/validation/generation-completion.js";
@@ -69,6 +70,7 @@ import type { AdapterBackedAssetResolver } from "../assets/source-adapters.js";
 import type { MediaStore } from "../assets/media-store.js";
 import { loadAssetManifest, persistAssetManifest } from "../assets/asset-manifest-persistence.js";
 import { validateRequiredUserAssetReferences } from "../assets/asset-reference-validator.js";
+import { replacementIntent, requestedImageReplacements } from "../assets/stock-image-query.js";
 import { resolveCapabilities, type ResolvedCapabilities } from "./capability-resolver.js";
 import { analyzeRequestProfile, type RequestProfile } from "./request-profile.js";
 import { generationAssetAdvisories } from "./generation-acceptance-policy.js";
@@ -95,6 +97,12 @@ import type {
   BillingAuthorization,
   SiteCreditBillingService,
 } from "../../billing/credit-billing.js";
+/**
+ * What the pipeline needs from billing. Intent preparation and reservation
+ * release are optional: without them finalizeSuccessfulJob claims the job itself.
+ */
+export type SitesBillingPort = Pick<SiteCreditBillingService, "preflight" | "finalizeSuccessfulJob"> &
+  Partial<Pick<SiteCreditBillingService, "prepareCharge" | "releaseReservation">>;
 export interface GenerateWebsiteRequest {
   readonly outerRequestId?: string;
   readonly userId: UserId;
@@ -191,7 +199,7 @@ export interface LocalSiteGenerationPipelineDependencies {
   runtimeProvider?: SiteRuntimeProvider;
   assetResolver?: AdapterBackedAssetResolver;
   assetMediaStore?: MediaStore;
-  billing?: SiteCreditBillingService;
+  billing?: SitesBillingPort;
   templateDesignReferences?: TemplateDesignReferenceResolver;
   failedCandidateEvidence?: FailedCandidateEvidence;
   developmentTelemetry?: GenerationDevelopmentTelemetry;
@@ -246,6 +254,7 @@ export class LocalSiteGenerationPipeline {
       updatedAt: now,
     };
     let jobFinalized = false;
+    let billingAuthorization: BillingAuthorization | undefined;
     try {
     await this.deps.jobs.save(job);
     this.#scope.validate(request.prompt);
@@ -260,10 +269,7 @@ export class LocalSiteGenerationPipeline {
       if (previous && (previous.ownerId !== request.userId || previous.latestVersionId))
         throw new ApplicationError("VALIDATION_FAILED", "This reference generation candidate cannot be replaced");
     }
-    const billingAuthorization = await this.#authorizeBilling(
-      request.userId,
-      request.agentProvider,
-    );
+    billingAuthorization = await this.#authorizeBilling(request.userId, request.agentProvider, jobId, runContext);
     const technicalProfile = this.deps.templates.resolveProfile(this.deps.template);
     if (request.technicalProfile && request.technicalProfile !== technicalProfile.id)
       throw new ApplicationError(
@@ -325,7 +331,10 @@ export class LocalSiteGenerationPipeline {
         requestText: request.prompt,
       });
       const intents = deterministicAssetIntents(siteSpec, resolvedCapabilities, request.prompt);
-      if (intents.length > 0) assetManifest = await this.deps.assetResolver.resolve(intents);
+      if (intents.length > 0) assetManifest = await this.deps.assetResolver.resolve(intents, undefined, {
+        requestText: request.prompt,
+        subjectText: siteSubject(siteSpec),
+      });
     }
 
     const siteRuntime =
@@ -532,6 +541,10 @@ export class LocalSiteGenerationPipeline {
       const committedVersion = await this.#commitVersion(resolvedProject, versionDraft, 1);
       retainEnvironment = request.retainPreview === true;
       job = this.#finalJob(job, runContext.getSummary(), true);
+      // The charge intent is persisted in the same write as SUCCEEDED: from here on
+      // a crash leaves a PENDING job that billing recovery settles exactly once.
+      if (billingAuthorization && this.deps.billing?.prepareCharge)
+        job = this.deps.billing.prepareCharge(job, runContext.getSummary(), billingAuthorization);
       await this.deps.jobs.save(job);
       jobFinalized = true;
       if (billingAuthorization && this.deps.billing)
@@ -589,6 +602,8 @@ export class LocalSiteGenerationPipeline {
         billingStatus: job.billingStatus, creditsCharged: job.creditsCharged ?? 0 });
       throw cause;
     } finally {
+      // Free the credit hold unless a charge is still awaiting settlement.
+      if (billingAuthorization && job.billingStatus !== "PENDING") await this.deps.billing?.releaseReservation?.(billingAuthorization);
       logSiteTokenUsage("generate", request.agentProvider, runContext.getSummary(), terminalError);
     }
   }
@@ -622,6 +637,7 @@ export class LocalSiteGenerationPipeline {
       updatedAt: jobCreatedAt,
     };
     let jobFinalized = false;
+    let billingAuthorization: BillingAuthorization | undefined;
     try {
     await this.deps.jobs.save(job);
     // Normal edits have one authoritative Targeted Edit request. A single
@@ -635,20 +651,38 @@ export class LocalSiteGenerationPipeline {
       throw new ApplicationError("VERSION_NOT_FOUND", "Site version was not found");
     const parent = await this.deps.versions.getById(fromVersionId);
     if (!parent) throw new ApplicationError("VERSION_NOT_FOUND", "Site version was not found");
-    const billingAuthorization = await this.#authorizeBilling(
-      request.userId,
-      request.agentProvider,
-    );
+    billingAuthorization = await this.#authorizeBilling(request.userId, request.agentProvider, editJobId, runContext);
     const parentAssets = parent.assetManifestArtifactRef
       ? await loadAssetManifest(this.deps.artifacts, parent.assetManifestArtifactRef)
       : undefined;
     let assetManifest = mergeAssetManifests(parentAssets, request.assetManifest);
+    const imageReplacements: ImageReplacement[] = [];
     if (!request.assetManifest && this.deps.assetResolver && parent.siteSpec) {
       const capabilities = resolveCapabilities(parent.siteSpec, { requestText: request.instruction });
       const intents = deterministicAssetIntents(parent.siteSpec, capabilities, request.instruction)
         .filter((intent) => !assetManifest?.assets.some((asset) => asset.logicalAssetId === intent.logicalAssetId));
-      if (intents.length)
-        assetManifest = mergeAssetManifests(assetManifest, await this.deps.assetResolver.resolve(intents));
+      // Saved photos are kept; a stock photo or placeholder is swapped only when the edit asks for it.
+      const ids = new Set(assetManifest?.assets.map((asset) => asset.logicalAssetId) ?? []);
+      const replacing = requestedImageReplacements(request.instruction, parentAssets?.assets ?? []).map((asset) => {
+        const intent = replacementIntent(asset, ids);
+        ids.add(intent.logicalAssetId);
+        return { asset, intent };
+      });
+      if (intents.length || replacing.length) {
+        const resolved = await this.deps.assetResolver.resolve([...intents, ...replacing.map(({ intent }) => intent)], undefined, {
+          requestText: request.instruction,
+          subjectText: siteSubject(parent.siteSpec),
+          excludeProviderAssetIds: (assetManifest?.assets ?? []).flatMap((asset) => asset.provenance.providerAssetId ? [`${asset.provenance.providerId}:${asset.provenance.providerAssetId}`] : []),
+        });
+        // A replacement with no stock photo is dropped, so the saved image stays.
+        const replacementIds = new Set(replacing.map(({ intent }) => intent.logicalAssetId));
+        const added = resolved.assets.filter((asset) => !replacementIds.has(asset.logicalAssetId) || asset.sourceType === "STOCK");
+        for (const { asset, intent } of replacing) {
+          const next = added.find((candidate) => candidate.logicalAssetId === intent.logicalAssetId);
+          if (asset.publicPath && next?.publicPath) imageReplacements.push({ from: asset.publicPath, to: next.publicPath });
+        }
+        if (added.length) assetManifest = mergeAssetManifests(assetManifest, createAssetManifest({ manifestVersion: 1, assets: added }));
+      }
     }
     const environment = await this.deps.execution.createEnvironment({});
     let retainEnvironment = false;
@@ -688,10 +722,11 @@ export class LocalSiteGenerationPipeline {
         request.signal,
         runContext,
         async () => {
-          await this.#authorizeBilling(request.userId, request.agentProvider);
+          await this.#authorizeBilling(request.userId, request.agentProvider, editJobId, runContext);
         },
       );
       editSession = session;
+      await applyImageReplacements(this.deps.execution, environment.id, imageReplacements);
       await validateRequiredUserAssetReferences(this.deps.execution, environment.id, request.assetManifest);
       const editedSource = await readEditRequirementFiles(this.deps.execution, environment.id);
       const parentSource = new Map(Object.entries(before.files).filter(([path]) => isEditableRequirementPath(path)));
@@ -826,6 +861,10 @@ export class LocalSiteGenerationPipeline {
         versionNumber,
       );
       job = this.#finalJob(job, runContext.getSummary(), true);
+      // The charge intent is persisted in the same write as SUCCEEDED: from here on
+      // a crash leaves a PENDING job that billing recovery settles exactly once.
+      if (billingAuthorization && this.deps.billing?.prepareCharge)
+        job = this.deps.billing.prepareCharge(job, runContext.getSummary(), billingAuthorization);
       await this.deps.jobs.save(job);
       jobFinalized = true;
       if (billingAuthorization && this.deps.billing)
@@ -868,6 +907,8 @@ export class LocalSiteGenerationPipeline {
       }
       throw cause;
     } finally {
+      // Free the credit hold unless a charge is still awaiting settlement.
+      if (billingAuthorization && job.billingStatus !== "PENDING") await this.deps.billing?.releaseReservation?.(billingAuthorization);
       logSiteTokenUsage("edit", request.agentProvider, runContext.getSummary(), terminalError);
       if (terminalError instanceof ApplicationError &&
         (terminalError.code.startsWith("STRUCTURED_RESPONSE_") || terminalError.code === "MODEL_OUTPUT_TRUNCATED")) {
@@ -1234,6 +1275,8 @@ export class LocalSiteGenerationPipeline {
   async #authorizeBilling(
     userId: UserId,
     provider: string,
+    jobId: JobId,
+    runContext: InferenceRunContext,
   ): Promise<BillingAuthorization | undefined> {
     if (!this.deps.billing || provider === "mock" || provider === "mock-agent") return undefined;
     const model = this.deps.resolveAgentModel(provider);
@@ -1243,7 +1286,13 @@ export class LocalSiteGenerationPipeline {
         `The selected Sites provider '${provider}' did not expose a model`,
         { metadata: { provider, model: null } },
       );
-    return this.deps.billing.preflight({ userId, provider, model });
+    // Reserves credits for this job and caps the run to what they can pay for at
+    // the existing rate: concurrent jobs and a nearly empty balance stay bounded.
+    const authorization = await this.deps.billing.preflight({
+      userId, provider, model, jobId, maxTotalTokens: runContext.budget.limits.maxTotalTokens,
+    });
+    if (authorization.maxTotalTokens !== undefined) runContext.budget.capTotalTokens(authorization.maxTotalTokens);
+    return authorization;
   }
   #finalJob(
     job: SiteJob,
@@ -1297,6 +1346,38 @@ export class LocalSiteGenerationPipeline {
       message,
       timestamp: new Date(),
     });
+  }
+}
+
+/** What the site is about, for choosing relevant stock photos. */
+function siteSubject(siteSpec: SiteSpec): string {
+  return [siteSpec.project.description, siteSpec.requirements.siteType, siteSpec.project.name].filter(Boolean).join(" ");
+}
+
+interface ImageReplacement { readonly from: string; readonly to: string }
+
+/**
+ * Guarantees a requested photo swap lands even when the edit model left the old
+ * path in place: the old managed path is rewritten to the new one in source.
+ */
+async function applyImageReplacements(
+  execution: Pick<LocalExecutionProvider, "listFiles" | "readFile" | "writeFile">,
+  environmentId: string,
+  replacements: readonly ImageReplacement[],
+): Promise<void> {
+  if (!replacements.length) return;
+  const files = (await execution.listFiles(environmentId))
+    .filter((entry) => entry.type === "FILE" && (entry.path === "index.html" || entry.path.startsWith("src/")) && /\.(?:[cm]?[jt]sx?|css|html)$/.test(entry.path));
+  const sources = new Map<string, string>();
+  for (const entry of files) sources.set(entry.path, await execution.readFile(environmentId, entry.path));
+  for (const { from, to } of replacements) {
+    if ([...sources.values()].some((content) => content.includes(to))) continue;
+    for (const [path, content] of sources) {
+      if (!content.includes(from)) continue;
+      const updated = content.split(from).join(to);
+      sources.set(path, updated);
+      await execution.writeFile(environmentId, path, updated);
+    }
   }
 }
 

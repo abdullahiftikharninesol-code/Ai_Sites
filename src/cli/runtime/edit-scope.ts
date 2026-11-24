@@ -138,6 +138,8 @@ function contactCandidate(source: string, value: ProtectedValue, path?: string):
   const digits = digitCount(value.value);
   if (digits < 7 || digits > 15 || path?.endsWith(".css")) return false;
   if (/^\d{4}-\d{2}-\d{2}$/.test(value.value)) return false;
+  // Content-hashed managed image names (/__sites/assets/<sha256>.<ext>) can start with a digit run.
+  if (/\/__sites\/assets\/[0-9a-f]*$/i.test(source.slice(Math.max(0, value.start - 96), value.start))) return false;
   // Unseparated digit runs inside identifiers/hex/data are not displayed phone numbers.
   if (/[\w#$.]$/.test(source.slice(Math.max(0, value.start - 1), value.start)) && !/[+(]$/.test(source.slice(Math.max(0, value.start - 1), value.start))) return false;
   return true;

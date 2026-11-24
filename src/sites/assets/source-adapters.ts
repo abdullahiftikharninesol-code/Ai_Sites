@@ -32,11 +32,39 @@ export class AssetProviderBudget {
   }
 }
 
+/** Site-level context a remote source may use to find relevant media. */
+export interface AssetResolutionContext {
+  /** The user's request for this generation or edit. */
+  readonly requestText?: string;
+  /** What the site is about (project description, site type). */
+  readonly subjectText?: string;
+  /** Provider photos already used by this site, so a new pick is never a duplicate. */
+  readonly excludeProviderAssetIds?: readonly string[];
+}
+
+/** State shared by every intent resolved in one call: duplicate prevention and search caching. */
+export class AssetResolutionSession {
+  readonly usedProviderAssetIds: Set<string>;
+  readonly #searches = new Map<string, Promise<readonly StockImageResult[]>>();
+  constructor(readonly context: AssetResolutionContext = {}) {
+    this.usedProviderAssetIds = new Set(context.excludeProviderAssetIds ?? []);
+  }
+  /** One provider request per distinct search, however many intents share it. */
+  search(key: string, run: () => Promise<readonly StockImageResult[]>): Promise<readonly StockImageResult[]> {
+    let pending = this.#searches.get(key);
+    if (!pending) {
+      pending = run();
+      this.#searches.set(key, pending);
+    }
+    return pending;
+  }
+}
+
 export interface AssetSourceAdapter {
   readonly id: string;
   readonly sourceType: AssetSourceType;
   readonly available: boolean;
-  resolve(intent: AssetIntent, budget: AssetProviderBudget): Promise<AssetCandidate | undefined>;
+  resolve(intent: AssetIntent, budget: AssetProviderBudget, session?: AssetResolutionSession): Promise<AssetCandidate | undefined>;
 }
 
 export interface GeneratedImageRequest {
@@ -63,12 +91,37 @@ export interface StockImageResult {
   readonly attribution?: string;
   readonly bytes?: Uint8Array;
   readonly contentType?: string;
+  /** Provider-reported original dimensions. */
+  readonly width?: number;
+  readonly height?: number;
+  /** Provider-written description of the photo, used as alt text. */
+  readonly alt?: string;
+  /** Provider-hosted renditions by size name. */
+  readonly downloadUrls?: Readonly<Record<string, string>>;
+}
+
+export type StockImageOrientation = "landscape" | "portrait" | "square";
+
+export interface StockImageSearchRequest {
+  readonly description: string;
+  readonly purpose: string;
+  readonly query?: string;
+  readonly orientation?: StockImageOrientation;
+}
+
+export interface DownloadedStockImage {
+  readonly bytes: Uint8Array;
+  readonly contentType: string;
+  readonly width: number;
+  readonly height: number;
 }
 
 export interface StockImageProvider {
   readonly id: string;
   readonly configured: boolean;
-  search(request: { readonly description: string; readonly purpose: string }, budget: AssetProviderBudget): Promise<readonly StockImageResult[]>;
+  search(request: StockImageSearchRequest, budget: AssetProviderBudget): Promise<readonly StockImageResult[]>;
+  /** Downloads and validates one result's bytes from the provider's own image host. */
+  download?(result: StockImageResult, rendition: string, budget: AssetProviderBudget): Promise<DownloadedStockImage>;
 }
 
 export class MapAssetSourceAdapter implements AssetSourceAdapter {
@@ -107,6 +160,9 @@ export const DEFAULT_ASSET_SOURCE_POLICY: AssetSourcePolicy = Object.freeze({
   allowedSources: ["USER_UPLOAD", "GENERATED", "STOCK", "SYSTEM", "PLACEHOLDER"] as const,
 });
 
+/** Per-resolution bounds: enough for an image-rich page (hero plus several 4-image sections). */
+export const DEFAULT_RESOLUTION_LIMITS = Object.freeze({ maxProviderRequests: 12, maxDownloads: 16 });
+
 export class AdapterBackedAssetResolver {
   private readonly resolver: DeterministicAssetResolver;
   constructor(
@@ -115,7 +171,12 @@ export class AdapterBackedAssetResolver {
     private readonly policy: AssetSourcePolicy = DEFAULT_ASSET_SOURCE_POLICY,
   ) { this.resolver = new Resolver(mediaStore); }
 
-  async resolve(intents: readonly AssetIntent[], budget = new AssetProviderBudget()) {
+  async resolve(
+    intents: readonly AssetIntent[],
+    budget = new AssetProviderBudget(DEFAULT_RESOLUTION_LIMITS),
+    context: AssetResolutionContext = {},
+  ) {
+    const session = new AssetResolutionSession(context);
     const candidates: AssetCandidate[] = [];
     for (const intent of intents) {
       const preferred = intent.sourcePreference ?? this.policy.allowedSources;
@@ -123,8 +184,17 @@ export class AdapterBackedAssetResolver {
       for (const source of sources) {
         const adapter = this.adapters.find((candidate) => candidate.sourceType === source && candidate.available);
         if (!adapter) continue;
-        if (source === "GENERATED" || source === "STOCK") budget.reserve("PROVIDER");
-        const candidate = await adapter.resolve(intent, budget);
+        let candidate: AssetCandidate | undefined;
+        try {
+          // Stock adapters reserve per real provider request and download themselves.
+          if (source === "GENERATED") budget.reserve("PROVIDER");
+          candidate = await adapter.resolve(intent, budget, session);
+        } catch (cause) {
+          // Remote media is best effort: an unavailable provider or an exhausted
+          // budget falls through to the next source (ultimately the placeholder).
+          if (source !== "GENERATED" && source !== "STOCK") throw cause;
+          continue;
+        }
         if (candidate) {
           candidates.push(candidate);
           break;

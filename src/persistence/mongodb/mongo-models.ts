@@ -43,8 +43,12 @@ export interface MongoSiteJobRecord {
   billableTokens?: number;
   creditsPer500Tokens?: number;
   creditsCharged?: number;
-  billingStatus: "NOT_CHARGED" | "CHARGED" | "FAILED";
+  creditsCalculated?: number;
+  creditsReserved?: number;
+  billingStatus: "NOT_CHARGED" | "PENDING" | "CHARGED" | "FAILED";
   billingErrorCode?: string;
+  billingAttemptId?: string;
+  billingClaimedAt?: Date;
   chargedAt?: Date;
   logicalCalls: number;
   physicalRequests: number;
@@ -58,9 +62,17 @@ export interface MongoSiteJobRecord {
   updatedAt: Date;
 }
 
+/** Sites-owned, short-lived credit holds per user; never a balance of its own. */
+export interface MongoCreditHoldRecord {
+  _id: string;
+  holds: { jobId: string; credits: number; expiresAt: Date }[];
+  updatedAt: Date;
+}
+
 export interface MongoModels {
   readonly projects: Model<MongoSiteProjectRecord>;
   readonly jobs: Model<MongoSiteJobRecord>;
+  readonly creditHolds: Model<MongoCreditHoldRecord>;
 }
 
 const projectSchema = new Schema<MongoSiteProjectRecord>(
@@ -111,13 +123,17 @@ const jobSchema = new Schema<MongoSiteJobRecord>(
     billableTokens: Number,
     creditsPer500Tokens: Number,
     creditsCharged: Number,
+    creditsCalculated: Number,
+    creditsReserved: Number,
     billingStatus: {
       type: String,
       required: true,
-      enum: ["NOT_CHARGED", "CHARGED", "FAILED"],
+      enum: ["NOT_CHARGED", "PENDING", "CHARGED", "FAILED"],
       default: "NOT_CHARGED",
     },
     billingErrorCode: String,
+    billingAttemptId: String,
+    billingClaimedAt: Date,
     chargedAt: Date,
     logicalCalls: { type: Number, required: true, min: 0 },
     physicalRequests: { type: Number, required: true, min: 0 },
@@ -134,6 +150,20 @@ const jobSchema = new Schema<MongoSiteJobRecord>(
 );
 jobSchema.index({ projectId: 1, createdAt: -1 });
 jobSchema.index({ ownerId: 1, createdAt: -1 });
+// Billing recovery scans interrupted settlements only.
+jobSchema.index({ billingStatus: 1, updatedAt: 1 }, { partialFilterExpression: { billingStatus: "PENDING" } });
+
+const creditHoldSchema = new Schema<MongoCreditHoldRecord>(
+  {
+    _id: { type: String, required: true, immutable: true },
+    holds: {
+      type: [{ _id: false, jobId: { type: String, required: true }, credits: { type: Number, required: true, min: 0 }, expiresAt: { type: Date, required: true } }],
+      default: [],
+    },
+    updatedAt: { type: Date, required: true },
+  },
+  { collection: "sites_credit_holds", versionKey: false, strict: "throw" },
+);
 
 export function createMongoModels(connection: Connection): MongoModels {
   return {
@@ -143,5 +173,8 @@ export function createMongoModels(connection: Connection): MongoModels {
     jobs:
       (connection.models.SitesJob as Model<MongoSiteJobRecord> | undefined) ??
       connection.model<MongoSiteJobRecord>("SitesJob", jobSchema),
+    creditHolds:
+      (connection.models.SitesCreditHold as Model<MongoCreditHoldRecord> | undefined) ??
+      connection.model<MongoCreditHoldRecord>("SitesCreditHold", creditHoldSchema),
   };
 }

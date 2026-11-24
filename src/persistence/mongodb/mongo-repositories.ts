@@ -8,6 +8,7 @@ import type {
 import type { SiteJob, SiteProject, SiteVersion } from "../../sites/domain/entities.js";
 import type { DeploymentId, JobId, SiteId, UserId, VersionId } from "../../shared/types.js";
 import type {
+  SiteJobChargeIntent,
   SiteJobRepository,
   SiteProjectRepository,
   SiteVersionRepository,
@@ -332,7 +333,11 @@ export class MongoSiteJobRepository implements SiteJobRepository {
         "billableTokens",
         "creditsPer500Tokens",
         "creditsCharged",
+        "creditsCalculated",
+        "creditsReserved",
         "billingErrorCode",
+        "billingAttemptId",
+        "billingClaimedAt",
         "chargedAt",
         "errorCode",
         "errorMessage",
@@ -358,17 +363,15 @@ export class MongoSiteJobRepository implements SiteJobRepository {
     }
   }
 
-  async claimBilling(id: JobId) {
+  async claimBilling(id: JobId, intent?: SiteJobChargeIntent) {
     try {
+      const recorded = Object.fromEntries(Object.entries(intent ?? {}).filter(([, value]) => value !== undefined));
       const result = await this.models.jobs
         .updateOne(
           { jobId: id, billingStatus: "NOT_CHARGED" },
           {
-            $set: {
-              billingStatus: "FAILED",
-              billingErrorCode: "BILLING_FINALIZATION_IN_PROGRESS",
-              updatedAt: new Date(),
-            },
+            $set: { ...recorded, billingStatus: "PENDING", updatedAt: new Date() },
+            $unset: { billingErrorCode: 1, creditsCharged: 1 },
           },
         )
         .exec();
@@ -376,6 +379,29 @@ export class MongoSiteJobRepository implements SiteJobRepository {
     } catch (cause) {
       return writeError("Unable to claim site job billing", cause);
     }
+  }
+
+  async listPendingBillingForUser(userId: string) {
+    const records = await this.models.jobs.find({ ownerId: userId, billingStatus: "PENDING" }).lean().exec();
+    return records.map(jobFrom);
+  }
+
+  async leasePendingBilling(id: JobId, staleBefore: Date, now: Date) {
+    // Compare-and-set on updatedAt: exactly one worker wins a stale job per grace period.
+    const result = await this.models.jobs
+      .updateOne({ jobId: id, billingStatus: "PENDING", updatedAt: { $lt: staleBefore } }, { $set: { updatedAt: now } })
+      .exec();
+    return result.modifiedCount === 1;
+  }
+
+  async listPendingBilling(updatedBefore: Date, limit: number) {
+    const records = await this.models.jobs
+      .find({ billingStatus: "PENDING", updatedAt: { $lt: updatedBefore } })
+      .sort({ updatedAt: 1 })
+      .limit(limit)
+      .lean()
+      .exec();
+    return records.map(jobFrom);
   }
 
   async listBySite(siteId: SiteId) {
@@ -489,8 +515,12 @@ const jobFrom = (record: MongoSiteJobRecord): SiteJob => ({
     ? { creditsPer500Tokens: record.creditsPer500Tokens }
     : {}),
   ...(record.creditsCharged !== undefined ? { creditsCharged: record.creditsCharged } : {}),
+  ...(record.creditsCalculated !== undefined ? { creditsCalculated: record.creditsCalculated } : {}),
+  ...(record.creditsReserved !== undefined ? { creditsReserved: record.creditsReserved } : {}),
   billingStatus: record.billingStatus ?? "NOT_CHARGED",
   ...(record.billingErrorCode !== undefined ? { billingErrorCode: record.billingErrorCode } : {}),
+  ...(record.billingAttemptId !== undefined ? { billingAttemptId: record.billingAttemptId } : {}),
+  ...(record.billingClaimedAt !== undefined ? { billingClaimedAt: new Date(record.billingClaimedAt) } : {}),
   ...(record.chargedAt !== undefined ? { chargedAt: new Date(record.chargedAt) } : {}),
   logicalCalls: record.logicalCalls,
   physicalRequests: record.physicalRequests,

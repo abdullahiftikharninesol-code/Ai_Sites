@@ -244,7 +244,9 @@ describe("Edit pipeline QA outcomes (offline, mocked model and browser)", () => 
     let qa!: MockInstance<BrowserQARunner["run"]>;
     const h = await editHarness("Add a product search to the shop page", site({ shop: staticShop, about: "Search coming soon." }), product => { qa = vi.spyOn(product.browserQA, "run"); });
     try {
-      await expect(h.run()).rejects.toMatchObject({ code: "EDIT_REQUIREMENT_INCOMPLETE", metadata: { reason: "REQUESTED_CAPABILITY_NOT_IMPLEMENTED" } });
+      // Caught statically before any build: the requested search has no wired state, so the
+      // single requirement repair runs (this mock replays its patch) and the edit is rejected.
+      await expect(h.run()).rejects.toMatchObject({ metadata: { attempts: 2, missingRequirements: ["behavior"] } });
       expect(qa).not.toHaveBeenCalled(); expect(h.finalize).not.toHaveBeenCalled();
       expect((await h.product.projects.getById(h.siteId))!.latestVersionId).toBe(h.versionId);
     } finally { await h.cleanup(); }

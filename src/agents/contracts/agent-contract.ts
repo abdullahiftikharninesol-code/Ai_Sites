@@ -317,7 +317,7 @@ export const CORE_AGENT_CONTRACTS: readonly AgentContract[] = deepFreeze([
     contextPolicy: { id: "GENERATE_SITE_CONTEXT" },
     stopConditions: ["VALID_STRUCTURED_OUTPUT"],
     limits: { authority: "INFERENCE_RUN_BUDGET" },
-    prompt: { promptId: "sites.site-coder", promptVersion: 4 },
+    prompt: { promptId: "sites.site-coder", promptVersion: 5 },
     lifecycle: { status: "ACTIVE" },
   }),
   contract({
@@ -340,7 +340,7 @@ export const CORE_AGENT_CONTRACTS: readonly AgentContract[] = deepFreeze([
   contract({
     agentId: "sites.targeted-edit",
     stage: "TARGETED_EDIT",
-    purpose: "Implement a validated edit plan with a minimal diff.",
+    purpose: "Implement the requested edit completely and visibly with a diff scoped to the affected components.",
     inputContract: { required: ["EDIT_REQUEST", "RELEVANT_SOURCE"] },
     outputContract: { kind: "SOURCE_PATCH" },
     tools: [],
@@ -351,7 +351,7 @@ export const CORE_AGENT_CONTRACTS: readonly AgentContract[] = deepFreeze([
     contextPolicy: { id: "TARGETED_EDIT_CONTEXT" },
     stopConditions: ["VALID_STRUCTURED_OUTPUT"],
     limits: { authority: "INFERENCE_RUN_BUDGET" },
-    prompt: { promptId: "sites.targeted-edit", promptVersion: 2 },
+    prompt: { promptId: "sites.targeted-edit", promptVersion: 3 },
     lifecycle: { status: "ACTIVE" },
   }),
 ] as const);

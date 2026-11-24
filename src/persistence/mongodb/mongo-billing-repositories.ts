@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import { Types, type ClientSession } from "mongoose";
 import { ApplicationError } from "../../app/errors/application-error.js";
 import {
   SITES_MODEL_CREDIT_TYPE,
@@ -92,12 +92,13 @@ export class MongoSubscriberQuotaRepository implements SubscriberQuotaRepository
     return record ? quotaFrom(record, userId) : undefined;
   }
 
+  /** With a session, the debit joins that transaction (see MongoSiteBillingLedger). */
   async deduct(input: {
     readonly userId: string;
     readonly calculatedCredits: number;
     readonly inputTokens: number;
     readonly outputTokens: number;
-  }) {
+  }, options: { readonly session?: ClientSession } = {}) {
     if (!Number.isFinite(input.calculatedCredits) || input.calculatedCredits < 0)
       throw new ApplicationError("CREDIT_DEDUCTION_FAILED", "Calculated credits are invalid", {
         metadata: { reason: "invalid_numeric_data" },
@@ -146,11 +147,15 @@ export class MongoSubscriberQuotaRepository implements SubscriberQuotaRepository
             // The pre-update values are required to report the exact clamped
             // charge while the returned repository state is calculated below.
             returnDocument: "before",
+            ...(options.session ? { session: options.session } : {}),
           },
         )
         .lean()
         .exec();
     } catch (cause) {
+      // Inside a transaction the driver must see its own error (with labels such as
+      // TransientTransactionError) to retry a write conflict; the ledger classifies it.
+      if (options.session) throw cause;
       throw await this.#operationFailure(input.userId, cause);
     }
     if (!before) {

@@ -800,7 +800,9 @@ describe("MongoDB Sites persistence", () => {
   it("defines exactly the final project and job persistence fields", () => {
     const manager = new MongoConnectionManager();
     const models = createMongoModels(manager.connection);
-    expect(Object.keys(models)).toEqual(["projects", "jobs"]);
+    expect(Object.keys(models)).toEqual(["projects", "jobs", "creditHolds"]);
+    // Sites-owned short-lived credit holds; the GetChatly quota stays the only balance.
+    expect(models.creditHolds.collection.collectionName).toBe("sites_credit_holds");
     expect(Object.keys(models.projects.schema.paths).sort()).toEqual(
       [
         "_id",
@@ -829,12 +831,16 @@ describe("MongoDB Sites persistence", () => {
         "billableInputTokens",
         "billableOutputTokens",
         "billableTokens",
+        "billingAttemptId",
+        "billingClaimedAt",
         "billingErrorCode",
         "billingStatus",
         "chargedAt",
         "createdAt",
+        "creditsCalculated",
         "creditsCharged",
         "creditsPer500Tokens",
+        "creditsReserved",
         "errorCode",
         "errorMessage",
         "inputTokens",

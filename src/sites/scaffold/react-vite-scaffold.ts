@@ -616,10 +616,26 @@ export const DESIGN_DIRECTIONS: readonly {
   },
 ];
 
+/**
+ * Directions that suit a recognisable kind of site, most specific first. A match
+ * narrows the choice (a skincare store never lands on square black "graphite");
+ * the seed hash still picks within the group, so similar requests keep variety.
+ */
+const DIRECTION_AFFINITIES: readonly (readonly [RegExp, readonly string[]])[] = [
+  [/\b(?:skin ?care|beauty|cosmetics?|spa|salon|wellness|fragrances?|perfumes?|bridal|weddings?|florists?|flowers?|jewell?e?ry|candles?|self-care)\b/i, ["clay", "plum"]],
+  [/\b(?:law|legal|attorneys?|lawyers?|finance|financial|banks?|banking|insurance|accounting|consult\w*|saas|software|fintech|analytics|dashboards?|b2b|clinics?|dental|dentists?|medical|healthcare)\b/i, ["ink", "graphite"]],
+  [/\b(?:gardens?|gardening|outdoors?|organic|farms?|eco|sustainab\w*|nature|hiking|camping|landscap\w*|plants?|vegan|coffee|tea)\b/i, ["forest", "clay"]],
+  [/\b(?:architects?|architecture|portfolios?|photograph\w*|agency|fashion|galler(?:y|ies)|minimal\w*|editorial|magazines?|interior)\b/i, ["graphite", "ink"]],
+  [/\b(?:restaurants?|bakery|bakeries|caf[eé]s?|kitchens?|food|wine|bistro|pottery|ceramics?|crafts?|handmade)\b/i, ["clay", "forest"]],
+  [/\b(?:music|nightlife|club|events?|festivals?|luxury|premium)\b/i, ["plum", "graphite"]],
+];
+
 export function pickDesignDirection(seed = ""): (typeof DESIGN_DIRECTIONS)[number] {
   let hash = 0;
   for (const character of seed) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
-  return DESIGN_DIRECTIONS[hash % DESIGN_DIRECTIONS.length]!;
+  const ids = DIRECTION_AFFINITIES.find(([pattern]) => pattern.test(seed))?.[1];
+  const candidates = ids ? DESIGN_DIRECTIONS.filter((direction) => ids.includes(direction.id)) : DESIGN_DIRECTIONS;
+  return candidates[hash % candidates.length]!;
 }
 
 /**
@@ -651,12 +667,12 @@ export function summarizeDesignSystem(css: string = DEFAULT_STYLES_CSS, referenc
   return [
     referenceDriven
       ? "Baseline design system is available in src/styles.css, but the attached visual reference takes priority. Override its typography, colors, spacing, and layout where needed to match the reference."
-      : "Baseline design system already applied in src/styles.css (keep it; add a small custom stylesheet for anything extra instead of replacing it).",
+      : "Baseline design system already applied in src/styles.css, with an art direction chosen for this request (keep the file; add your own stylesheet for site-specific styling instead of replacing it).",
     `Design tokens: ${tokens.join(", ")}.`,
     `Utility classes: ${classes.join(", ")}.`,
     referenceDriven
       ? "Recreate the reference's own typography and page rhythm, even if it differs from the baseline display serif and section styling."
-      : "Compose with these tokens for color, spacing, radius, and type. Headings already use a display serif and sections already have vertical rhythm.",
+      : "Compose with these tokens for color, spacing, radius, and type. Headings already use var(--font-display) and sections already have vertical rhythm. The baseline is a starting point, not the finished look: give this site its own character through layout composition, type scale, imagery treatment, and component styling suited to its audience, retuning tokens such as --accent, --font-display, and --radius in your stylesheet (for :root and :root[data-theme=\"dark\"]) when the brand calls for it.",
   ].join("\n");
 }
 

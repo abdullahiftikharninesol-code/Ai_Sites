@@ -103,11 +103,29 @@ export class InferenceBudget {
   exhaustedReason?: BudgetExhaustedReason;
   budgetExceeded = false;
 
+  #limits: InferenceBudgetLimits;
+
   constructor(
-    readonly limits: InferenceBudgetLimits,
+    limits: InferenceBudgetLimits,
     private readonly clock: () => number = Date.now,
   ) {
+    this.#limits = limits;
     this.startedAt = this.clock();
+  }
+
+  get limits(): InferenceBudgetLimits {
+    return this.#limits;
+  }
+
+  /**
+   * Lowers the run's total token ceiling (never raises it). Used when the
+   * user's remaining credits can pay for fewer tokens than the default budget,
+   * so provider spend stays within what billing can actually collect.
+   */
+  capTotalTokens(maxTotalTokens: number): void {
+    if (!Number.isFinite(maxTotalTokens) || maxTotalTokens < 0) return;
+    const capped = Math.floor(maxTotalTokens);
+    if (capped < this.#limits.maxTotalTokens) this.#limits = { ...this.#limits, maxTotalTokens: capped };
   }
 
   get elapsedMs(): number {

@@ -26,6 +26,7 @@ import { parseTemplateReference, type TemplateReferenceSelection } from "../temp
 import type { SiteGenerationResult } from "../sites/generation/local-site-generation-pipeline.js";
 import { createDevelopmentFailedCandidateEvidence, type LocalFailedCandidateEvidence } from "../sites/generation/failed-candidate-evidence.js";
 import { createDevelopmentGenerationTelemetry } from "../sites/generation/generation-development-telemetry.js";
+import { createStockImageProviders } from "../sites/assets/stock-image-providers.js";
 
 export interface PlaygroundConfig {
   host: string;
@@ -130,6 +131,8 @@ export class PlaygroundService {
     this.#failedCandidateEvidence = createDevelopmentFailedCandidateEvidence(config.dataRoot);
     const developmentTelemetry = createDevelopmentGenerationTelemetry();
     this.product = createMongoPersistentSitesProduct({
+      // Pixabay first, then Pexels; each is off unless its SITES_*_ENABLED flag and API key are set.
+      createStockImages: (searchCache) => createStockImageProviders(process.env, { searchCache }),
       ...(config.databaseUri ? { databaseUri: config.databaseUri } : {}),
       ...(mongoConnection ? { mongoConnection } : {}),
       artifactRoot: join(config.dataRoot, "artifacts"),

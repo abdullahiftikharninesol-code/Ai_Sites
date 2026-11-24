@@ -20,6 +20,55 @@ export interface CapabilityAwareGenerationContextInput {
  * model. It contains identities and approved roots, never package-selection
  * authority or full managed-file contents.
  */
+/** Website media the model may reference (design references are excluded: they are not files). */
+function assetSummaries(manifest?: AssetManifest) {
+  return (manifest?.assets ?? []).filter((asset) => !isVisualReferenceAsset(asset)).map((asset) => ({
+    logicalAssetId: asset.logicalAssetId,
+    role: asset.role,
+    purpose: asset.purpose ?? asset.role,
+    publicPath: asset.publicPath,
+    ...(asset.width === undefined ? {} : { width: asset.width }),
+    ...(asset.height === undefined ? {} : { height: asset.height }),
+    ...(asset.altText === undefined ? {} : { altText: asset.altText }),
+    decorative: asset.decorative,
+  }));
+}
+
+/** Stock providers credited in the footer, in the order they are tried. */
+const STOCK_SOURCES = [
+  { id: "pixabay", name: "Pixabay", url: "https://pixabay.com" },
+  { id: "pexels", name: "Pexels", url: "https://www.pexels.com" },
+] as const;
+
+function assetUsageLines(manifest?: AssetManifest): string[] {
+  const userAssets = (manifest?.assets ?? []).filter((asset) => asset.sourceType === "USER_UPLOAD" && !isVisualReferenceAsset(asset));
+  const stockSources = STOCK_SOURCES.filter((source) => (manifest?.assets ?? []).some((asset) => asset.sourceType === "STOCK" && asset.provenance.providerId === source.id));
+  const credited = stockSources.map((source) => source.name).join(" and ");
+  return [
+    ...(userAssets.length ? [
+      `USER PROVIDED ASSETS (required use): ${userAssets.map((asset) => `${asset.logicalAssetId} path: ${asset.publicPath} original: ${asset.provenance.userUploadName ?? "image"}`).join("; ")}`,
+      "Every USER PROVIDED ASSET listed above MUST be rendered somewhere in the website, using its exact path. Do not replace a user-provided asset with a placeholder, and do not refer to it by its original filename.",
+    ] : []),
+    ...(stockSources.length ? [
+      `Stock photos in the Asset manifest are real photographs licensed from ${credited}, not AI-generated: never describe them as generated. Keep one small footer credit, "Photos provided by ${credited}", linking to ${stockSources.map((source) => source.url).join(" and ")}.`,
+    ] : []),
+  ];
+}
+
+/**
+ * The website's image files for a targeted edit: without them the edit model
+ * cannot place a newly attached upload or a replacement photo.
+ */
+export function editAssetContext(manifest?: AssetManifest): string | undefined {
+  const assets = assetSummaries(manifest);
+  if (!assets.length) return undefined;
+  return [
+    "Website images (the only image files that exist; reference them by these exact paths):",
+    `Asset manifest: ${JSON.stringify(assets)}`,
+    ...assetUsageLines(manifest),
+  ].join("\n");
+}
+
 export function buildCapabilityAwareGenerationContext(
   input: CapabilityAwareGenerationContextInput,
 ): string {
@@ -48,19 +97,9 @@ export function buildCapabilityAwareGenerationContext(
     )
     .sort((a, b) => a.localeCompare(b));
   const references = (input.assetManifest?.assets ?? []).filter(isVisualReferenceAsset);
-  const assets = (input.assetManifest?.assets ?? []).filter((asset) => !isVisualReferenceAsset(asset)).map((asset) => ({
-    logicalAssetId: asset.logicalAssetId,
-    role: asset.role,
-    purpose: asset.purpose ?? asset.role,
-    publicPath: asset.publicPath,
-    ...(asset.width === undefined ? {} : { width: asset.width }),
-    ...(asset.height === undefined ? {} : { height: asset.height }),
-    ...(asset.altText === undefined ? {} : { altText: asset.altText }),
-    decorative: asset.decorative,
-  }));
+  const assets = assetSummaries(input.assetManifest);
   const backgroundAssets = assets.filter((asset) => asset.role === "BACKGROUND");
   const imageAssets = assets.filter((asset) => asset.role !== "BACKGROUND");
-  const userAssets = (input.assetManifest?.assets ?? []).filter((asset) => asset.sourceType === "USER_UPLOAD" && !isVisualReferenceAsset(asset));
   const explicitMotion = /\b(?:animat(?:e|ed|ion|ions)|motion|parallax|cinematic|moving\s+background)\b/i.test(input.requestText ?? "");
   const lines = [
     "Capability Context:",
@@ -74,13 +113,11 @@ export function buildCapabilityAwareGenerationContext(
     "Toggle controls, including task completion, must update meaningful content/state and expose aria-pressed or aria-checked as appropriate. Hover/focus styling alone is not an action.",
     ...(references.length ? [
       `Design references: ${references.map((asset) => asset.provenance.userUploadName ?? asset.assetId).join(", ")}. Their image content is attached separately for visual analysis, not as website media paths.`,
+      "A design reference is not a file in this website: never reference it by filename or invent a local image path for it (for example /image.png). Only Asset manifest paths exist; a reference to any other local image file is rejected.",
       "Match the entire reference page: its dominant background, page frame, navigation, hero arrangement, content sequence, visual density, cards, controls, typography, and accent colours. Build nested interface previews as real HTML/CSS/React. Do not display or animate the reference image itself. Follow the user's requested content while preserving the reference composition.",
       "Reference interaction contract: reproduce the visible navigation and build each destination as a usable page or view, not just the screenshot's first screen. Every visible button, link, menu, tab, search field, and form must have a meaningful action. Use React state and local browser storage for demo data when no backend capability exists; do not claim a remote integration or persistence exists. Do not use dead links, alert-only handlers, empty callbacks, or static page labels as substitutes for behavior.",
     ] : []),
-    ...(userAssets.length ? [
-      `USER PROVIDED ASSETS (required use): ${userAssets.map((asset) => `${asset.logicalAssetId} path: ${asset.publicPath} original: ${asset.provenance.userUploadName ?? "image"}`).join("; ")}`,
-      "Every USER PROVIDED ASSET listed above MUST be rendered somewhere in the website. Do not replace a user-provided asset with a placeholder.",
-    ] : []),
+    ...assetUsageLines(input.assetManifest),
     ...(references.length ? ["Motion: keep the reference composition static unless the user explicitly requests animation; subtle interactive hover/focus feedback is fine."] : ["Motion: one-time staggered hero/CTA entrances plus restrained card/button hover/focus feedback. Use opacity/transform, finite durations, no layout shifts or loops."]),
     "At prefers-reduced-motion: reduce, disable decorative movement and keep all content visible.",
     ...(explicitMotion ? ["The user explicitly requested animation: make the motion design visible and purposeful across the hero and relevant content, within the CSS and accessibility rules above."] : []),

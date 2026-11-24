@@ -33,8 +33,9 @@ import { BrowserQARunner } from "../../browser-qa/browser-qa-runner.js";
 import type { SiteRuntimeProvider } from "../../site-runtime/site-runtime-provider.js";
 import { AgentPlanningPipeline } from "../../agents/intelligence/agent-intelligence.js";
 import { ArtifactMediaStore } from "../assets/media-store.js";
-import { AdapterBackedAssetResolver, PlaceholderAssetSourceAdapter } from "../assets/source-adapters.js";
-import type { SiteCreditBillingService } from "../../billing/credit-billing.js";
+import { AdapterBackedAssetResolver, PlaceholderAssetSourceAdapter, type StockImageProvider } from "../assets/source-adapters.js";
+import { StockAssetSourceAdapter } from "../assets/stock-asset-source-adapter.js";
+import type { SitesBillingPort } from "./local-site-generation-pipeline.js";
 import type { TemplateDesignReferenceResolver } from "../../templates/application/template-design-context.js";
 import type { FailedCandidateEvidence } from "./failed-candidate-evidence.js";
 import type { GenerationDevelopmentTelemetry } from "./generation-development-telemetry.js";
@@ -54,7 +55,9 @@ export interface LocalSitesProductOptions {
   readonly jobs?: SiteJobRepository;
   readonly versionCommitter?: SiteVersionCommitter;
   readonly runtimeProvider?: SiteRuntimeProvider;
-  readonly billing?: SiteCreditBillingService;
+  readonly billing?: SitesBillingPort;
+  /** Stock photo providers for image intents, tried in order (Pixabay, then Pexels); unresolved images keep the placeholder. */
+  readonly stockImages?: StockImageProvider | readonly StockImageProvider[];
   readonly templateDesignReferences?: TemplateDesignReferenceResolver;
   readonly failedCandidateEvidence?: FailedCandidateEvidence;
   readonly developmentTelemetry?: GenerationDevelopmentTelemetry;
@@ -110,7 +113,10 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
       mode: "AGENT_WITH_FALLBACK",
       strategy: "COMBINED",
     }),
-    assetResolver: new AdapterBackedAssetResolver(mediaStore, [new PlaceholderAssetSourceAdapter()]),
+    assetResolver: new AdapterBackedAssetResolver(mediaStore, [
+      ...(stockAdapter(options.stockImages)),
+      new PlaceholderAssetSourceAdapter(),
+    ]),
     assetMediaStore: mediaStore,
     ...(options.agentRegistry && options.orchestrationAgent
       ? {
@@ -156,4 +162,9 @@ export function createLocalSitesProduct(options: LocalSitesProductOptions) {
     template,
     browserQA,
   };
+}
+
+function stockAdapter(stockImages: LocalSitesProductOptions["stockImages"]) {
+  const providers = stockImages === undefined ? [] : Array.isArray(stockImages) ? stockImages : [stockImages as StockImageProvider];
+  return providers.length ? [new StockAssetSourceAdapter(providers)] : [];
 }

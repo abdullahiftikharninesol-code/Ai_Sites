@@ -59,7 +59,12 @@ export interface SiteVersion {
 }
 export type SiteJobOperation = "GENERATE" | "EDIT";
 export type SiteJobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
-export type SiteJobBillingStatus = "NOT_CHARGED" | "CHARGED" | "FAILED";
+/**
+ * NOT_CHARGED: nothing owed or not yet finalized. PENDING: a durable charge intent
+ * exists and the debit has not been confirmed (recoverable). CHARGED: the debit and
+ * this record were settled together. FAILED: no debit happened (billingErrorCode says why).
+ */
+export type SiteJobBillingStatus = "NOT_CHARGED" | "PENDING" | "CHARGED" | "FAILED";
 
 export interface SiteJob {
   readonly id: JobId;
@@ -80,8 +85,15 @@ export interface SiteJob {
   readonly billableTokens?: number;
   readonly creditsPer500Tokens?: number;
   readonly creditsCharged?: number;
+  /** Credits the usage costs at the authorized rate; may exceed creditsCharged when the balance ran out. */
+  readonly creditsCalculated?: number;
+  /** Credits held against the shared balance while the job runs. */
+  readonly creditsReserved?: number;
   readonly billingStatus: SiteJobBillingStatus;
   readonly billingErrorCode?: string;
+  /** Identifies the single charge intent a PENDING job may be settled with. */
+  readonly billingAttemptId?: string;
+  readonly billingClaimedAt?: Date;
   readonly chargedAt?: Date;
   readonly logicalCalls: number;
   readonly physicalRequests: number;

@@ -19,6 +19,7 @@ import {
 } from "../../persistence/mongodb/mongo-connection.js";
 import { createMongoModels } from "../../persistence/mongodb/mongo-models.js";
 import { createMongoBillingModels } from "../../persistence/mongodb/mongo-billing-models.js";
+import { MongoSiteBillingLedger } from "../../persistence/mongodb/mongo-billing-ledger.js";
 import {
   MongoModelCreditRateRepository,
   MongoSubscriberQuotaRepository,
@@ -56,6 +57,13 @@ import { LocalSitesRuntimeGateway } from "../../site-runtime/local/local-sites-r
 import { SiteRuntimeService } from "../../site-runtime/site-runtime-service.js";
 import type { SiteId } from "../../shared/types.js";
 import { SiteQueries } from "../application/site-queries.js";
+import type { StockImageProvider } from "../assets/source-adapters.js";
+import {
+  InMemoryStockSearchCache,
+  LayeredStockSearchCache,
+  RedisStockSearchCache,
+  type StockSearchCache,
+} from "../assets/stock-search-cache.js";
 import {
   createLocalSitesProduct,
   type LocalSitesProductOptions,
@@ -67,6 +75,11 @@ export interface MongoPersistentSitesProductOptions extends Omit<
 > {
   readonly databaseUri?: string;
   readonly mongoConnection?: MongoConnectionManager;
+  /**
+   * Builds the stock photo providers with a 24-hour search cache shared by every
+   * instance through Redis (per-process when Redis is unavailable).
+   */
+  readonly createStockImages?: (searchCache: StockSearchCache) => readonly StockImageProvider[];
 }
 
 export function createMongoPersistentSitesProduct(options: MongoPersistentSitesProductOptions) {
@@ -119,6 +132,9 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
     quotas,
     jobs,
     quotaNotifications,
+    undefined,
+    // Debit + job state commit in one transaction; PENDING jobs are retry-safe.
+    new MongoSiteBillingLedger(mongo.connection, models, billingModels, quotas, jobs),
   );
   const deployments = new InMemorySiteDeploymentRepository();
   const customDomains = new InMemoryCustomDomainRepository();
@@ -133,8 +149,13 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
     new LocalNoopCertificateProvider(),
     new ReservedHostnamePolicy(["localhost", "127.0.0.1"]),
   );
+  const stockImages = options.createStockImages?.(new LayeredStockSearchCache(
+    new InMemoryStockSearchCache(),
+    new RedisStockSearchCache(sharedRedis, appConfig.redisCacheEnvironment ?? "development"),
+  )) ?? options.stockImages;
   const product = createLocalSitesProduct({
     ...options,
+    ...(stockImages ? { stockImages } : {}),
     artifacts,
     projects,
     versions,
@@ -167,6 +188,7 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
     deployments,
   );
   let closed = false;
+  let stopBillingRecovery: (() => void) | undefined;
 
   return {
     ...product,
@@ -198,9 +220,18 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
     readCanonicalQuota: (userId: string) => readUserCreditQuotaPayload(quotas, quotaUsers, userId),
     connectPersistence: async () => {
       await connectMongo(mongo);
-      if (Number(mongo.connection.readyState) === 1)
+      if (Number(mongo.connection.readyState) === 1) {
         await migrateMongoProjectFilesToLocalArtifacts(models, artifacts);
+        // Settle charges interrupted by a crash, restart or lost acknowledgement: one
+        // bounded pass now, then periodically. Never blocks or fails startup; safe on
+        // every worker (lease per job, transactional exactly-once settlement).
+        stopBillingRecovery ??= billing.startRecoveryLoop({
+          onReport: (report) => { if (report.examined) console.info("[sites][billing] interrupted charge recovery", report); },
+          onError: () => { console.warn("[sites][billing] interrupted charge recovery pass failed; retrying next interval"); },
+        });
+      }
     },
+    recoverBilling: (options?: Parameters<SiteCreditBillingService["recoverPendingJobs"]>[0]) => billing.recoverPendingJobs(options),
     databaseStatus: () => getMongoStatus(mongo),
     deleteSite: async (siteId: SiteId, ownerId: string) => {
       await deleteMongoSite(models, siteId, ownerId);
@@ -211,6 +242,8 @@ export function createMongoPersistentSitesProduct(options: MongoPersistentSitesP
       if (product.execution.getActiveEnvironmentCount() !== 0)
         throw new Error("Cannot close persistent Sites product with active resources");
       siteRuntime.close();
+      stopBillingRecovery?.();
+      stopBillingRecovery = undefined;
       await sharedRedis.close();
       await disconnectMongo(mongo);
       closed = true;

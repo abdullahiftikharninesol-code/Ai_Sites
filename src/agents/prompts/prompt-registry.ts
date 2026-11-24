@@ -17,6 +17,8 @@ import { SITES_SITE_CODER_PROMPT_V3 } from "./sites-site-coder-v3.prompt.js";
 import { SITES_EDIT_PLANNER_PROMPT } from "./sites-edit-planner.prompt.js";
 import { SITES_EDIT_PLANNER_PROMPT_V2 } from "./sites-edit-planner-v2.prompt.js";
 import { SITES_SITE_CODER_PROMPT_V4 } from "./sites-site-coder-v4.prompt.js";
+import { SITES_SITE_CODER_PROMPT_V5 } from "./sites-site-coder-v5.prompt.js";
+import { SITES_TARGETED_EDIT_PROMPT_V3 } from "./sites-targeted-edit-v3.prompt.js";
 
 export type PromptId = AgentId;
 export type PromptLifecycleStatus = "ACTIVE" | "DORMANT" | "DEPRECATED";
@@ -315,13 +317,17 @@ export const REGISTERED_PROMPT_DEFINITIONS: readonly PromptDefinition[] = deepFr
   historicalPrompt("sites.site-coder", 1, "GENERATE_SITE", SITES_CODING_AGENT_PROMPT, { id: "generation-tool-loop", kind: "TOOL_LOOP" }),
   historicalPrompt("sites.site-coder", 2, "GENERATE_SITE", SITES_SITE_CODER_PROMPT_V2, { id: "generation-tool-loop", kind: "TOOL_LOOP" }),
   historicalPrompt("sites.site-coder", 3, "GENERATE_SITE", SITES_SITE_CODER_PROMPT_V3, { id: "generation-tool-loop", kind: "TOOL_LOOP" }),
-  createPromptDefinition({ promptId: "sites.site-coder", promptVersion: 4, stage: "GENERATE_SITE", systemPrompt: SITES_SITE_CODER_PROMPT_V4, compatibleAgentContracts: [{ agentId: "sites.site-coder", contractVersion: 1 }], responseContract: { id: "site-coder-file-bundle", kind: "JSON_SCHEMA", schemaId: "SiteCoderFileBundle" }, providerCompatibility: structuredPromptCompatibility.providerCompatibility, lifecycle: { status: "ACTIVE" } }),
+  historicalPrompt("sites.site-coder", 4, "GENERATE_SITE", SITES_SITE_CODER_PROMPT_V4, { id: "site-coder-file-bundle", kind: "JSON_SCHEMA", schemaId: "SiteCoderFileBundle" }),
+  // v5 adds design-quality and real-behavior guidance on top of v4.
+  createPromptDefinition({ promptId: "sites.site-coder", promptVersion: 5, stage: "GENERATE_SITE", systemPrompt: SITES_SITE_CODER_PROMPT_V5, compatibleAgentContracts: [{ agentId: "sites.site-coder", contractVersion: 1 }], responseContract: { id: "site-coder-file-bundle", kind: "JSON_SCHEMA", schemaId: "SiteCoderFileBundle" }, providerCompatibility: structuredPromptCompatibility.providerCompatibility, lifecycle: { status: "ACTIVE" } }),
   historicalPrompt("sites.build-repair", 1, "BUILD_REPAIR", SITES_CODING_AGENT_PROMPT, { id: "build-repair-tool-loop", kind: "TOOL_LOOP" }),
   dormantPrompt("sites.build-repair", "BUILD_REPAIR", SITES_BUILD_REPAIR_PROMPT_V2, { id: "build-repair-patch-bundle", kind: "JSON_SCHEMA", schemaId: "BuildRepairPatchBundle" }, structuredPromptCompatibility.providerCompatibility, "ACTIVE"),
   historicalPrompt("sites.edit-planner", 1, "EDIT_PLANNING", SITES_EDIT_PLANNER_PROMPT, { id: "site-edit-plan", kind: "JSON_SCHEMA", schemaId: "SiteEditPlan" }),
   historicalPrompt("sites.edit-planner", 2, "EDIT_PLANNING", SITES_EDIT_PLANNER_PROMPT_V2, { id: "site-edit-plan", kind: "JSON_SCHEMA", schemaId: "SiteEditPlan" }),
   historicalPrompt("sites.targeted-edit", 1, "TARGETED_EDIT", SITES_CODING_AGENT_PROMPT, { id: "targeted-edit-tool-loop", kind: "TOOL_LOOP" }),
-  dormantPrompt("sites.targeted-edit", "TARGETED_EDIT", SITES_TARGETED_EDIT_PROMPT_V2, { id: "site-edit-patch-bundle", kind: "JSON_SCHEMA", schemaId: "SiteEditPatchBundle" }, structuredPromptCompatibility.providerCompatibility, "ACTIVE"),
+  historicalPrompt("sites.targeted-edit", 2, "TARGETED_EDIT", SITES_TARGETED_EDIT_PROMPT_V2, { id: "site-edit-patch-bundle", kind: "JSON_SCHEMA", schemaId: "SiteEditPatchBundle" }),
+  // v3 asks for complete, visible, scoped edits instead of "the smallest change".
+  createPromptDefinition({ promptId: "sites.targeted-edit", promptVersion: 3, stage: "TARGETED_EDIT", systemPrompt: SITES_TARGETED_EDIT_PROMPT_V3, compatibleAgentContracts: [{ agentId: "sites.targeted-edit", contractVersion: 1 }], responseContract: { id: "site-edit-patch-bundle", kind: "JSON_SCHEMA", schemaId: "SiteEditPatchBundle" }, providerCompatibility: structuredPromptCompatibility.providerCompatibility, lifecycle: { status: "ACTIVE" } }),
 ]);
 
 export class PromptRegistry {
@@ -442,9 +448,9 @@ export const PROMPT_REGISTRY = new PromptRegistry();
 // highest available version never changes these pointers implicitly.
 for (const [promptId, promptVersion] of [
   ["sites.site-planner", 2],
-  ["sites.site-coder", 4],
+  ["sites.site-coder", 5],
   ["sites.build-repair", 2],
-  ["sites.targeted-edit", 2],
+  ["sites.targeted-edit", 3],
 ] as const) PROMPT_REGISTRY.setCurrentPrompt(promptId, promptVersion);
 
 export function getPrompt(promptId: string, promptVersion: number): PromptDefinition {

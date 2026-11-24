@@ -7,6 +7,7 @@ import type {
 import type { DeploymentId, JobId, Page, SiteId, VersionId } from "../shared/types.js";
 import type {
   SiteDeploymentRepository,
+  SiteJobChargeIntent,
   SiteJobRepository,
   SiteProjectRepository,
   SiteVersionRepository,
@@ -80,16 +81,35 @@ export class InMemorySiteJobRepository implements SiteJobRepository {
   async save(job: SiteJob) {
     this.#items.set(job.id, structuredClone(job));
   }
-  async claimBilling(id: JobId) {
+  async claimBilling(id: JobId, intent?: SiteJobChargeIntent) {
     const job = this.#items.get(id);
     if (!job || job.billingStatus !== "NOT_CHARGED") return false;
-    this.#items.set(id, {
-      ...job,
-      billingStatus: "FAILED",
-      billingErrorCode: "BILLING_FINALIZATION_IN_PROGRESS",
+    const { billingErrorCode: _previous, ...rest } = job;
+    void _previous;
+    this.#items.set(id, structuredClone({
+      ...rest,
+      ...intent,
+      billingStatus: "PENDING" as const,
       updatedAt: new Date(),
-    });
+    }));
     return true;
+  }
+  async listPendingBillingForUser(userId: string) {
+    return [...this.#items.values()]
+      .filter((job) => job.billingStatus === "PENDING" && String(job.userId) === userId)
+      .map((job) => structuredClone(job));
+  }
+  async leasePendingBilling(id: JobId, staleBefore: Date, now: Date) {
+    const job = this.#items.get(id);
+    if (!job || job.billingStatus !== "PENDING" || job.updatedAt.getTime() >= staleBefore.getTime()) return false;
+    this.#items.set(id, { ...job, updatedAt: now });
+    return true;
+  }
+  async listPendingBilling(updatedBefore: Date, limit: number) {
+    return [...this.#items.values()]
+      .filter((job) => job.billingStatus === "PENDING" && job.updatedAt.getTime() < updatedBefore.getTime())
+      .slice(0, limit)
+      .map((job) => structuredClone(job));
   }
   async listBySite(siteId: SiteId) {
     return page([...this.#items.values()].filter((item) => item.siteId === siteId));
